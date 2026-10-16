@@ -1,0 +1,7 @@
+[package]
+name = "configurator-core"
+version = "0.1.0"
+edition = "2024"
+description = "Domain model and compiler for strata-configurator"
+
+[dependencies]

@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  api:
+    uses: nonagenticai/gitops-production/.github/workflows/rust-service.yml@main
+    with:
+      image_name: strata-configurator-api
+      cargo_package: configurator-api
+      test_command: 'cargo test --workspace --locked'
+      prepull_images: |
+        registry.internal:5000/library/postgres:18-alpine
+      dockerfile_path: Dockerfile.rust
+      buildx_extra_args: "--build-arg PACKAGE=configurator-api"
+      build_smoke: >-
+        docker run --rm --entrypoint sh "$IMAGE_REF" -c
+        'test -x /usr/local/bin/configurator-api && ! ldd /usr/local/bin/configurator-api | grep -q "not found"'
+    secrets: inherit

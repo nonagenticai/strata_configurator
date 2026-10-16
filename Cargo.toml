@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["crates/configurator-core", "crates/configurator-api"]
