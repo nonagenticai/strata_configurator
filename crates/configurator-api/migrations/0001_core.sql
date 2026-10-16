@@ -77,6 +77,8 @@ CREATE UNIQUE INDEX overlay_row_current_unique
 CREATE TABLE axis (
     key          text        PRIMARY KEY CHECK (key <> ''),
     cardinality  text        NOT NULL CHECK (cardinality IN ('one', 'many')),
+    label        text        CHECK (label <> ''),
+    description  text,
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 

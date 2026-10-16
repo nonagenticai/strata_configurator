@@ -252,6 +252,10 @@ struct RawAxisValue {
     key: String,
     #[serde(default)]
     parent: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +264,10 @@ struct RawAxis {
     key: String,
     cardinality: Cardinality,
     values: Vec<RawAxisValue>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -326,6 +334,25 @@ fn name_of(v: &Value, field: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("?")
         .to_owned()
+}
+
+/// A label or description, when given, must not be blank.
+fn check_text(
+    file: &str,
+    key: &str,
+    label: &Option<String>,
+    description: &Option<String>,
+) -> Result<(), SeedError> {
+    for (name, text) in [("label", label), ("description", description)] {
+        if text.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(SeedError::new(
+                file,
+                key,
+                format!("{name} must not be blank"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn typed<T: DeserializeOwned>(file: &str, key: &str, v: Value) -> Result<T, SeedError> {
@@ -396,9 +423,17 @@ pub fn parse(version: u32, files: &[(&str, &str)]) -> Result<SeedBundle, SeedErr
                     .map(|v| AxisValue {
                         key: v.key,
                         parent: v.parent,
+                        label: v.label,
+                        description: v.description,
                     })
                     .collect(),
+                label: a.label,
+                description: a.description,
             };
+            check_text(file, &key, &axis.label, &axis.description)?;
+            for v in &axis.values {
+                check_text(file, &format!("{key}={}", v.key), &v.label, &v.description)?;
+            }
             validate_axis(&axis).map_err(|e| SeedError::new(file, &key, e.to_string()))?;
             b.axes.push(axis);
         }
@@ -467,7 +502,12 @@ pub fn parse(version: u32, files: &[(&str, &str)]) -> Result<SeedBundle, SeedErr
         }
 
         for v in raw.layer {
-            let l: RawLayer = typed(file, "layer", v)?;
+            let ctx = ["scope", "industry", "department", "job"]
+                .iter()
+                .filter_map(|f| v.get(*f).and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(":");
+            let l: RawLayer = typed(file, &format!("layer {ctx}"), v)?;
             let layer = LayerKey {
                 scope: l.scope,
                 industry: l.industry,
@@ -604,16 +644,33 @@ fn with_rows(mut m: Map<String, Value>, rows: &[RowSpec]) -> Value {
     Value::Object(m)
 }
 
+/// Insert `name` when `value` is set.
+fn put(m: &mut Map<String, Value>, name: &str, value: &Option<String>) {
+    if let Some(v) = value {
+        m.insert(name.into(), json!(v));
+    }
+}
+
 fn axis_json(a: &Axis) -> Value {
     let values: Vec<Value> = a
         .values
         .iter()
-        .map(|v| match &v.parent {
-            Some(parent) => json!({"key": v.key, "parent": parent}),
-            None => json!({"key": v.key}),
+        .map(|v| {
+            let mut m = Map::new();
+            m.insert("key".into(), json!(v.key));
+            put(&mut m, "parent", &v.parent);
+            put(&mut m, "label", &v.label);
+            put(&mut m, "description", &v.description);
+            Value::Object(m)
         })
         .collect();
-    json!({"key": a.key, "cardinality": cardinality_name(a.cardinality), "values": values})
+    let mut m = Map::new();
+    m.insert("key".into(), json!(a.key));
+    m.insert("cardinality".into(), json!(cardinality_name(a.cardinality)));
+    put(&mut m, "label", &a.label);
+    put(&mut m, "description", &a.description);
+    m.insert("values".into(), Value::Array(values));
+    Value::Object(m)
 }
 
 fn dimension_json(d: &Dimension) -> Value {
@@ -780,6 +837,43 @@ condition = { eq = ["order_type", "weekly"] }
         assert!(parse(1, &[("t.toml", tenant)]).is_err());
         let unknown = "[[layer]]\nscope = \"base\"\ncolour = \"red\"\n";
         assert!(parse(1, &[("u.toml", unknown)]).is_err());
+    }
+
+    #[test]
+    fn seed_axis_labels_round_trip() {
+        let labelled = r#"
+[[axis]]
+key = "payment_method"
+label = "Payment method"
+description = "How a customer pays."
+cardinality = "many"
+values = [
+  { key = "digital_wallet", label = "Digital wallet" },
+  { key = "digital_wallet.mobile", parent = "digital_wallet", label = "Mobile wallet", description = "Google Pay, Apple Pay" },
+  { key = "cash" },
+]
+"#;
+        let a = parse(1, &[("axes.toml", labelled)]).expect("parses");
+        let axis = &a.axes[0];
+        assert_eq!(axis.label.as_deref(), Some("Payment method"));
+        assert_eq!(
+            axis.values[1].description.as_deref(),
+            Some("Google Pay, Apple Pay")
+        );
+        assert_eq!(axis.values[2].label, None);
+        let files = render(&a);
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+        assert_eq!(parse(1, &refs).expect("rendered parses"), a);
+
+        let blank = labelled.replace("\"Mobile wallet\"", "\"  \"");
+        let err = parse(1, &[("axes.toml", blank.as_str())]).err();
+        assert_eq!(
+            err.map(|e| e.key),
+            Some("payment_method=digital_wallet.mobile".to_owned())
+        );
     }
 
     #[test]

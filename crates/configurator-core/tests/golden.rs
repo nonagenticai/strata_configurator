@@ -67,6 +67,33 @@ fn section<'a>(doc: &'a Value, name: &str) -> &'a Vec<Value> {
         .unwrap_or_else(|| panic!("{name} is not an array"))
 }
 
+/// Rewrite the fixture's care-bus rows named in `_deltas` from `from` to `to`
+/// (scope/industry), asserting each row really is in its `from` state.
+/// Returns the moved entity names.
+fn apply_deltas(fixture: &mut Value) -> Vec<String> {
+    let deltas = section(fixture, "_deltas").clone();
+    let entities = fixture["entities"]
+        .as_array_mut()
+        .expect("entities is an array");
+    let mut moved = Vec::new();
+    for d in &deltas {
+        let name = d["entity"].as_str().expect("delta names an entity");
+        let row = entities
+            .iter_mut()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("delta entity {name} not in fixture"));
+        for field in ["scope", "industry"] {
+            assert_eq!(
+                row[field], d["from"][field],
+                "{name}.{field}: fixture row is not in the delta's from state"
+            );
+            row[field] = d["to"][field].clone();
+        }
+        moved.push(name.to_owned());
+    }
+    moved
+}
+
 #[test]
 fn golden_retail_customer_care_contains_carebus_0002() {
     let b = v1();
@@ -74,14 +101,11 @@ fn golden_retail_customer_care_contains_carebus_0002() {
     assert_eq!(cfg.hash.len(), 64);
     println!("golden retail customer_care_agent hash: {}", cfg.hash);
 
-    let fixture: Value = serde_json::from_str(FIXTURE).expect("fixture is JSON");
+    let mut fixture: Value = serde_json::from_str(FIXTURE).expect("fixture is JSON");
     let got = serde_json::to_value(project_carebus(&cfg)).expect("projection serializes");
 
     // The only recorded model delta: Order, Product and Payment move to base.
-    let mut moved: Vec<&str> = section(&fixture, "_deltas")
-        .iter()
-        .filter_map(|d| d["entity"].as_str())
-        .collect();
+    let mut moved = apply_deltas(&mut fixture);
     moved.sort_unstable();
     assert_eq!(moved, ["Order", "Payment", "Product"]);
 
@@ -132,6 +156,18 @@ fn seed_render_parse_round_trip() {
         Err(e) => panic!("rendered seed does not parse: {e}"),
     };
     assert_eq!(again, b);
+    // Labels and descriptions survive render -> parse (spec 4.3 axis/axis_value label).
+    let customer_type = again
+        .axes
+        .iter()
+        .find(|a| a.key == "customer_type")
+        .expect("customer_type axis");
+    assert_eq!(customer_type.label.as_deref(), Some("Customer type"));
+    assert!(customer_type.description.is_some());
+    assert_eq!(
+        customer_type.values[0].label.as_deref(),
+        Some("Natural person")
+    );
 }
 
 #[test]

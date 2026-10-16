@@ -1,110 +1,119 @@
 # Seed v1 — classifier axes (spec 4.3). Source: ~/Documents/01Quant/objects.txt.
 # A value's parent is its dotted prefix; `axis = v` also holds for descendants of v.
 
-# objects.txt customer-types: consumers (natural person, household) and legal entities (sole proprietorship, corporation, single representative of legal entities, conglomerate/committee).
 [[axis]]
 key = "customer_type"
+label = "Customer type"
+description = "Consumers (natural person, household) and legal entities (sole proprietorship, corporation, single representative of legal entities, conglomerate/committee)."
 cardinality = "many"
 values = [
-  { key = "natural_person" },
-  { key = "household" },
-  { key = "sole_proprietorship" },
-  { key = "corporation" },
-  { key = "group_representative" },
-  { key = "conglomerate" },
+  { key = "natural_person", label = "Natural person" },
+  { key = "household", label = "Household" },
+  { key = "sole_proprietorship", label = "Sole proprietorship" },
+  { key = "corporation", label = "Corporation" },
+  { key = "group_representative", label = "Representative of several legal entities" },
+  { key = "conglomerate", label = "Conglomerate / committee" },
 ]
 
-# objects.txt product-types: service (consult), physical (pizza), virtual (e-book), access (lease/rental/saas), customer product (freemium).
 [[axis]]
 key = "product_type"
+label = "Product type"
+description = "Service (consult), physical (pizza), virtual (e-book), access (lease, rental, SaaS), customer product (freemium)."
 cardinality = "many"
 values = [
-  { key = "service" },
-  { key = "physical" },
-  { key = "virtual" },
-  { key = "access_lease" },
-  { key = "freemium" },
+  { key = "service", label = "Service product" },
+  { key = "physical", label = "Physical product" },
+  { key = "virtual", label = "Virtual product" },
+  { key = "access_lease", label = "Access product (lease, rental, SaaS)" },
+  { key = "freemium", label = "Freemium" },
 ]
 
-# objects.txt product-offering-types: availability (regular, seasonal/limited-time, pre-order/backorder), combinatory (bundle, configurable), consumeability (usage-based).
 [[axis]]
 key = "offering_type"
+label = "Product offering type"
+description = "Availability (regular, seasonal, pre-order), combinatory (bundle, configurable), consumption (usage based)."
 cardinality = "one"
 values = [
-  { key = "availability" },
-  { key = "availability.regular", parent = "availability" },
-  { key = "availability.seasonal", parent = "availability" },
-  { key = "availability.preorder", parent = "availability" },
-  { key = "combinatory" },
-  { key = "combinatory.bundle", parent = "combinatory" },
-  { key = "combinatory.configurable", parent = "combinatory" },
-  { key = "consumption" },
-  { key = "consumption.usage_based", parent = "consumption" },
+  { key = "availability", label = "Availability" },
+  { key = "availability.regular", parent = "availability", label = "Regular" },
+  { key = "availability.seasonal", parent = "availability", label = "Seasonal / limited time" },
+  { key = "availability.preorder", parent = "availability", label = "Pre-order / backorder" },
+  { key = "combinatory", label = "Combinatory" },
+  { key = "combinatory.bundle", parent = "combinatory", label = "Bundle / combo" },
+  { key = "combinatory.configurable", parent = "combinatory", label = "Configurable / customizable" },
+  { key = "consumption", label = "Consumption" },
+  { key = "consumption.usage_based", parent = "consumption", label = "Usage based / pay per use" },
 ]
 
-# objects.txt order-types: discrete (ecommerce), recurring (subscription), continuous (electricity).
 [[axis]]
 key = "order_type"
+label = "Order type"
+description = "Discrete (ecommerce), recurring (subscription), continuous (electricity)."
 cardinality = "one"
 values = [
-  { key = "discrete" },
-  { key = "recurring" },
-  { key = "continuous" },
+  { key = "discrete", label = "Discrete" },
+  { key = "recurring", label = "Recurring" },
+  { key = "continuous", label = "Continuous" },
 ]
 
-# objects.txt order-renewal-types: no renewal, customer initiated, provider initiated (explicit, implicit).
 [[axis]]
 key = "renewal_type"
+label = "Order renewal type"
+description = "No renewal, customer initiated, provider initiated (explicit, implicit)."
 cardinality = "one"
 values = [
-  { key = "none" },
-  { key = "customer_initiated" },
-  { key = "provider" },
-  { key = "provider.explicit", parent = "provider" },
-  { key = "provider.implicit", parent = "provider" },
+  { key = "none", label = "No renewal" },
+  { key = "customer_initiated", label = "Customer initiated" },
+  { key = "provider", label = "Provider initiated" },
+  { key = "provider.explicit", parent = "provider", label = "Explicit" },
+  { key = "provider.implicit", parent = "provider", label = "Implicit" },
 ]
 
-# objects.txt delivery-types.
 [[axis]]
 key = "delivery_type"
+label = "Delivery type"
+description = "Pickup or delivery."
 cardinality = "one"
 values = [
-  { key = "pickup" },
-  { key = "delivery" },
+  { key = "pickup", label = "Pickup" },
+  { key = "delivery", label = "Delivery" },
 ]
 
-# objects.txt delivery-methods.
 [[axis]]
 key = "delivery_method"
+label = "Delivery method"
+description = "Physical, digital or administrative delivery."
 cardinality = "one"
 values = [
-  { key = "physical" },
-  { key = "digital" },
-  { key = "administrative" },
+  { key = "physical", label = "Physical" },
+  { key = "digital", label = "Digital" },
+  { key = "administrative", label = "Administrative" },
 ]
 
-# objects.txt payment-types: singleton, recurring (fixed, variable), balancing.
 [[axis]]
 key = "payment_type"
+label = "Payment type"
+description = "Singleton, recurring (fixed, variable), balancing."
 cardinality = "one"
 values = [
-  { key = "singleton" },
-  { key = "recurring" },
-  { key = "recurring.fixed", parent = "recurring" },
-  { key = "recurring.variable", parent = "recurring" },
-  { key = "balancing" },
+  { key = "singleton", label = "Singleton" },
+  { key = "recurring", label = "Recurring" },
+  { key = "recurring.fixed", parent = "recurring", label = "Fixed" },
+  { key = "recurring.variable", parent = "recurring", label = "Variable" },
+  { key = "balancing", label = "Balancing" },
 ]
 
-# objects.txt payment-method: cash-based, card-based, bank transfer, digital wallet (mobile, web, crypto).
 [[axis]]
 key = "payment_method"
+label = "Payment method"
+description = "Cash, card, bank transfer, digital wallet (mobile, web, crypto)."
 cardinality = "many"
 values = [
-  { key = "cash" },
-  { key = "card" },
-  { key = "bank_transfer" },
-  { key = "digital_wallet" },
-  { key = "digital_wallet.mobile", parent = "digital_wallet" },
-  { key = "digital_wallet.web", parent = "digital_wallet" },
-  { key = "digital_wallet.crypto", parent = "digital_wallet" },
+  { key = "cash", label = "Cash" },
+  { key = "card", label = "Card" },
+  { key = "bank_transfer", label = "Bank transfer" },
+  { key = "digital_wallet", label = "Digital wallet" },
+  { key = "digital_wallet.mobile", parent = "digital_wallet", label = "Mobile wallet" },
+  { key = "digital_wallet.web", parent = "digital_wallet", label = "Web wallet" },
+  { key = "digital_wallet.crypto", parent = "digital_wallet", label = "Crypto wallet" },
 ]

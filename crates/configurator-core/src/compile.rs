@@ -819,6 +819,8 @@ mod tests {
         let val = |k: &str| AxisValue {
             key: k.into(),
             parent: None,
+            label: None,
+            description: None,
         };
         Known {
             industries: ["retail".to_owned()].into(),
@@ -833,6 +835,8 @@ mod tests {
                 key: "order_type".into(),
                 cardinality: Cardinality::One,
                 values: vec![val("continuous"), val("one_off")],
+                label: None,
+                description: None,
             }],
         }
     }

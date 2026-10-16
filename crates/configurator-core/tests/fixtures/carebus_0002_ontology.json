@@ -1,5 +1,5 @@
 {
-  "_source": "care-bus-agents 3b88445 crates/carebus-api/migrations/0002_seed.sql",
+  "_source": "care-bus-agents 3b88445 crates/carebus-api/migrations/0002_seed.sql (rows verbatim; the test applies _deltas)",
   "_deltas": [
     {
       "entity": "Order",
@@ -79,8 +79,8 @@
     },
     {
       "name": "Order",
-      "scope": "generic",
-      "industry": null,
+      "scope": "industry",
+      "industry": "retail",
       "department": null,
       "label": "Order",
       "synonyms": [
@@ -92,8 +92,8 @@
     },
     {
       "name": "Product",
-      "scope": "generic",
-      "industry": null,
+      "scope": "industry",
+      "industry": "retail",
       "department": null,
       "label": "Product",
       "synonyms": [
@@ -105,8 +105,8 @@
     },
     {
       "name": "Payment",
-      "scope": "generic",
-      "industry": null,
+      "scope": "industry",
+      "industry": "retail",
       "department": null,
       "label": "Payment",
       "synonyms": [

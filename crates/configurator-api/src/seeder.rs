@@ -152,22 +152,29 @@ async fn insert_bundle(conn: &mut PgConnection, b: &SeedBundle) -> Result<(), Se
     let author = author(version);
 
     for a in &b.axes {
-        sqlx::query("INSERT INTO axis (key, cardinality) VALUES ($1, $2)")
-            .bind(a.key.as_str())
-            .bind(cardinality_name(a.cardinality))
-            .execute(&mut *conn)
-            .await
-            .map_err(fail(version, format!("axis:{}", a.key)))?;
+        sqlx::query(
+            "INSERT INTO axis (key, cardinality, label, description) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(a.key.as_str())
+        .bind(cardinality_name(a.cardinality))
+        .bind(a.label.as_deref())
+        .bind(a.description.as_deref())
+        .execute(&mut *conn)
+        .await
+        .map_err(fail(version, format!("axis:{}", a.key)))?;
         for v in &a.values {
-            let label = v.key.rsplit('.').next().unwrap_or(v.key.as_str());
+            // A value without a seed label is labelled with its leaf segment.
+            let leaf = v.key.rsplit('.').next().unwrap_or(v.key.as_str());
+            let label = v.label.as_deref().unwrap_or(leaf);
             sqlx::query(
                 "INSERT INTO axis_value (axis, key, label, parent, description) \
-                 VALUES ($1, $2, $3, $4, NULL)",
+                 VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(a.key.as_str())
             .bind(v.key.as_str())
             .bind(label)
             .bind(v.parent.as_deref())
+            .bind(v.description.as_deref())
             .execute(&mut *conn)
             .await
             .map_err(fail(version, format!("axis_value:{}={}", a.key, v.key)))?;

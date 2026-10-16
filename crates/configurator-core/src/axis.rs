@@ -32,6 +32,10 @@ pub struct AxisValue {
     /// Full dotted path, e.g. `digital_wallet.mobile`.
     pub key: String,
     pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +43,10 @@ pub struct Axis {
     pub key: String,
     pub cardinality: Cardinality,
     pub values: Vec<AxisValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 fn find_axis<'a>(axes: &'a [Axis], key: &str) -> Result<&'a Axis, AxisError> {
@@ -194,6 +202,8 @@ mod tests {
         AxisValue {
             key: key.to_owned(),
             parent: parent.map(str::to_owned),
+            label: None,
+            description: None,
         }
     }
 
@@ -208,16 +218,22 @@ mod tests {
                     val("digital_wallet.mobile", Some("digital_wallet")),
                     val("card", None),
                 ],
+                label: None,
+                description: None,
             },
             Axis {
                 key: "order_type".into(),
                 cardinality: Cardinality::One,
                 values: vec![val("continuous", None), val("one_off", None)],
+                label: None,
+                description: None,
             },
             Axis {
                 key: "payment_type".into(),
                 cardinality: Cardinality::Many,
                 values: vec![val("balancing", None), val("prepaid", None)],
+                label: None,
+                description: None,
             },
         ]
     }
@@ -358,6 +374,8 @@ mod tests {
             key: "x".into(),
             cardinality: Cardinality::Many,
             values,
+            label: None,
+            description: None,
         };
         // key does not carry parent prefix
         assert!(validate_axis(&mk(vec![val("a", None), val("b.c", Some("a"))])).is_err());

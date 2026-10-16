@@ -150,16 +150,45 @@ async fn seed_v1_applies_once() {
         count(&pool, "SELECT count(*) FROM layer WHERE scope = 'base'").await,
         1
     );
-    // axis_value.label is the leaf segment of the key.
+    // Axis and axis_value labels/descriptions come from the seed.
     assert_eq!(
         count(
             &pool,
-            "SELECT count(*) FROM axis_value \
-             WHERE label <> regexp_replace(key, '^.*\\.', '') OR description IS NOT NULL"
+            "SELECT count(*) FROM axis WHERE key = 'customer_type' \
+             AND label = 'Customer type' AND description IS NOT NULL"
         )
         .await,
-        0
+        1
     );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM axis_value WHERE axis = 'payment_method' \
+             AND key = 'digital_wallet.mobile' AND label = 'Mobile wallet'"
+        )
+        .await,
+        1
+    );
+    // Every axis_value carries its seed label (or, without one, its leaf segment).
+    for a in &v1.axes {
+        for v in &a.values {
+            let want = v.label.clone().unwrap_or_else(|| {
+                v.key
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(v.key.as_str())
+                    .to_owned()
+            });
+            let got: String =
+                sqlx::query_scalar("SELECT label FROM axis_value WHERE axis = $1 AND key = $2")
+                    .bind(a.key.as_str())
+                    .bind(v.key.as_str())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(got, want, "axis_value {}={}", a.key, v.key);
+        }
+    }
     let sha: String = sqlx::query_scalar("SELECT sha256 FROM seed_version WHERE version = 1")
         .fetch_one(&pool)
         .await
