@@ -1,1 +1,4 @@
-//! Domain model and compiler for strata-configurator (filled in by later tasks).
+//! Domain model and compiler for strata-configurator.
+
+pub mod layer;
+pub mod overlay;
