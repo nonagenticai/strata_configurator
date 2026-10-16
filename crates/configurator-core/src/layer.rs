@@ -37,6 +37,8 @@ pub enum LayerError {
     ExtraKey { scope: Scope, key: &'static str },
     #[error("key `{key}` must not be empty")]
     EmptyValue { key: &'static str },
+    #[error("tenant must be a non-nil uuid")]
+    NilTenant,
 }
 
 /// The layer key every authored object carries.
@@ -101,6 +103,9 @@ impl LayerKey {
                 return Err(LayerError::EmptyValue { key });
             }
         }
+        if self.tenant.is_some_and(|t| t.is_nil()) {
+            return Err(LayerError::NilTenant);
+        }
         Ok(())
     }
 }
@@ -125,11 +130,18 @@ mod tests {
     fn layer_tenant_requires_tenant_only() {
         assert!(key(Scope::Tenant).validate().is_err());
         let mut ok = key(Scope::Tenant);
-        ok.tenant = Some(Uuid::nil());
+        ok.tenant = Some(Uuid::from_u128(1));
         assert_eq!(ok.validate(), Ok(()));
         let mut extra = ok.clone();
         extra.industry = Some("retail".into());
         assert!(extra.validate().is_err());
+    }
+
+    #[test]
+    fn layer_tenant_nil_rejected() {
+        let mut k = key(Scope::Tenant);
+        k.tenant = Some(Uuid::nil());
+        assert_eq!(k.validate(), Err(LayerError::NilTenant));
     }
 
     #[test]
