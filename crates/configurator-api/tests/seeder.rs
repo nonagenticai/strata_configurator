@@ -74,9 +74,15 @@ async fn migrations_apply_on_empty_db() {
     .await
     .unwrap();
     assert_eq!(present, TABLES.len() as i64);
+    // Every embedded migration is recorded exactly once.
+    let embedded = configurator_api::db::MIGRATOR.iter().count() as i64;
+    assert!(
+        embedded >= 2,
+        "0001_core and 0002_member_sub_index are embedded"
+    );
     assert_eq!(
         count(&pool, "SELECT count(*) FROM _sqlx_migrations").await,
-        1
+        embedded
     );
     for (table, n) in counts(&pool).await {
         assert_eq!(n, 0, "{table} is empty after migrating");
