@@ -363,7 +363,7 @@ async fn only_super_admin_creates_tenants() {
         common::get("/api/tenants", Some(&super_admin(ROOT))),
     )
     .await;
-    assert_eq!(names(&all), ["Acme", "Beta"]);
+    assert_eq!(names(&all), ["Beta", "Acme"], "newest first");
     assert!(all["next"].is_null());
     let (_, own) = common::send(
         &e.app,

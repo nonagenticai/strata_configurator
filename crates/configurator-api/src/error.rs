@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -26,6 +26,15 @@ pub enum ApiError {
     MethodNotAllowed,
     #[error("{1}")]
     Unavailable(&'static str, String),
+    /// An error that lists every item at fault: `{"error":{"code","message"},"errors":[…]}`
+    /// (e.g. 400 `invalid_fields` with each field error).
+    #[error("{message}")]
+    Detailed {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        errors: Vec<Value>,
+    },
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -43,6 +52,7 @@ impl ApiError {
             ApiError::Conflict(c, _) => (StatusCode::CONFLICT, *c),
             ApiError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             ApiError::Unavailable(c, _) => (StatusCode::SERVICE_UNAVAILABLE, *c),
+            ApiError::Detailed { status, code, .. } => (*status, *code),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -51,6 +61,13 @@ impl ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         ApiError::Internal(e.into())
+    }
+}
+
+/// A query string that did not parse: the error envelope.
+impl From<axum::extract::rejection::QueryRejection> for ApiError {
+    fn from(e: axum::extract::rejection::QueryRejection) -> Self {
+        ApiError::BadRequest("invalid_query", e.body_text())
     }
 }
 
@@ -71,11 +88,11 @@ impl IntoResponse for ApiError {
             ApiError::Internal(_) => "Something went wrong on our side.".to_string(),
             o => o.to_string(),
         };
-        (
-            status,
-            Json(json!({"error": {"code": code, "message": message}})),
-        )
-            .into_response()
+        let mut body = json!({"error": {"code": code, "message": message}});
+        if let ApiError::Detailed { errors, .. } = self {
+            body["errors"] = Value::Array(errors);
+        }
+        (status, Json(body)).into_response()
     }
 }
 

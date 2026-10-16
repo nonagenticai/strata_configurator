@@ -1,5 +1,6 @@
 //! Tenants and tenant roles (spec section 10.2). Roles live in the configurator DB, not in Keycloak.
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -112,25 +113,77 @@ pub async fn resolve(st: &AppState, caller: Caller, tenant: Uuid) -> Result<Tena
     })
 }
 
+/// 400 `tenant_required`: a tenant-scoped route without `X-Tenant-Id`.
+pub fn tenant_required() -> ApiError {
+    ApiError::BadRequest(
+        "tenant_required",
+        "this route needs an X-Tenant-Id header".into(),
+    )
+}
+
+/// The `X-Tenant-Id` header: `None` when absent; 400 `invalid_tenant` when malformed, nil or repeated.
+pub fn tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
+    let mut values = headers.get_all("x-tenant-id").iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_tenant());
+    }
+    let raw = first.to_str().map_err(|_| invalid_tenant())?;
+    parse_tenant_id(raw).map(Some)
+}
+
 /// Reads `X-Tenant-Id`: exactly one header holding a bare non-nil uuid. Missing → 400 `tenant_required`;
 /// malformed, nil or repeated → 400 `invalid_tenant`. The token is checked first (401 before 400).
 impl FromRequestParts<AppState> for TenantCtx {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
         let caller = Caller::from_request_parts(parts, st).await?;
-        let mut values = parts.headers.get_all("x-tenant-id").iter();
-        let Some(first) = values.next() else {
-            return Err(ApiError::BadRequest(
-                "tenant_required",
-                "this route needs an X-Tenant-Id header".into(),
-            ));
+        let Some(tenant) = tenant_header(&parts.headers)? else {
+            return Err(tenant_required());
         };
-        if values.next().is_some() {
-            return Err(invalid_tenant());
-        }
-        let raw = first.to_str().map_err(|_| invalid_tenant())?;
-        let tenant = parse_tenant_id(raw)?;
         resolve(st, caller, tenant).await
+    }
+}
+
+/// Who a request acts as on routes where the super-admin may leave out `X-Tenant-Id`.
+#[derive(Clone, Debug)]
+pub enum Acting {
+    /// The super-admin without `X-Tenant-Id`: platform data only, no tenant's data.
+    Platform(Caller),
+    /// The caller in the `X-Tenant-Id` tenant (the super-admin there is `admin`).
+    Tenant(TenantCtx),
+}
+
+impl Acting {
+    pub fn caller(&self) -> &Caller {
+        match self {
+            Acting::Platform(c) => c,
+            Acting::Tenant(t) => &t.caller,
+        }
+    }
+
+    /// The tenant acted in; `None` for the platform view.
+    pub fn tenant(&self) -> Option<Uuid> {
+        match self {
+            Acting::Platform(_) => None,
+            Acting::Tenant(t) => Some(t.tenant),
+        }
+    }
+}
+
+/// `X-Tenant-Id` as for [`TenantCtx`], except that the super-admin may leave it out
+/// ([`Acting::Platform`]). Anyone else without it → 400 `tenant_required`.
+impl FromRequestParts<AppState> for Acting {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
+        let caller = Caller::from_request_parts(parts, st).await?;
+        match tenant_header(&parts.headers)? {
+            Some(tenant) => Ok(Acting::Tenant(resolve(st, caller, tenant).await?)),
+            None if caller.super_admin => Ok(Acting::Platform(caller)),
+            None => Err(tenant_required()),
+        }
     }
 }
 

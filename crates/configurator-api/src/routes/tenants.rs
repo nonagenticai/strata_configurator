@@ -1,6 +1,6 @@
 //! Tenants and their members (spec sections 10.1 and 10.2).
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -11,6 +11,7 @@ use crate::audit;
 use crate::auth::{Caller, require_super_admin};
 use crate::db::tenants;
 use crate::error::ApiError;
+use crate::page::{self, Paged, TimeCursor};
 use crate::state::AppState;
 use crate::tenancy::{self, Role, TenantCtx};
 
@@ -21,7 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/tenants/{id}/members/{sub}", delete(remove_member))
 }
 
-/// A list in the `Paged{items,next}` envelope. Paging arrives with the shared helper; `next` is null.
+/// A whole (unpaged) list in the `Paged{items,next}` envelope: `next` is null.
 fn paged<T: serde::Serialize>(items: Vec<T>) -> Json<Value> {
     Json(json!({"items": items, "next": null}))
 }
@@ -81,14 +82,29 @@ async fn create(
     Ok((StatusCode::CREATED, Json(json!(t))))
 }
 
-/// The super-admin sees every tenant; anyone else the tenants they belong to.
-async fn list(State(st): State<AppState>, caller: Caller) -> Result<Json<Value>, ApiError> {
-    let items = if caller.super_admin {
-        tenants::list_all(&st.db).await?
+#[derive(Deserialize)]
+struct ListQuery {
+    limit: Option<String>,
+    before: Option<String>,
+}
+
+/// The super-admin sees every tenant; anyone else the tenants they belong to. Newest first, paged.
+async fn list(
+    State(st): State<AppState>,
+    caller: Caller,
+    q: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<Paged<tenants::Tenant>>, ApiError> {
+    let Query(q) = q?;
+    let limit = page::limit(q.limit.as_deref())?;
+    let before = TimeCursor::decode(q.before.as_deref())?;
+    let rows = if caller.super_admin {
+        tenants::list_all(&st.db, before, page::fetch(limit)).await?
     } else {
-        tenants::list_for(&st.db, &caller.sub).await?
+        tenants::list_for(&st.db, &caller.sub, before, page::fetch(limit)).await?
     };
-    Ok(paged(items))
+    Ok(Json(Paged::new(rows, limit, |t| {
+        TimeCursor::encode(t.ts_us, t.id)
+    })))
 }
 
 /// The path's tenant, for a caller who must be its admin (or the super-admin).

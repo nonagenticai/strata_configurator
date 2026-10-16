@@ -3,6 +3,7 @@ use serde::Serialize;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::page::TimeCursor;
 use crate::tenancy::Role;
 
 #[derive(Debug, Clone, Serialize)]
@@ -11,6 +12,9 @@ pub struct Tenant {
     pub name: String,
     /// RFC 3339.
     pub created_at: String,
+    /// `created_at` in microseconds since the epoch: the paging cursor, not part of the body.
+    #[serde(skip)]
+    pub ts_us: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,33 +79,64 @@ pub async fn memberships(db: &PgPool, sub: &str) -> Result<Vec<Membership>, sqlx
         .collect()
 }
 
-fn tenants(rows: Vec<(Uuid, String, String)>) -> Vec<Tenant> {
+fn tenants(rows: Vec<(Uuid, String, String, i64)>) -> Vec<Tenant> {
     rows.into_iter()
-        .map(|(id, name, created_at)| Tenant {
+        .map(|(id, name, created_at, ts_us)| Tenant {
             id,
             name,
             created_at,
+            ts_us,
         })
         .collect()
 }
 
-/// Every tenant (super-admin view).
-pub async fn list_all(db: &PgPool) -> Result<Vec<Tenant>, sqlx::Error> {
-    // `to_jsonb(timestamptz) #>> '{}'` is RFC 3339 text (the crate carries no date-time type).
-    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
-        "SELECT id, name, to_jsonb(created_at) #>> '{}' FROM tenant ORDER BY created_at, id",
+// `to_jsonb(timestamptz) #>> '{}'` is RFC 3339 text (the crate carries no date-time type); the
+// microsecond epoch is the exact paging position. Lists are newest first; `$1`/`$2` are the `before`
+// cursor (both NULL on the first page).
+
+/// Every tenant (super-admin view), one page.
+pub async fn list_all(
+    db: &PgPool,
+    before: Option<TimeCursor>,
+    fetch: i64,
+) -> Result<Vec<Tenant>, sqlx::Error> {
+    let (us, id) = TimeCursor::split(before);
+    let rows = sqlx::query_as::<_, (Uuid, String, String, i64)>(
+        "SELECT id, name, to_jsonb(created_at) #>> '{}', \
+                (extract(epoch FROM created_at) * 1000000)::bigint \
+         FROM tenant \
+         WHERE ($1::bigint IS NULL \
+                OR (created_at, id) < (timestamptz 'epoch' + $1::bigint * interval '1 microsecond', $2::uuid)) \
+         ORDER BY created_at DESC, id DESC LIMIT $3",
     )
+    .bind(us)
+    .bind(id)
+    .bind(fetch)
     .fetch_all(db)
     .await?;
     Ok(tenants(rows))
 }
 
-/// The tenants `sub` is a member of.
-pub async fn list_for(db: &PgPool, sub: &str) -> Result<Vec<Tenant>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
-        "SELECT id, name, to_jsonb(created_at) #>> '{}' FROM tenant \
-         WHERE id IN (SELECT tenant FROM member WHERE sub = $1) ORDER BY created_at, id",
+/// The tenants `sub` is a member of, one page.
+pub async fn list_for(
+    db: &PgPool,
+    sub: &str,
+    before: Option<TimeCursor>,
+    fetch: i64,
+) -> Result<Vec<Tenant>, sqlx::Error> {
+    let (us, id) = TimeCursor::split(before);
+    let rows = sqlx::query_as::<_, (Uuid, String, String, i64)>(
+        "SELECT id, name, to_jsonb(created_at) #>> '{}', \
+                (extract(epoch FROM created_at) * 1000000)::bigint \
+         FROM tenant \
+         WHERE id IN (SELECT tenant FROM member WHERE sub = $4) \
+           AND ($1::bigint IS NULL \
+                OR (created_at, id) < (timestamptz 'epoch' + $1::bigint * interval '1 microsecond', $2::uuid)) \
+         ORDER BY created_at DESC, id DESC LIMIT $3",
     )
+    .bind(us)
+    .bind(id)
+    .bind(fetch)
     .bind(sub)
     .fetch_all(db)
     .await?;
@@ -114,9 +149,10 @@ pub async fn create(
     name: &str,
     first_admin_sub: &str,
 ) -> Result<Tenant, sqlx::Error> {
-    let (id, name, created_at) = sqlx::query_as::<_, (Uuid, String, String)>(
+    let (id, name, created_at, ts_us) = sqlx::query_as::<_, (Uuid, String, String, i64)>(
         "INSERT INTO tenant (id, name) VALUES ($1, $2) \
-         RETURNING id, name, to_jsonb(created_at) #>> '{}'",
+         RETURNING id, name, to_jsonb(created_at) #>> '{}', \
+                   (extract(epoch FROM created_at) * 1000000)::bigint",
     )
     .bind(Uuid::new_v4())
     .bind(name)
@@ -131,6 +167,7 @@ pub async fn create(
         id,
         name,
         created_at,
+        ts_us,
     })
 }
 

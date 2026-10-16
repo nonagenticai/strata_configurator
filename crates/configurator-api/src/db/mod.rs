@@ -37,4 +37,12 @@ pub async fn ping(pool: &PgPool) -> bool {
         .is_ok()
 }
 
+pub mod layers;
+pub mod rows;
 pub mod tenants;
+
+/// A snake_case text column as the serde enum it names (`Scope`, `Kind`, `Op`).
+pub(crate) fn from_text<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, sqlx::Error> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned()))
+        .map_err(|e| sqlx::Error::Decode(format!("unexpected value {s:?}: {e}").into()))
+}
