@@ -5,6 +5,7 @@ ARG PACKAGE
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY seed ./seed
 RUN test -n "$PACKAGE" \
  && cargo build --release --locked -p "$PACKAGE" \
  && mkdir /out \

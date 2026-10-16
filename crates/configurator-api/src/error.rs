@@ -15,6 +15,8 @@ pub enum ApiError {
     NotFound(String),
     #[error("this route does not accept that method")]
     MethodNotAllowed,
+    #[error("{1}")]
+    Unavailable(&'static str, String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -28,6 +30,7 @@ impl ApiError {
             ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+            ApiError::Unavailable(c, _) => (StatusCode::SERVICE_UNAVAILABLE, *c),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
