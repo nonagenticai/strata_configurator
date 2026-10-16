@@ -235,12 +235,12 @@ pub fn validate_fields(
                 match known.iter().find(|s| s.name == name.as_str()) {
                     None => errors.push(FieldError::new(
                         "unknown_field",
-                        Some(name),
+                        Some(name.as_str()),
                         format!("unknown field {name:?} for {kind:?}"),
                     )),
                     Some(s) => {
                         if let Some(msg) = check_value(s.ty, value) {
-                            errors.push(FieldError::new("invalid_value", Some(name), msg));
+                            errors.push(FieldError::new("invalid_value", Some(name.as_str()), msg));
                         }
                     }
                 }
