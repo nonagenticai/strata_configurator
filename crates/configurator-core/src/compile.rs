@@ -47,6 +47,8 @@ pub enum ErrorCode {
     DuplicateAdd,
     PatchMissing,
     TombstoneMissing,
+    /// `add` of a key a lower layer tombstoned (spec 4.2: hidden at and above that layer).
+    AddTombstoned,
     DanglingReference,
     InvalidRow,
 }
@@ -244,6 +246,14 @@ fn validate_selection(sel: &Selection, known: &Known) -> Vec<CompileError> {
             "departments require an industry (industry x department cells)".to_owned(),
         ));
     }
+    if sel.job.is_none() {
+        for dim in sel.dimensions.keys() {
+            errors.push(CompileError::selection(
+                dim,
+                format!("dimension {dim:?} requires a job (dimensions qualify job overlays)"),
+            ));
+        }
+    }
     if let Some(job) = sel.job.as_ref().filter(|j| !known.jobs.contains(*j)) {
         errors.push(CompileError::selection(job, format!("unknown job {job:?}")));
     }
@@ -383,10 +393,12 @@ struct Obj {
 struct State {
     /// Present objects, indexed by `kind_index`.
     objects: [BTreeMap<String, Obj>; 4],
-    /// Objects removed by a tombstone (directly or by cascade) and not re-added.
-    removed: [BTreeSet<String>; 4],
+    /// Objects removed by a tombstone (directly or by cascade) -> index of the
+    /// layer (in `layer_order`) that removed them.
+    removed: [BTreeMap<String, usize>; 4],
     provenance: BTreeMap<String, Vec<Origin>>,
     errors: Vec<CompileError>,
+    warnings: Vec<Warning>,
 }
 
 impl State {
@@ -394,8 +406,9 @@ impl State {
         self.objects[kind_index(kind)].contains_key(key)
     }
 
-    fn was_removed(&self, kind: Kind, key: &str) -> bool {
-        self.removed[kind_index(kind)].contains(key)
+    /// The layer index that tombstoned `key`, if any.
+    fn removed_at(&self, kind: Kind, key: &str) -> Option<usize> {
+        self.removed[kind_index(kind)].get(key).copied()
     }
 
     fn error(&mut self, code: ErrorCode, row: &OverlayRow, message: String) {
@@ -403,16 +416,31 @@ impl State {
             .push(CompileError::row(code, row.id, row.kind, &row.key, message));
     }
 
-    fn remove(&mut self, kind: Kind, key: &str) {
+    fn remove(&mut self, kind: Kind, key: &str, layer: usize) {
         let idx = kind_index(kind);
         self.objects[idx].remove(key);
-        self.removed[idx].insert(key.to_owned());
+        self.removed[idx].insert(key.to_owned(), layer);
         self.provenance.remove(&provenance_key(kind, key));
     }
 
-    fn apply(&mut self, row: &OverlayRow) {
+    /// Apply one row of the layer at index `layer` in `layer_order`.
+    fn apply(&mut self, row: &OverlayRow, layer: usize) {
         let kind = row.kind;
         let idx = kind_index(kind);
+        // A patch/tombstone of an attribute/relation whose entity this same layer
+        // tombstoned is superseded by that tombstone: skip it with a warning.
+        if row.op != Op::Add
+            && !self.exists(kind, &row.key)
+            && referenced_entities(kind, &row.key)
+                .into_iter()
+                .any(|e| self.removed_at(Kind::Entity, e) == Some(layer))
+        {
+            self.warnings.push(Warning {
+                code: "superseded_by_tombstone",
+                key: row.key.clone(),
+            });
+            return;
+        }
         match row.op {
             Op::Add => {
                 if self.exists(kind, &row.key) {
@@ -420,9 +448,20 @@ impl State {
                     self.error(ErrorCode::DuplicateAdd, row, msg);
                     return;
                 }
+                if self.removed_at(kind, &row.key).is_some_and(|at| at < layer) {
+                    let msg = format!(
+                        "{} {:?} was tombstoned in a lower layer and stays hidden above it",
+                        kind_name(kind),
+                        row.key
+                    );
+                    self.error(ErrorCode::AddTombstoned, row, msg);
+                    return;
+                }
                 let dead: Vec<&str> = referenced_entities(kind, &row.key)
                     .into_iter()
-                    .filter(|e| !self.exists(Kind::Entity, e) && self.was_removed(Kind::Entity, e))
+                    .filter(|e| {
+                        !self.exists(Kind::Entity, e) && self.removed_at(Kind::Entity, e).is_some()
+                    })
                     .collect();
                 if !dead.is_empty() {
                     let msg = format!("entity {} was tombstoned", dead.join(", "));
@@ -436,7 +475,6 @@ impl State {
                         add_row: row.id,
                     },
                 );
-                self.removed[idx].remove(&row.key);
                 self.provenance
                     .insert(provenance_key(kind, &row.key), vec![origin(row)]);
             }
@@ -451,35 +489,35 @@ impl State {
                         .push(origin(row));
                 }
                 None => {
-                    let msg = self.missing_message("patch", row);
+                    let msg = self.missing_message("patch", row, layer);
                     self.error(ErrorCode::PatchMissing, row, msg);
                 }
             },
             Op::Tombstone => {
                 if !self.exists(kind, &row.key) {
-                    let msg = self.missing_message("tombstone", row);
+                    let msg = self.missing_message("tombstone", row, layer);
                     self.error(ErrorCode::TombstoneMissing, row, msg);
                     return;
                 }
-                self.remove(kind, &row.key);
+                self.remove(kind, &row.key, layer);
                 if kind == Kind::Entity {
-                    self.cascade(&row.key);
+                    self.cascade(&row.key, layer);
                 }
             }
         }
     }
 
-    fn missing_message(&self, verb: &str, row: &OverlayRow) -> String {
-        let why = if self.was_removed(row.kind, &row.key) {
-            "it was tombstoned below this layer"
-        } else {
-            "it does not exist"
+    fn missing_message(&self, verb: &str, row: &OverlayRow, layer: usize) -> String {
+        let why = match self.removed_at(row.kind, &row.key) {
+            Some(at) if at < layer => "it was tombstoned in a lower layer",
+            Some(_) => "it was tombstoned in this layer",
+            None => "it does not exist",
         };
         format!("cannot {verb} {} {:?}: {why}", kind_name(row.kind), row.key)
     }
 
     /// Remove the attributes of `entity` and every relation touching it.
-    fn cascade(&mut self, entity: &str) {
+    fn cascade(&mut self, entity: &str, layer: usize) {
         let attributes: Vec<String> = self.objects[kind_index(Kind::Attribute)]
             .keys()
             .filter(|k| attribute_entity(k) == entity)
@@ -494,10 +532,10 @@ impl State {
             .cloned()
             .collect();
         for key in attributes {
-            self.remove(Kind::Attribute, &key);
+            self.remove(Kind::Attribute, &key, layer);
         }
         for key in relations {
-            self.remove(Kind::Relation, &key);
+            self.remove(Kind::Relation, &key, layer);
         }
     }
 
@@ -617,6 +655,11 @@ pub fn compile(
     let mut by_layer: Vec<Vec<&OverlayRow>> = vec![Vec::new(); order.len()];
     for row in rows {
         let Some(pos) = order.iter().position(|l| *l == row.layer) else {
+            // Not a selected layer: the loader's business, unless the layer itself is
+            // malformed, which is never silently skipped.
+            if let Err(e) = row.layer.validate() {
+                state.error(ErrorCode::InvalidRow, row, e.to_string());
+            }
             continue;
         };
         let problems = row_problems(row);
@@ -627,7 +670,7 @@ pub fn compile(
         }
     }
 
-    for bucket in &mut by_layer {
+    for (pos, bucket) in by_layer.iter_mut().enumerate() {
         // Kind order entity -> attribute -> relation -> job; key order within a kind.
         bucket.sort_by(|a, b| {
             kind_index(a.kind)
@@ -648,7 +691,7 @@ pub fn compile(
                 continue;
             }
             previous = Some(current);
-            state.apply(row);
+            state.apply(row, pos);
         }
     }
 
@@ -670,7 +713,7 @@ pub fn compile(
         .map(|(k, o)| (k.clone(), to_relation(k, &o.fields)))
         .collect();
 
-    let mut warnings = Vec::new();
+    let mut warnings = std::mem::take(&mut state.warnings);
     let job = sel.job.as_ref().and_then(|key| {
         let job = state.objects[kind_index(Kind::Job)]
             .get(key)
@@ -684,7 +727,8 @@ pub fn compile(
         job
     });
     if let Some(job) = &job {
-        for name in &job.ontology_slice {
+        let slice: BTreeSet<&String> = job.ontology_slice.iter().collect();
+        for name in slice {
             if !entities.contains_key(name) {
                 warnings.push(Warning {
                     code: "slice_entity_missing",
@@ -830,6 +874,186 @@ mod tests {
             Ok(cfg) => cfg,
             Err(errors) => panic!("unexpected compile errors: {errors:?}"),
         }
+    }
+
+    fn attr(n: u128, layer: LayerKey, key: &str) -> OverlayRow {
+        row(
+            n,
+            layer,
+            Kind::Attribute,
+            key,
+            Op::Add,
+            json!({"data_type": "string"}),
+        )
+    }
+
+    fn rel(n: u128, layer: LayerKey, key: &str) -> OverlayRow {
+        row(
+            n,
+            layer,
+            Kind::Relation,
+            key,
+            Op::Add,
+            json!({"cardinality": "1:n"}),
+        )
+    }
+
+    fn tomb(n: u128, layer: LayerKey, kind: Kind, key: &str) -> OverlayRow {
+        row(n, layer, kind, key, Op::Tombstone, json!({}))
+    }
+
+    fn sel_retail_tenant() -> Selection {
+        Selection {
+            tenant: Some(TENANT),
+            ..sel_retail()
+        }
+    }
+
+    /// Base adds Order, Payment, Order.status, Order|paidBy|Payment; industry tombstones Order.
+    fn platform_tombstoned_order() -> Vec<OverlayRow> {
+        vec![
+            entity(1, base(), "Order"),
+            entity(2, base(), "Payment"),
+            attr(3, base(), "Order.status"),
+            rel(4, base(), "Order|paidBy|Payment"),
+            tomb(5, industry("retail"), Kind::Entity, "Order"),
+        ]
+    }
+
+    #[test]
+    fn tenant_patch_of_attribute_after_platform_tombstone_is_patch_missing() {
+        let mut rows = platform_tombstoned_order();
+        rows.push(row(
+            10,
+            tenant(),
+            Kind::Attribute,
+            "Order.status",
+            Op::Patch,
+            json!({"pii": true}),
+        ));
+        let errors = compile_err(&sel_retail_tenant(), &rows);
+        assert_eq!(codes(&errors), vec![ErrorCode::PatchMissing]);
+        assert_eq!(errors[0].row_id, Some(id(10)));
+        assert_eq!(errors[0].kind, Some(Kind::Attribute));
+        assert_eq!(errors[0].key.as_deref(), Some("Order.status"));
+        assert!(
+            errors[0].message.contains("lower layer"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn tenant_tombstone_of_cascaded_relation_is_tombstone_missing() {
+        let mut rows = platform_tombstoned_order();
+        rows.push(tomb(10, tenant(), Kind::Relation, "Order|paidBy|Payment"));
+        let errors = compile_err(&sel_retail_tenant(), &rows);
+        assert_eq!(codes(&errors), vec![ErrorCode::TombstoneMissing]);
+        assert_eq!(errors[0].row_id, Some(id(10)));
+        assert_eq!(errors[0].kind, Some(Kind::Relation));
+    }
+
+    #[test]
+    fn dimensions_without_job_rejected() {
+        let sel = Selection {
+            dimensions: [("channel".to_owned(), "voice".to_owned())].into(),
+            ..Selection::default()
+        };
+        let errors = compile_err(&sel, &[]);
+        assert_eq!(codes(&errors), vec![ErrorCode::InvalidSelection]);
+        assert_eq!(errors[0].key.as_deref(), Some("channel"));
+    }
+
+    #[test]
+    fn same_layer_dependent_patch_and_tombstone_superseded_by_entity_tombstone() {
+        let rows = [
+            entity(1, base(), "Order"),
+            entity(2, base(), "Payment"),
+            attr(3, base(), "Order.status"),
+            attr(4, base(), "Order.total"),
+            rel(5, base(), "Order|paidBy|Payment"),
+            tomb(10, tenant(), Kind::Entity, "Order"),
+            tomb(11, tenant(), Kind::Attribute, "Order.status"),
+            row(
+                12,
+                tenant(),
+                Kind::Attribute,
+                "Order.total",
+                Op::Patch,
+                json!({"pii": true}),
+            ),
+            tomb(13, tenant(), Kind::Relation, "Order|paidBy|Payment"),
+        ];
+        let sel = Selection {
+            tenant: Some(TENANT),
+            ..Selection::default()
+        };
+        let cfg = compile_ok(&sel, &rows);
+        assert_eq!(cfg.entities.keys().collect::<Vec<_>>(), vec!["Payment"]);
+        assert!(cfg.attributes.is_empty());
+        assert!(cfg.relations.is_empty());
+        let superseded: Vec<&str> = cfg
+            .warnings
+            .iter()
+            .filter(|w| w.code == "superseded_by_tombstone")
+            .map(|w| w.key.as_str())
+            .collect();
+        assert_eq!(
+            superseded,
+            vec!["Order.status", "Order.total", "Order|paidBy|Payment"]
+        );
+    }
+
+    #[test]
+    fn same_layer_dependent_add_after_entity_tombstone_is_dangling_reference() {
+        let rows = [
+            entity(1, base(), "Order"),
+            tomb(10, tenant(), Kind::Entity, "Order"),
+            attr(11, tenant(), "Order.note"),
+        ];
+        let sel = Selection {
+            tenant: Some(TENANT),
+            ..Selection::default()
+        };
+        let errors = compile_err(&sel, &rows);
+        assert_eq!(codes(&errors), vec![ErrorCode::DanglingReference]);
+        assert_eq!(errors[0].row_id, Some(id(11)));
+    }
+
+    #[test]
+    fn readd_of_tombstoned_entity_is_add_tombstoned() {
+        let mut rows = platform_tombstoned_order();
+        rows.push(entity(10, tenant(), "Order"));
+        let errors = compile_err(&sel_retail_tenant(), &rows);
+        assert_eq!(codes(&errors), vec![ErrorCode::AddTombstoned]);
+        assert_eq!(errors[0].row_id, Some(id(10)));
+        assert_eq!(errors[0].kind, Some(Kind::Entity));
+        assert_eq!(
+            serde_json::to_value(ErrorCode::AddTombstoned).ok(),
+            Some(json!("add_tombstoned"))
+        );
+    }
+
+    #[test]
+    fn readd_of_cascaded_attribute_is_add_tombstoned() {
+        let mut rows = platform_tombstoned_order();
+        rows.push(attr(10, tenant(), "Order.status"));
+        let errors = compile_err(&sel_retail_tenant(), &rows);
+        assert_eq!(codes(&errors), vec![ErrorCode::AddTombstoned]);
+        assert_eq!(errors[0].row_id, Some(id(10)));
+        assert_eq!(errors[0].kind, Some(Kind::Attribute));
+    }
+
+    #[test]
+    fn row_with_malformed_layer_is_invalid_row() {
+        let bad_layer = LayerKey {
+            tenant: Some(Uuid::nil()),
+            ..layer(Scope::Tenant)
+        };
+        let rows = [entity(1, base(), "Order"), entity(2, bad_layer, "Refund")];
+        let errors = compile_err(&Selection::default(), &rows);
+        assert_eq!(codes(&errors), vec![ErrorCode::InvalidRow]);
+        assert_eq!(errors[0].row_id, Some(id(2)));
     }
 
     #[test]
