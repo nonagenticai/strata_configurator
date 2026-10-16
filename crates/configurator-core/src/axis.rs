@@ -88,7 +88,10 @@ pub fn validate_axis(axis: &Axis) -> Result<(), AxisError> {
         match v.parent.as_deref() {
             None => {
                 if v.key.is_empty() || v.key.contains('.') {
-                    return Err(bad(&v.key, "root value key must be a single non-empty segment"));
+                    return Err(bad(
+                        &v.key,
+                        "root value key must be a single non-empty segment",
+                    ));
                 }
             }
             Some(parent) => {
@@ -251,9 +254,15 @@ mod tests {
     #[test]
     fn in_any() {
         let p = profile(&[("payment_method", &["digital_wallet.mobile"])]);
-        let c = Condition::In("payment_method".into(), vec!["card".into(), "digital_wallet".into()]);
+        let c = Condition::In(
+            "payment_method".into(),
+            vec!["card".into(), "digital_wallet".into()],
+        );
         assert!(c.eval(&p));
-        let none = Condition::In("payment_method".into(), vec!["card".into(), "digital".into()]);
+        let none = Condition::In(
+            "payment_method".into(),
+            vec!["card".into(), "digital".into()],
+        );
         assert!(!none.eval(&p));
     }
 
@@ -288,7 +297,10 @@ mod tests {
                 value: "nope".into()
             })
         );
-        let nested = Condition::Not(Box::new(Condition::In("order_type".into(), vec!["bad".into()])));
+        let nested = Condition::Not(Box::new(Condition::In(
+            "order_type".into(),
+            vec!["bad".into()],
+        )));
         assert!(matches!(
             nested.validate(&ax),
             Err(AxisError::UnknownValue { .. })
@@ -308,9 +320,11 @@ mod tests {
                 count: 2
             })
         );
-        assert!(profile(&[("payment_type", &["balancing", "prepaid"])])
-            .validate(&ax)
-            .is_ok());
+        assert!(
+            profile(&[("payment_type", &["balancing", "prepaid"])])
+                .validate(&ax)
+                .is_ok()
+        );
     }
 
     #[test]
