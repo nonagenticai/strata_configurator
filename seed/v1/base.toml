@@ -1,0 +1,918 @@
+# Seed v1 — base layer (spec 4.2 / 4.6). Sources: care-bus 0002_seed.sql @ 3b88445 and
+# ~/Documents/01Quant/objects.txt, object_bill.txt, object_contract.txt.
+
+[[layer]]
+scope = "base"
+
+  # --- care-bus 0002 generic entities, verbatim
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Customer"
+  op = "add"
+  fields = { label = "Customer", synonyms = ["client", "buyer", "cust_no"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Customer.customer_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Customer.name"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Customer.email"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Customer.tier"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Communication"
+  op = "add"
+  fields = { label = "Communication", synonyms = ["message", "email", "sms"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Communication.channel"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Communication.subject"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Communication.at"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Policy"
+  op = "add"
+  fields = { label = "Policy", synonyms = ["terms", "rule"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Policy.code"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Policy.text"
+  op = "add"
+  fields = { data_type = "text" }
+
+  # --- moved from care-bus scope industry/retail to base (spec 4.2); generic synonyms only,
+  # --- retail.toml patches the full care-bus lists. Order.shipment_id lives in retail.
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Order"
+  op = "add"
+  fields = { label = "Order", synonyms = ["purchase"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Order.order_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Order.placed"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Order.amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Order.status"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Product"
+  op = "add"
+  fields = { label = "Product", synonyms = ["item", "article"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Product.sku"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Product.name"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Product.category"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Payment"
+  op = "add"
+  fields = { label = "Payment", synonyms = ["charge", "transaction"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Payment.payment_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Payment.method"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Payment.amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Payment.status"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Payment.at"
+  op = "add"
+  fields = { data_type = "datetime" }
+
+  # --- core business objects (objects.txt)
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Party"
+  op = "add"
+  fields = { label = "Party", synonyms = ["person", "household", "company", "group"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.party_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.party_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.name"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.email"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.phone"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.postal_address"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.billing_address"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.corp_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Party.tax_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "ProductOffering"
+  op = "add"
+  fields = { label = "Product offering", synonyms = ["offer", "offering"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.offering_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.product_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.offering_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.sku"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.name"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.description"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.price"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.availability"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ProductOffering.stock_level"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Renewal"
+  op = "add"
+  fields = { label = "Renewal", synonyms = ["extension"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Renewal.renewal_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Renewal.renewal_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Renewal.initiator"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Renewal.renewal_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Renewal.period"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Delivery"
+  op = "add"
+  fields = { label = "Delivery", synonyms = ["fulfilment"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Delivery.delivery_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Delivery.delivery_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Delivery.delivery_method"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "PaymentMethod"
+  op = "add"
+  fields = { label = "Payment method", synonyms = ["payment option"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentMethod.payment_method_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentMethod.method_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentMethod.provider"
+  op = "add"
+  fields = { data_type = "string" }
+
+  # --- contract (object_contract.txt)
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Contract"
+  op = "add"
+  fields = { label = "Contract", synonyms = ["agreement"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.title"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.contract_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.effective_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.expiration_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.term"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.status"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.renewal_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.renewal_initiator"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Contract.customer_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "ContractParty"
+  op = "add"
+  fields = { label = "Contract party", synonyms = ["counterparty", "supplier", "subcontractor"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractParty.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractParty.party_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractParty.role"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractParty.legal_entity"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractParty.address"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractParty.contact_info"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Term"
+  op = "add"
+  fields = { label = "Contract terms", synonyms = ["terms and conditions", "clause"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Term.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Term.summary"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Term.document_ref"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Obligation"
+  op = "add"
+  fields = { label = "Obligation", synonyms = ["milestone", "deliverable"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Obligation.obligation_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Obligation.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Obligation.description"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Obligation.due_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Obligation.condition"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "ContractLineItem"
+  op = "add"
+  fields = { label = "Contract line item", synonyms = ["contract line", "contract item"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractLineItem.line_item_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractLineItem.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractLineItem.product_ref"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractLineItem.quantity"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractLineItem.unit_price"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ContractLineItem.schedule"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "PaymentTerm"
+  op = "add"
+  fields = { label = "Payment terms", synonyms = ["billing schedule"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentTerm.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentTerm.billing_schedule"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentTerm.payment_method_terms"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentTerm.discounts"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentTerm.penalties"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentTerm.late_fees"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Amendment"
+  op = "add"
+  fields = { label = "Amendment", synonyms = ["revision", "contract change"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Amendment.amendment_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Amendment.contract_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Amendment.effective_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Amendment.reason"
+  op = "add"
+  fields = { data_type = "text" }
+
+  # --- bill (object_bill.txt)
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Bill"
+  op = "add"
+  fields = { label = "Bill", synonyms = ["invoice"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.bill_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.customer_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.bill_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.due_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.bill_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.payment_terms"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.currency"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.status"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.total_amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.tax_amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.discount_amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.notes"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Bill.compliance_info"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "BillLineItem"
+  op = "add"
+  fields = { label = "Bill line item", synonyms = ["invoice line"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.line_item_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.bill_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.product_ref"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.description"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.quantity"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.unit_price"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.line_total"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.tax_rate"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "BillLineItem.discount_pct"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "PaymentRecord"
+  op = "add"
+  fields = { label = "Payment record", synonyms = ["receipt"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.payment_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.bill_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.payment_date"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.payment_method"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.transaction_ref"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "PaymentRecord.status"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Adjustment"
+  op = "add"
+  fields = { label = "Adjustment", synonyms = ["credit note", "correction"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Adjustment.adjustment_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Adjustment.bill_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Adjustment.adjustment_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Adjustment.amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Adjustment.reason"
+  op = "add"
+  fields = { data_type = "text" }
+
+  # --- base relations (care-bus 0002, the ones between base entities)
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Customer|places|Order"
+  op = "add"
+  fields = { cardinality = "1:n" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Order|contains|Product"
+  op = "add"
+  fields = { cardinality = "n:m" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Order|paidBy|Payment"
+  op = "add"
+  fields = { cardinality = "1:n" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Customer|receives|Communication"
+  op = "add"
+  fields = { cardinality = "1:n" }

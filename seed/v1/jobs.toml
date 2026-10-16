@@ -1,0 +1,16 @@
+# Seed v1 — generic job definitions (spec 4.5), base layer.
+
+[[layer]]
+scope = "base"
+
+  [[layer.row]]
+  kind = "job"
+  key = "customer_care_agent"
+  op = "add"
+  fields = { label = "Customer care agent", actor = "customer", stance = "aftersales is presales: every interaction is a brand moment", ontology_slice = ["Customer", "Order", "Product", "Payment", "Communication", "Policy"] }
+
+  [[layer.row]]
+  kind = "job"
+  key = "employee_care_agent"
+  op = "add"
+  fields = { label = "Employee care agent", actor = "employee", ontology_slice = ["Party", "Communication", "Policy"] }

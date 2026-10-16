@@ -1,0 +1,110 @@
+# Seed v1 — classifier axes (spec 4.3). Source: ~/Documents/01Quant/objects.txt.
+# A value's parent is its dotted prefix; `axis = v` also holds for descendants of v.
+
+# objects.txt customer-types: consumers (natural person, household) and legal entities (sole proprietorship, corporation, single representative of legal entities, conglomerate/committee).
+[[axis]]
+key = "customer_type"
+cardinality = "many"
+values = [
+  { key = "natural_person" },
+  { key = "household" },
+  { key = "sole_proprietorship" },
+  { key = "corporation" },
+  { key = "group_representative" },
+  { key = "conglomerate" },
+]
+
+# objects.txt product-types: service (consult), physical (pizza), virtual (e-book), access (lease/rental/saas), customer product (freemium).
+[[axis]]
+key = "product_type"
+cardinality = "many"
+values = [
+  { key = "service" },
+  { key = "physical" },
+  { key = "virtual" },
+  { key = "access_lease" },
+  { key = "freemium" },
+]
+
+# objects.txt product-offering-types: availability (regular, seasonal/limited-time, pre-order/backorder), combinatory (bundle, configurable), consumeability (usage-based).
+[[axis]]
+key = "offering_type"
+cardinality = "one"
+values = [
+  { key = "availability" },
+  { key = "availability.regular", parent = "availability" },
+  { key = "availability.seasonal", parent = "availability" },
+  { key = "availability.preorder", parent = "availability" },
+  { key = "combinatory" },
+  { key = "combinatory.bundle", parent = "combinatory" },
+  { key = "combinatory.configurable", parent = "combinatory" },
+  { key = "consumption" },
+  { key = "consumption.usage_based", parent = "consumption" },
+]
+
+# objects.txt order-types: discrete (ecommerce), recurring (subscription), continuous (electricity).
+[[axis]]
+key = "order_type"
+cardinality = "one"
+values = [
+  { key = "discrete" },
+  { key = "recurring" },
+  { key = "continuous" },
+]
+
+# objects.txt order-renewal-types: no renewal, customer initiated, provider initiated (explicit, implicit).
+[[axis]]
+key = "renewal_type"
+cardinality = "one"
+values = [
+  { key = "none" },
+  { key = "customer_initiated" },
+  { key = "provider" },
+  { key = "provider.explicit", parent = "provider" },
+  { key = "provider.implicit", parent = "provider" },
+]
+
+# objects.txt delivery-types.
+[[axis]]
+key = "delivery_type"
+cardinality = "one"
+values = [
+  { key = "pickup" },
+  { key = "delivery" },
+]
+
+# objects.txt delivery-methods.
+[[axis]]
+key = "delivery_method"
+cardinality = "one"
+values = [
+  { key = "physical" },
+  { key = "digital" },
+  { key = "administrative" },
+]
+
+# objects.txt payment-types: singleton, recurring (fixed, variable), balancing.
+[[axis]]
+key = "payment_type"
+cardinality = "one"
+values = [
+  { key = "singleton" },
+  { key = "recurring" },
+  { key = "recurring.fixed", parent = "recurring" },
+  { key = "recurring.variable", parent = "recurring" },
+  { key = "balancing" },
+]
+
+# objects.txt payment-method: cash-based, card-based, bank transfer, digital wallet (mobile, web, crypto).
+[[axis]]
+key = "payment_method"
+cardinality = "many"
+values = [
+  { key = "cash" },
+  { key = "card" },
+  { key = "bank_transfer" },
+  { key = "digital_wallet" },
+  { key = "digital_wallet.mobile", parent = "digital_wallet" },
+  { key = "digital_wallet.web", parent = "digital_wallet" },
+  { key = "digital_wallet.crypto", parent = "digital_wallet" },
+]

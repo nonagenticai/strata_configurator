@@ -1,0 +1,202 @@
+# Seed v1 — industry `retail` (spec 4.2): care-bus 0002's retail slice as overlays.
+# A relation lives in the layer that adds its later entity.
+
+[[layer]]
+scope = "industry"
+industry = "retail"
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Shipment"
+  op = "add"
+  fields = { label = "Shipment", synonyms = ["parcel", "package", "zending"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Shipment.shipment_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Shipment.carrier"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Shipment.status"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Shipment.eta"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Order.shipment_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Order|shippedVia|Shipment"
+  op = "add"
+  fields = { cardinality = "1:n" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Order"
+  op = "patch"
+  fields = { synonyms = ["purchase", "ord_no", "bestelling"] }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Product"
+  op = "patch"
+  fields = { synonyms = ["item", "article", "sku"] }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Payment"
+  op = "patch"
+  fields = { synonyms = ["charge", "transaction", "psp_reference"] }
+
+[[layer]]
+scope = "industry_dept"
+industry = "retail"
+department = "order-support"
+
+  [[layer.row]]
+  kind = "entity"
+  key = "ReturnAuthorization"
+  op = "add"
+  fields = { label = "Return (RMA)", synonyms = ["rma", "return label", "retour"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ReturnAuthorization.rma_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ReturnAuthorization.reason"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "ReturnAuthorization.deadline"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "entity"
+  key = "WarrantyClaim"
+  op = "add"
+  fields = { label = "Warranty claim", synonyms = ["guarantee claim", "repair"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "WarrantyClaim.claim_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "WarrantyClaim.defect"
+  op = "add"
+  fields = { data_type = "text" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "WarrantyClaim.warranty_until"
+  op = "add"
+  fields = { data_type = "date" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "ReturnAuthorization|for|Order"
+  op = "add"
+  fields = { cardinality = "n:1" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "WarrantyClaim|covers|Product"
+  op = "add"
+  fields = { cardinality = "n:1" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Policy|governs|ReturnAuthorization"
+  op = "add"
+  fields = { cardinality = "1:n" }
+
+[[layer]]
+scope = "industry_dept"
+industry = "retail"
+department = "logistics"
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Carrier"
+  op = "add"
+  fields = { label = "Carrier", synonyms = ["PostNL", "DHL", "courier"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Carrier.code"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Carrier.name"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Shipment|carriedBy|Carrier"
+  op = "add"
+  fields = { cardinality = "n:1" }
+
+[[layer]]
+scope = "industry_dept"
+industry = "retail"
+department = "payments"
+
+  [[layer.row]]
+  kind = "entity"
+  key = "Refund"
+  op = "add"
+  fields = { label = "Refund", synonyms = ["money back", "chargeback", "terugbetaling"] }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Refund.refund_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Refund.amount"
+  op = "add"
+  fields = { data_type = "money" }
+
+  [[layer.row]]
+  kind = "attribute"
+  key = "Refund.eta"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[layer.row]]
+  kind = "relation"
+  key = "Refund|reverses|Payment"
+  op = "add"
+  fields = { cardinality = "n:1" }
+

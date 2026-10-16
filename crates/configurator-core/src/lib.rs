@@ -6,3 +6,4 @@ pub mod carebus;
 pub mod compile;
 pub mod layer;
 pub mod overlay;
+pub mod seed;

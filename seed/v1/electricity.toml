@@ -1,0 +1,93 @@
+# Seed v1 — `electricity` profile template and the axis rules it triggers (spec 4.3).
+
+[[profile]]
+name = "electricity"
+values = { order_type = ["continuous"], renewal_type = ["provider.implicit"], product_type = ["access_lease"], payment_type = ["balancing"] }
+
+[[rule]]
+key = "metered_supply"
+priority = 100
+condition = { and = [{ eq = ["order_type", "continuous"] }, { eq = ["payment_type", "balancing"] }] }
+
+  [[rule.row]]
+  kind = "entity"
+  key = "MeterPoint"
+  op = "add"
+  fields = { label = "Meter point", synonyms = ["EAN", "connection point", "aansluiting"] }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterPoint.meter_point_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterPoint.ean"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterPoint.address"
+  op = "add"
+  fields = { data_type = "string", pii = true }
+
+  [[rule.row]]
+  kind = "entity"
+  key = "MeterReading"
+  op = "add"
+  fields = { label = "Meter reading", synonyms = ["reading", "meterstand"] }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterReading.reading_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterReading.meter_point_id"
+  op = "add"
+  fields = { data_type = "string" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterReading.value"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterReading.read_at"
+  op = "add"
+  fields = { data_type = "datetime" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "MeterReading.reading_type"
+  op = "add"
+  fields = { data_type = "enum" }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "Bill.meter_reading"
+  op = "add"
+  fields = { data_type = "number" }
+
+  [[rule.row]]
+  kind = "relation"
+  key = "Order|meteredBy|MeterPoint"
+  op = "add"
+  fields = { cardinality = "1:n" }
+
+[[rule]]
+key = "implicit_renewal"
+priority = 200
+condition = { eq = ["renewal_type", "provider.implicit"] }
+
+  [[rule.row]]
+  kind = "attribute"
+  key = "Renewal.notice_period_days"
+  op = "add"
+  fields = { data_type = "number" }
