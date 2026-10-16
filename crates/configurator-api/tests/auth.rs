@@ -157,6 +157,60 @@ async fn bad_signature_401() {
     );
 }
 
+/// Every claim check holds at the HTTP layer: each row is 401 `unauthorized`.
+#[tokio::test]
+async fn claim_checks_401() {
+    let e = common::env().await;
+    let without = |field: &str| {
+        let mut c = keys::claims(ROOT, &[keys::SUPER_ADMIN]);
+        c.as_object_mut().unwrap().remove(field);
+        c
+    };
+    let with = |field: &str, v: Value| {
+        let mut c = keys::claims(ROOT, &[keys::SUPER_ADMIN]);
+        c[field] = v;
+        c
+    };
+    let good = keys::claims(ROOT, &[keys::SUPER_ADMIN]);
+    let cases: Vec<(&str, String)> = vec![
+        ("expired", keys::sign(&keys::expiring_in(ROOT, -120))),
+        ("no exp", keys::sign(&without("exp"))),
+        ("no aud", keys::sign(&without("aud"))),
+        ("other aud", keys::sign(&with("aud", json!("account")))),
+        ("no iss", keys::sign(&without("iss"))),
+        (
+            "other iss",
+            keys::sign(&with("iss", json!("https://issuer.test/realms/other"))),
+        ),
+        ("no sub", keys::sign(&without("sub"))),
+        ("empty sub", keys::sign(&with("sub", json!("")))),
+        ("hs256", keys::hs256(&good)),
+        ("alg none", keys::alg_none(&good)),
+    ];
+    for (name, tok) in &cases {
+        let (s, b) = common::send(&e.app, common::get("/api/me", Some(tok.as_str()))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{name}: {b}");
+        assert_eq!(b["error"]["code"], "unauthorized", "{name}");
+    }
+    // controls: the same claims, RS256-signed by the trusted key, pass; so does a near-expiry token
+    for tok in [keys::sign(&good), keys::sign(&keys::expiring_in(ROOT, 60))] {
+        let (s, b) = common::send(&e.app, common::get("/api/me", Some(&tok))).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+    }
+    // the auth scheme is case-insensitive
+    for scheme in ["bearer", "BEARER", "Bearer"] {
+        let req = Request::get("/api/me")
+            .header("authorization", format!("{scheme} {}", keys::sign(&good)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            common::send(&e.app, req).await.0,
+            StatusCode::OK,
+            "{scheme}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn me_lists_memberships() {
     let e = common::env().await;
@@ -239,6 +293,9 @@ async fn only_super_admin_creates_tenants() {
         json!({"name": "", "first_admin_sub": "x"}),
         json!({"name": "X", "first_admin_sub": "  "}),
         json!({"name": "X"}),
+        json!({"name": "x".repeat(201), "first_admin_sub": "x"}),
+        json!({"name": "X", "first_admin_sub": "s".repeat(256)}),
+        json!({"name": "X", "first_admin_sub": "a\tb"}),
     ] {
         let (s, b) = common::send(
             &e.app,
@@ -248,6 +305,48 @@ async fn only_super_admin_creates_tenants() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["error"]["code"], "invalid_body");
     }
+
+    // values are trimmed before they are checked and stored; the caps are inclusive
+    let (s, b) = common::send(
+        &e.app,
+        common::json(
+            "POST",
+            "/api/tenants",
+            Some(&super_admin(ROOT)),
+            json!({"name": format!("  {}  ", "n".repeat(200)), "first_admin_sub": " trimmed "}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(b["name"], "n".repeat(200));
+    let tid = Uuid::parse_str(b["id"].as_str().unwrap()).unwrap();
+    let stored: Vec<String> = sqlx::query_scalar("SELECT sub FROM member WHERE tenant = $1")
+        .bind(tid)
+        .fetch_all(common::pool(&e))
+        .await
+        .unwrap();
+    assert_eq!(stored, ["trimmed"]);
+    let (s, b) = add_member(
+        &e.app,
+        tid,
+        &super_admin(ROOT),
+        &format!(" {} ", "s".repeat(255)),
+        "viewer",
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(b["sub"], "s".repeat(255));
+    let (s, b) = add_member(&e.app, tid, &super_admin(ROOT), " trimmed ", "viewer").await;
+    assert_eq!(
+        (s, b["error"]["code"].clone()),
+        (StatusCode::CONFLICT, json!("member_exists")),
+        "a padded sub is the same member"
+    );
+    sqlx::query("DELETE FROM tenant WHERE id = $1")
+        .bind(tid)
+        .execute(common::pool(&e))
+        .await
+        .unwrap();
 
     // listing: the super-admin sees all, others only their own
     create_tenant(&e.app, "Beta", "bob").await;
@@ -548,7 +647,8 @@ async fn writes_are_audited() {
     let rows = audit_rows(db).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     let (actor, tenant, action, object, before, after) = &rows[0];
-    assert_eq!(actor, &keys::username(ROOT));
+    // the actor is the token `sub` (stable), not the display username
+    assert_eq!(actor, ROOT);
     assert_eq!(*tenant, Some(t));
     assert_eq!(action, "tenant.create");
     assert_eq!(object, &format!("tenant:{t}"));
@@ -603,21 +703,21 @@ async fn writes_are_audited() {
         summary,
         [
             (
-                keys::username(ROOT),
+                ROOT.to_string(),
                 "tenant.create".to_string(),
                 format!("tenant:{t}"),
                 false,
                 true
             ),
             (
-                keys::username("alice"),
+                "alice".to_string(),
                 "member.add".to_string(),
                 bob.clone(),
                 false,
                 true
             ),
             (
-                keys::username("alice"),
+                "alice".to_string(),
                 "member.remove".to_string(),
                 bob,
                 true,

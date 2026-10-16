@@ -26,15 +26,25 @@ fn paged<T: serde::Serialize>(items: Vec<T>) -> Json<Value> {
     Json(json!({"items": items, "next": null}))
 }
 
-fn non_empty(field: &'static str, v: &str) -> Result<(), ApiError> {
-    if v.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "invalid_body",
-            format!("{field} must not be empty"),
-        ));
+/// `v` trimmed: 400 `invalid_body` when empty, longer than `max` characters, or holding control
+/// characters. The trimmed value is what gets stored.
+fn clean(field: &'static str, v: &str, max: usize) -> Result<String, ApiError> {
+    let t = v.trim();
+    let bad = |why: &str| ApiError::BadRequest("invalid_body", format!("{field} {why}"));
+    if t.is_empty() {
+        return Err(bad("must not be empty"));
     }
-    Ok(())
+    if t.chars().count() > max {
+        return Err(bad(&format!("must be at most {max} characters")));
+    }
+    if t.chars().any(char::is_control) {
+        return Err(bad("must not contain control characters"));
+    }
+    Ok(t.to_string())
 }
+
+const MAX_NAME: usize = 200;
+const MAX_SUB: usize = 255;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +54,7 @@ struct NewTenant {
 }
 
 /// Super-admin only: the tenant and its first admin, in one transaction, audited.
+/// Audit events name the caller by token `sub` (stable; matches `member.sub`).
 async fn create(
     State(st): State<AppState>,
     caller: Caller,
@@ -51,14 +62,14 @@ async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     require_super_admin(&caller)?;
     let Json(b) = body?;
-    non_empty("name", &b.name)?;
-    non_empty("first_admin_sub", &b.first_admin_sub)?;
+    let name = clean("name", &b.name, MAX_NAME)?;
+    let first_admin_sub = clean("first_admin_sub", &b.first_admin_sub, MAX_SUB)?;
     let mut tx = st.db.begin().await?;
-    let t = tenants::create(&mut tx, b.name.trim(), &b.first_admin_sub).await?;
-    let after = json!({"tenant": t, "first_admin_sub": b.first_admin_sub});
+    let t = tenants::create(&mut tx, &name, &first_admin_sub).await?;
+    let after = json!({"tenant": t, "first_admin_sub": first_admin_sub});
     audit::record(
         &mut tx,
-        &caller.actor,
+        &caller.sub,
         Some(t.id),
         "tenant.create",
         &format!("tenant:{}", t.id),
@@ -112,18 +123,18 @@ async fn add_member(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let ctx = admin_of(&st, caller, &id).await?;
     let Json(b) = body?;
-    non_empty("sub", &b.sub)?;
+    let sub = clean("sub", &b.sub, MAX_SUB)?;
     let mut tx = st.db.begin().await?;
-    let Some(m) = tenants::add_member(&mut tx, ctx.tenant, &b.sub, b.role).await? else {
+    let Some(m) = tenants::add_member(&mut tx, ctx.tenant, &sub, b.role).await? else {
         return Err(ApiError::Conflict(
             "member_exists",
-            format!("{} is already a member of this tenant", b.sub),
+            format!("{sub} is already a member of this tenant"),
         ));
     };
     let after = json!({"tenant": ctx.tenant, "sub": m.sub, "role": m.role});
     audit::record(
         &mut tx,
-        &ctx.caller.actor,
+        &ctx.caller.sub,
         Some(ctx.tenant),
         "member.add",
         &format!("member:{}:{}", ctx.tenant, m.sub),
@@ -161,7 +172,7 @@ async fn remove_member(
     let before = json!({"tenant": ctx.tenant, "sub": m.sub, "role": m.role});
     audit::record(
         &mut tx,
-        &ctx.caller.actor,
+        &ctx.caller.sub,
         Some(ctx.tenant),
         "member.remove",
         &format!("member:{}:{}", ctx.tenant, m.sub),

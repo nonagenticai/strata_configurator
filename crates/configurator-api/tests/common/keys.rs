@@ -54,20 +54,59 @@ pub fn decoding_key() -> DecodingKey {
     DecodingKey::from_rsa_components(&KEY.n, "AQAB").unwrap()
 }
 
-fn mint(key: &KeyPair, sub: &str, roles: &[&str]) -> String {
-    let exp = SystemTime::now()
+fn now() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs()
-        + 300;
-    let mut h = Header::new(Algorithm::RS256);
-    h.kid = Some("test".into());
-    let claims = serde_json::json!({
-        "sub": sub, "preferred_username": username(sub), "exp": exp,
+        .as_secs() as i64
+}
+
+/// The claims of a valid token for `sub`; tests edit or remove fields before signing.
+pub fn claims(sub: &str, roles: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "sub": sub, "preferred_username": username(sub), "exp": now() + 300,
         "iss": TEST_ISSUER, "aud": TEST_AUDIENCE,
         "realm_access": {"roles": roles}
-    });
-    encode(&h, &claims, &key.enc).unwrap()
+    })
+}
+
+/// `claims` with `exp` this many seconds from now (negative = already expired).
+pub fn expiring_in(sub: &str, secs: i64) -> serde_json::Value {
+    let mut c = claims(sub, &[]);
+    c["exp"] = (now() + secs).into();
+    c
+}
+
+fn sign_with(key: &KeyPair, claims: &serde_json::Value) -> String {
+    let mut h = Header::new(Algorithm::RS256);
+    h.kid = Some("test".into());
+    encode(&h, claims, &key.enc).unwrap()
+}
+
+/// RS256 over arbitrary claims with the trusted key.
+pub fn sign(claims: &serde_json::Value) -> String {
+    sign_with(&KEY, claims)
+}
+
+/// Algorithm confusion: HS256, keyed with the trusted RSA public modulus.
+pub fn hs256(claims: &serde_json::Value) -> String {
+    let mut h = Header::new(Algorithm::HS256);
+    h.kid = Some("test".into());
+    encode(&h, claims, &EncodingKey::from_secret(KEY.n.as_bytes())).unwrap()
+}
+
+/// An unsigned `alg: none` token (jsonwebtoken cannot mint one, so it is built by hand).
+pub fn alg_none(claims: &serde_json::Value) -> String {
+    let header = br#"{"alg":"none","typ":"JWT"}"#;
+    format!(
+        "{}.{}.",
+        b64url(header),
+        b64url(claims.to_string().as_bytes())
+    )
+}
+
+fn mint(key: &KeyPair, sub: &str, roles: &[&str]) -> String {
+    sign_with(key, &claims(sub, roles))
 }
 
 /// The `preferred_username` minted for `sub`, i.e. the audit actor.

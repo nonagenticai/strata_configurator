@@ -116,6 +116,9 @@ impl Verifier {
             }
         };
         let mut v = Validation::new(Algorithm::RS256);
+        // jsonwebtoken checks `iss`/`aud` only when present: make them (and `sub`) mandatory, so a
+        // portal-realm token minted for another client without an `aud` cannot pass (spec 10.2).
+        v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         v.set_issuer(&[&self.issuer]);
         v.set_audience(&[&self.audience]);
         v.leeway = 5;
@@ -202,8 +205,9 @@ async fn fetch(
 /// The authenticated person. Missing or invalid token → 401.
 #[derive(Clone, Debug)]
 pub struct Caller {
+    /// The stable identity: matches `member.sub` and is the audit actor.
     pub sub: String,
-    /// Written to audit events.
+    /// `preferred_username`, else `sub`: for display only (usernames can change).
     pub actor: String,
     /// Holds the configured super-admin realm role (`config-super-admin` by default).
     pub super_admin: bool,
@@ -217,7 +221,12 @@ impl FromRequestParts<AppState> for Caller {
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or(ApiError::Unauthorized)?;
-        let token = h.strip_prefix("Bearer ").ok_or(ApiError::Unauthorized)?;
+        // The auth scheme is case-insensitive (RFC 7235).
+        let (scheme, token) = h.split_once(' ').ok_or(ApiError::Unauthorized)?;
+        let token = token.trim();
+        if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+            return Err(ApiError::Unauthorized);
+        }
         let c = st.auth.verify(token).await?;
         Ok(Caller {
             super_admin: c.has(&st.cfg.super_admin_role),
