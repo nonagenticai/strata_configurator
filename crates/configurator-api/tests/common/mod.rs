@@ -1,12 +1,15 @@
 //! Integration test harness, copied from care-bus `crates/carebus-api/tests/common/mod.rs` @ 3b88445
 //! (never a dependency on it): ONE Postgres 18 container per test binary, a fresh database per test.
 #![allow(dead_code)]
+pub mod keys;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use configurator_api::auth::Verifier;
 use configurator_api::{config::Config, db, routes, state::AppState};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -187,7 +190,13 @@ pub async fn env() -> TestEnv {
         .await
         .expect("connect to the test database");
     db::migrate(&pool).await.expect("migrations apply");
-    let state = AppState::new(test_config(url), pool);
+    let cfg = test_config(url);
+    let verifier = Verifier::static_key(
+        &cfg.keycloak_issuer,
+        &cfg.keycloak_audience,
+        keys::decoding_key(),
+    );
+    let state = AppState::new(cfg, pool).with_verifier(verifier);
     let app = routes::router(state.clone());
     TestEnv { state, app }
 }

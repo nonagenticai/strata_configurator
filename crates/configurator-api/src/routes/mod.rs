@@ -4,10 +4,14 @@ use crate::error;
 use crate::state::AppState;
 
 pub mod health;
+pub mod me;
+pub mod tenants;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(health::routes())
+        .merge(me::routes())
+        .merge(tenants::routes())
         .fallback(error::fallback)
         .method_not_allowed_fallback(error::method_not_allowed)
         .with_state(state)

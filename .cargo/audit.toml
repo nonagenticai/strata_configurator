@@ -1,0 +1,9 @@
+# cargo-audit config (read by the rust-library archetype's `cargo audit` step).
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071: rsa — Marvin timing side-channel on PKCS#1 v1.5 decryption; no fixed
+  # release exists. `rsa` is ONLY a dev-dependency of configurator-api, used to generate
+  # throwaway JWT signing keys in tests; it never ships in an image and never decrypts
+  # attacker-supplied data. Revisit if it gains a normal edge.
+  "RUSTSEC-2023-0071",
+]

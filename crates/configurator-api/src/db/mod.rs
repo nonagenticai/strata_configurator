@@ -36,3 +36,5 @@ pub async fn ping(pool: &PgPool) -> bool {
         .await
         .is_ok()
 }
+
+pub mod tenants;

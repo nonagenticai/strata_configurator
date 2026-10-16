@@ -11,8 +11,17 @@ pub enum ApiError {
     Unauthorized,
     #[error("this needs the {0} role")]
     Forbidden(&'static str),
+    /// 403 with its own code, e.g. `not_a_member`.
+    #[error("{1}")]
+    Denied(&'static str, String),
     #[error("{0} not found")]
     NotFound(String),
+    /// 404 with its own code, e.g. `tenant_not_found`.
+    #[error("{1}")]
+    Missing(&'static str, String),
+    /// 409 with its own code, e.g. `last_admin`.
+    #[error("{1}")]
+    Conflict(&'static str, String),
     #[error("this route does not accept that method")]
     MethodNotAllowed,
     #[error("{1}")]
@@ -28,11 +37,27 @@ impl ApiError {
             ApiError::BadRequest(c, _) => (StatusCode::BAD_REQUEST, *c),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            ApiError::Denied(c, _) => (StatusCode::FORBIDDEN, *c),
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
+            ApiError::Missing(c, _) => (StatusCode::NOT_FOUND, *c),
+            ApiError::Conflict(c, _) => (StatusCode::CONFLICT, *c),
             ApiError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             ApiError::Unavailable(c, _) => (StatusCode::SERVICE_UNAVAILABLE, *c),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
+    }
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(e: sqlx::Error) -> Self {
+        ApiError::Internal(e.into())
+    }
+}
+
+/// A JSON body that did not parse: the error envelope, never axum's plain-text rejection.
+impl From<axum::extract::rejection::JsonRejection> for ApiError {
+    fn from(e: axum::extract::rejection::JsonRejection) -> Self {
+        ApiError::BadRequest("invalid_body", e.body_text())
     }
 }
 
