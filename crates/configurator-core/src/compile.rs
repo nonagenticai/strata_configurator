@@ -147,7 +147,7 @@ pub struct EffectiveConfig {
     /// `"entity:Order"` -> the rows that built the object, in apply order.
     pub provenance: BTreeMap<String, Vec<Origin>>,
     pub warnings: Vec<Warning>,
-    /// Filled by the hashing step (Task 5).
+    /// sha256 of the canonical JSON of selection, entities, attributes, relations and job.
     pub hash: String,
 }
 
@@ -741,7 +741,7 @@ pub fn compile(
     // Tombstones drop provenance entries, so every entry is for a present object.
     let provenance = state.provenance;
 
-    Ok(EffectiveConfig {
+    let mut cfg = EffectiveConfig {
         selection: sel.clone(),
         entities,
         attributes,
@@ -750,7 +750,9 @@ pub fn compile(
         provenance,
         warnings,
         hash: String::new(),
-    })
+    };
+    cfg.hash = crate::canonical::effective_hash(&cfg);
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -1135,7 +1137,7 @@ mod tests {
         let order = &cfg.entities["Order"];
         assert_eq!(order.synonyms, vec!["z".to_owned()]);
         assert_eq!(order.label, "Order");
-        assert!(cfg.hash.is_empty());
+        assert_eq!(cfg.hash.len(), 64);
     }
 
     #[test]
