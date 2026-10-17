@@ -139,11 +139,11 @@ Each workstream is one PR per repo (PR discipline). Rust is verified in CI only 
    - base rows carry `release_id`;
    - the tenant admin edits only create `origin=tenant` rows, as overrides, extensions or `hidden` tombstones, with the same natural key as the base row (commonpractice's `tenantRowForGlobal` predicate);
    - the effective view = base(current release) ⊕ tenant rows, computed at read time, the same as commonpractice `compileEffective`.
-5. Release endpoint: `PUT /api/jobs/{job}/releases/{release_id}`, authenticated by a client-credentials SA with the client role `release-writer` (P4).
+5. Release endpoint: `PUT /api/tenants/{tenant}/jobs/{job}/releases/{release_id}` (tenant in the path: the SA token carries none), authenticated by a client-credentials SA with the client role `release-writer` (P4). The same role, and nothing else, also covers tenant provisioning `PUT /api/tenants/{tenant}` (tenant + first `tenant_admin`).
    - Body: the configurator's release bundle (ontology slice, context spaces/use cases, procedures, job settings, connector *slots* without secrets, knowledge store layout), plus its hash.
    - Idempotent on `(tenant, job, release_id, hash)`; a re-push is a no-op.
    - The apply is transactional: it swaps the base rows to the new release and reports a conflict for every tenant row whose base target disappeared or changed. Conflicts are kept, flagged in the admin UI and returned in the response.
-   - `GET /api/jobs/{job}/releases/current` exposes the current release for read-back (drift).
+   - `GET /api/tenants/{tenant}/jobs/{job}/releases/current` exposes the current release for read-back (drift).
 6. Data-driven substrate (P1, P2, P5): request types, areas and slots come from the effective context spaces; tools and side-effect flags come from config; this removes the `domain.rs` constants. This is the largest item; split it in the care-bus plan.
 7. Admin UI: everything is job-scoped; refinements of connectors (credentials, endpoints, field mappings) and knowledge areas sit on top of the base; base and tenant values are shown side by side, with unhide/revert.
 8. Licensing gate 2 (app key `care-bus`) and metering of LLM calls through the outbox → `billing:costs` (care-bus makes LLM calls today). Both ship dark behind flags.
