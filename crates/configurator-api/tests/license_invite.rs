@@ -374,10 +374,11 @@ async fn an_existing_identity_is_reused_without_an_email() {
         user_row(&e, "kc-existing").await,
         Some((t, "tenant_admin".to_string()))
     );
-    let g = lock(&up.mock);
-    assert!(g.created.is_empty(), "no identity created: {:?}", g.created);
-    assert!(g.emails.is_empty(), "no email sent: {:?}", g.emails);
-    drop(g);
+    {
+        let g = lock(&up.mock);
+        assert!(g.created.is_empty(), "no identity created: {:?}", g.created);
+        assert!(g.emails.is_empty(), "no email sent: {:?}", g.emails);
+    }
 
     // inviting them again is the usual 409, and still sends nothing
     let (s, b) = add(
