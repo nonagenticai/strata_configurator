@@ -79,7 +79,13 @@ async fn migration_upgrade_preserves_existing_seed_data() {
             .collect(),
     );
     first.run(&pool).await.unwrap();
-    seeder::apply(&pool, &seeder::embedded().unwrap())
+    // A 0001-era database holds seed v1 only: v2's job-content kinds need 0008.
+    let bundles = seeder::embedded().unwrap();
+    let v1 = bundles
+        .iter()
+        .find(|b| b.version == 1)
+        .expect("v1 embedded");
+    seeder::apply(&pool, std::slice::from_ref(v1))
         .await
         .unwrap();
     // memberships as 0001 held them: several tenants per subject
