@@ -13,7 +13,7 @@ jobs:
       image_name: strata-configurator-api
       cargo_package: configurator-api
       deploy_namespace: strata-configurator
-      test_command: 'cargo test --workspace --locked'
+      test_command: 'cargo test --workspace --locked -- --show-output'
       prepull_images: |
         registry.internal:5000/library/postgres:18-alpine
       dockerfile_path: Dockerfile.rust
