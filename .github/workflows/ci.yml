@@ -21,3 +21,13 @@ jobs:
         docker run --rm --entrypoint sh "$IMAGE_REF" -c
         'test -x /usr/local/bin/configurator-api && ! ldd /usr/local/bin/configurator-api | grep -q "not found"'
     secrets: inherit
+  web:
+    uses: nonagenticai/gitops-production/.github/workflows/ts-service.yml@main
+    with:
+      image_name: strata-configurator-web
+      working_directory: web
+      cache_dependency_path: web/package-lock.json
+      docker_build: true
+      dockerfile_path: Dockerfile
+      node_version: "24"
+    secrets: inherit
