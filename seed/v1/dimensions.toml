@@ -1,0 +1,28 @@
+# Seed v1 — standard dimensions (spec 4.4). Tenant-specific values are added through the API.
+
+[[dimension]]
+key = "department"
+label = "Department"
+values = [
+  { key = "order-support", label = "Order support" },
+  { key = "logistics", label = "Logistics" },
+  { key = "payments", label = "Payments" },
+  { key = "faq", label = "FAQ" },
+]
+
+[[dimension]]
+key = "channel"
+label = "Channel"
+values = [
+  { key = "chat", label = "Chat" },
+  { key = "voice", label = "Voice" },
+  { key = "email", label = "Email" },
+]
+
+[[dimension]]
+key = "region"
+label = "Region"
+values = [
+  { key = "eu", label = "EU" },
+  { key = "us", label = "US" },
+]
