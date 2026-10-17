@@ -97,11 +97,32 @@ pub fn parse_tenant_id(s: &str) -> Result<Uuid, ApiError> {
     Ok(id)
 }
 
-fn tenant_not_found(tenant: Uuid) -> ApiError {
+pub fn tenant_not_found(tenant: Uuid) -> ApiError {
     ApiError::Missing(
         "tenant_not_found",
         format!("tenant {tenant} does not exist"),
     )
+}
+
+/// 403 `tenant_suspended`: the tenant was offboarded (archived). commonpractice's code for a workspace
+/// it has offboarded (`middleware/tenant-status-gate.ts`), so a client handles both alike.
+pub fn tenant_suspended(tenant: Uuid) -> ApiError {
+    ApiError::Denied(
+        "tenant_suspended",
+        format!("tenant {tenant} has been offboarded"),
+    )
+}
+
+/// The tenant exists (404 `tenant_not_found`) and is not archived (403 `tenant_suspended`). Checked
+/// before licence gate 2: an offboarded tenant holds no licence, and "offboarded" is the true reason.
+/// Unlike commonpractice's suspension gate the super-admin is not exempt: an offboard is final (there
+/// is no un-archive), so there is nothing to undo from inside the tenant.
+async fn live_tenant(st: &AppState, tenant: Uuid) -> Result<(), ApiError> {
+    match tenants::archived(&st.db, tenant).await? {
+        None => Err(tenant_not_found(tenant)),
+        Some(true) => Err(tenant_suspended(tenant)),
+        Some(false) => Ok(()),
+    }
 }
 
 /// 403 `no_workspace`: the caller has no active `users` row.
@@ -139,10 +160,12 @@ pub fn active_tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiErro
 ///
 /// - Anyone but the super-admin: their own tenant and role from `users`; no row, or a disabled one, is
 ///   403 `no_workspace`. `X-Active-Tenant-Id` is ignored, so it cannot be used to probe tenants. Then
-///   licence gate 2 (402/403 `license_*` when it is enabled and the tenant is not licensed).
+///   licence gate 2 (402/403 `license_*` when it is enabled and the tenant is not licensed). An archived
+///   tenant is 403 `tenant_suspended` before the gate (its users are disabled by the offboard too).
 /// - The super-admin: the header's tenant (400 `invalid_tenant` when malformed, 404 `tenant_not_found`
-///   when unknown) as `tenant_admin`, audited as `tenant.scope_switch` unless it is their own tenant;
-///   without the header their own tenant if they have one, else the platform view. Licence gate 2
+///   when unknown, 403 `tenant_suspended` when archived) as `tenant_admin`, audited as
+///   `tenant.scope_switch` unless it is their own tenant; without the header their own tenant if they
+///   have one, else the platform view. Licence gate 2
 ///   applies to that tenant exactly as to its members (the platform view is not gated); a switch it
 ///   refuses is not audited, since no work happened in the tenant.
 pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acting, ApiError> {
@@ -150,6 +173,7 @@ pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acti
         let (tenant, role) = users::home(&st.db, &caller.sub)
             .await?
             .ok_or_else(no_workspace)?;
+        live_tenant(st, tenant).await?;
         license::check(st, tenant).await?;
         return Ok(Acting::Tenant(TenantCtx {
             caller,
@@ -161,15 +185,12 @@ pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acti
     let home = users::home(&st.db, &caller.sub).await?.map(|(t, _)| t);
     let (tenant, switched) = match (header, home) {
         (Some(t), Some(h)) if t == h => (t, false),
-        (Some(t), _) => {
-            if !tenants::exists(&st.db, t).await? {
-                return Err(tenant_not_found(t));
-            }
-            (t, true)
-        }
+        (Some(t), _) => (t, true),
         (None, Some(h)) => (h, false),
         (None, None) => return Ok(Acting::Platform(caller)),
     };
+    // Switching into an archived tenant is refused like any other request for it.
+    live_tenant(st, tenant).await?;
     license::check(st, tenant).await?;
     if switched {
         audit::scope_switch(
@@ -204,9 +225,7 @@ pub async fn in_tenant(
     tenant: Uuid,
 ) -> Result<TenantCtx, ApiError> {
     if caller.super_admin {
-        if !tenants::exists(&st.db, tenant).await? {
-            return Err(tenant_not_found(tenant));
-        }
+        live_tenant(st, tenant).await?;
         // A malformed header is no scope switch here (as commonpractice), not a 400: this route's
         // tenant comes from its path.
         let scope = match active_tenant_header(headers).ok().flatten() {
@@ -228,6 +247,7 @@ pub async fn in_tenant(
     if home != tenant {
         return Err(tenant_not_found(tenant));
     }
+    live_tenant(st, tenant).await?;
     license::check(st, tenant).await?;
     Ok(TenantCtx {
         caller,

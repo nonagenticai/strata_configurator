@@ -7,7 +7,7 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,6 +19,7 @@ use crate::auth::{Caller, require_super_admin};
 use crate::db::{licenses, signups, tenants, users};
 use crate::error::ApiError;
 use crate::licenses_admin::{Issued, registry_name};
+use crate::offboarding;
 use crate::page::{self, Paged, TimeCursor};
 use crate::state::AppState;
 use crate::tenancy::{self, Role, TenantCtx};
@@ -31,6 +32,7 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/{id}/users/{sub}",
             patch(change_role).delete(disable_user),
         )
+        .route("/api/tenants/{id}/offboard", post(offboard))
 }
 
 /// A whole (unpaged) list in the `Paged{items,next}` envelope: `next` is null.
@@ -403,9 +405,23 @@ async fn insert_tenant(
 struct ListQuery {
     limit: Option<String>,
     before: Option<String>,
+    include_archived: Option<String>,
 }
 
-/// The super-admin sees every tenant; anyone else their own (zero or one). Newest first, paged.
+/// `include_archived`: absent or `false` → false, `true` → true; anything else 400 `invalid_query`.
+fn include_archived(v: Option<&str>) -> Result<bool, ApiError> {
+    match v {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(ApiError::BadRequest(
+            "invalid_query",
+            "include_archived must be true or false".into(),
+        )),
+    }
+}
+
+/// The super-admin sees every live tenant (and the archived ones too with `include_archived=true`);
+/// anyone else their own (zero or one; never an archived one). Newest first, paged.
 async fn list(
     State(st): State<AppState>,
     caller: Caller,
@@ -414,8 +430,9 @@ async fn list(
     let Query(q) = q?;
     let limit = page::limit(q.limit.as_deref())?;
     let before = TimeCursor::decode(q.before.as_deref())?;
+    let archived = include_archived(q.include_archived.as_deref())?;
     let rows = if caller.super_admin {
-        tenants::list_all(&st.db, before, page::fetch(limit)).await?
+        tenants::list_all(&st.db, before, page::fetch(limit), archived).await?
     } else {
         tenants::list_for(&st.db, &caller.sub, before, page::fetch(limit)).await?
     };
@@ -562,4 +579,59 @@ async fn disable_user(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OffboardBody {
+    /// The tenant's name, typed by the operator (commonpractice types the slug; this tenant has none).
+    confirm_name: String,
+}
+
+/// Super-admin only, a platform route (not gated by licence gate 2 for the target tenant; as
+/// commonpractice's `requireSuperAdmin` `POST /api/tenants/:id/offboard`): offboard the tenant, see
+/// [`offboarding`]. Guards first, before any write: 403 `forbidden` (not the super-admin), 400
+/// `invalid_tenant`, 400 `invalid_body`, 404 `tenant_not_found`, 400 `confirm_mismatch` unless
+/// `confirm_name` is the tenant's name. Then the licence is revoked (502 `license_provisioning_failed`
+/// when that fails: nothing else changed, the tenant is live and still licensed, retry), then the tenant
+/// is archived and its users disabled, audited as `tenant.offboard`. 200 with the archived tenant.
+///
+/// Idempotent: offboarding an archived tenant is 200 with the same tenant (its original `archived_at`),
+/// `already_archived: true` and `license_revoked: null`, without calling licences; nothing is written
+/// (unless a user was somehow left active, who is disabled then).
+async fn offboard(
+    State(st): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    body: Result<Json<OffboardBody>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&caller)?;
+    let tenant = tenancy::parse_tenant_id(&id)?;
+    let Json(b) = body?;
+    let Some(t) = tenants::get(&st.db, tenant).await? else {
+        return Err(tenancy::tenant_not_found(tenant));
+    };
+    if b.confirm_name.trim() != t.name {
+        return Err(ApiError::BadRequest(
+            "confirm_mismatch",
+            format!(
+                "type the tenant name {:?} to confirm offboarding; this cannot be undone",
+                t.name
+            ),
+        ));
+    }
+    // Archived already: the licence was revoked before it was archived, so licences is not asked
+    // again; the archive below then changes nothing.
+    let revoked = if t.archived_at.is_some() {
+        None
+    } else {
+        offboarding::revoke_tenant_license(&st, &caller.sub, tenant).await?
+    };
+    let done = offboarding::archive_tenant(&st, &caller.sub, tenant, revoked.as_deref()).await?;
+    Ok(Json(json!({
+        "tenant": done.tenant,
+        "already_archived": done.already_archived,
+        "license_revoked": revoked,
+        "users_disabled": done.users_disabled,
+    })))
 }

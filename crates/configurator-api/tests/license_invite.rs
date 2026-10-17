@@ -1091,3 +1091,297 @@ async fn license_status_is_never_402() {
         (&json!("not_enforced"), &json!(false))
     );
 }
+
+// ---- the offboard route: POST /api/tenants/{id}/offboard ----
+
+async fn offboard(e: &common::TestEnv, t: Uuid, confirm: &str) -> (StatusCode, Value) {
+    root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/offboard"),
+        json!({"confirm_name": confirm}),
+    )
+    .await
+}
+
+/// `t`'s `archived_at` and how many of its users are still active, read as the owner.
+async fn tenant_state(e: &common::TestEnv, t: Uuid) -> (Option<String>, i64, i64) {
+    sqlx::query_as(
+        "SELECT to_jsonb(t.archived_at) #>> '{}', \
+                (SELECT count(*) FROM users u WHERE u.tenant = t.id), \
+                (SELECT count(*) FROM users u WHERE u.tenant = t.id AND u.disabled_at IS NULL) \
+         FROM tenant t WHERE t.id = $1",
+    )
+    .bind(t)
+    .fetch_one(common::pool(e))
+    .await
+    .unwrap()
+}
+
+fn listed(b: &Value) -> Vec<String> {
+    b["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn offboarding_revokes_the_licence_then_archives_the_tenant() {
+    let (up, e, t) = licensed().await;
+    let (s, _) = add(&e, t, json!({"sub": "bob", "role": "tenant_user"})).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    let (s, b) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["tenant"]["id"], json!(t));
+    assert!(
+        b["tenant"]["archived_at"].as_str().unwrap().contains('T'),
+        "{b}"
+    );
+    assert_eq!(
+        (
+            &b["already_archived"],
+            &b["license_revoked"],
+            &b["users_disabled"]
+        ),
+        (&json!(false), &json!("lic-1"), &json!(2))
+    );
+    assert_eq!(lock(&up.mock).revoked, ["lic-1"], "revoked by id, once");
+    assert_eq!(stored_token(&e, t).await, None, "the licence row is gone");
+
+    // soft: the tenant and its users stay, archived and disabled
+    let (archived_at, users, active) = tenant_state(&e, t).await;
+    assert_eq!(archived_at.as_deref(), b["tenant"]["archived_at"].as_str());
+    assert_eq!((users, active), (2, 0), "users are disabled, never deleted");
+    assert_eq!(audited(&e, "license.revoke").await, 1);
+    assert_eq!(audited(&e, "tenant.offboard").await, 1);
+
+    // hidden from the tenant list unless asked for
+    let (s, all) = as_root(&e, "/api/tenants", None).await;
+    assert_eq!(s, StatusCode::OK, "{all}");
+    assert!(listed(&all).is_empty(), "{all}");
+    let (s, all) = as_root(&e, "/api/tenants?include_archived=true", None).await;
+    assert_eq!(s, StatusCode::OK, "{all}");
+    assert_eq!(listed(&all), [t.to_string()]);
+    assert_eq!(all["items"][0]["archived_at"], b["tenant"]["archived_at"]);
+    let (s, bad) = as_root(&e, "/api/tenants?include_archived=yes", None).await;
+    assert_eq!(
+        (s, code(&bad)),
+        (StatusCode::BAD_REQUEST, &json!("invalid_query"))
+    );
+}
+
+#[tokio::test]
+async fn a_failed_licence_revoke_keeps_the_tenant_live() {
+    for (down, noop) in [(true, false), (false, true)] {
+        let (up, e, t) = licensed().await;
+        {
+            let mut g = lock(&up.mock);
+            g.revoke_down = down;
+            g.revoke_noop = noop;
+        }
+        let (s, b) = offboard(&e, t, "Acme").await;
+        assert_eq!(
+            (s, code(&b)),
+            (
+                StatusCode::BAD_GATEWAY,
+                &json!("license_provisioning_failed")
+            ),
+            "down={down} noop={noop}: {b}"
+        );
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("retry"),
+            "{b}"
+        );
+        // nothing else changed: live, licensed, its users active
+        assert!(
+            stored_token(&e, t).await.is_some(),
+            "the licence row is kept"
+        );
+        assert_eq!(tenant_state(&e, t).await, (None, 1, 1));
+        assert_eq!(audited(&e, "license.revoke_failed").await, 1);
+        assert_eq!(audited(&e, "tenant.offboard").await, 0);
+        let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+        assert_eq!(s, StatusCode::OK, "the tenant still works: {b}");
+
+        // once licences answers, the retry offboards
+        {
+            let mut g = lock(&up.mock);
+            g.revoke_down = false;
+            g.revoke_noop = false;
+        }
+        let (s, b) = offboard(&e, t, "Acme").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["license_revoked"], "lic-1");
+        assert_eq!(stored_token(&e, t).await, None);
+    }
+}
+
+#[tokio::test]
+async fn offboarding_an_archived_tenant_is_the_same_answer_without_licences() {
+    let (up, e, t) = licensed().await;
+    let (s, first) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::OK, "{first}");
+    let calls = {
+        let g = lock(&up.mock);
+        (g.revoked.len(), g.grants)
+    };
+    assert_eq!(calls.0, 1);
+
+    let (s, again) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again["tenant"], first["tenant"], "the original archived_at");
+    assert_eq!(
+        (
+            &again["already_archived"],
+            &again["license_revoked"],
+            &again["users_disabled"]
+        ),
+        (&json!(true), &Value::Null, &json!(0))
+    );
+    let seen = {
+        let g = lock(&up.mock);
+        (g.revoked.len(), g.grants)
+    };
+    assert_eq!(
+        seen, calls,
+        "licences not called again (no revoke, no token grant)"
+    );
+    assert_eq!(
+        audited(&e, "tenant.offboard").await,
+        1,
+        "nothing new written"
+    );
+    assert_eq!(audited(&e, "license.revoke").await, 1);
+}
+
+#[tokio::test]
+async fn only_the_super_admin_offboards_and_only_when_confirmed() {
+    let (up, e, t) = licensed().await;
+    let uri = format!("/api/tenants/{t}/offboard");
+    // the tenant's own admin: a platform route, 403
+    let (s, b) = member(
+        &e.app,
+        "POST",
+        &uri,
+        "alice",
+        json!({"confirm_name": "Acme"}),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, &json!("forbidden")),
+        "{b}"
+    );
+    // the super-admin: the wrong name, an unknown tenant, a malformed id, a bad body
+    let (s, b) = offboard(&e, t, "acme").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_REQUEST, &json!("confirm_mismatch")),
+        "{b}"
+    );
+    let (s, b) = offboard(&e, Uuid::new_v4(), "Acme").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::NOT_FOUND, &json!("tenant_not_found"))
+    );
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants/not-a-uuid/offboard",
+        json!({"confirm_name": "Acme"}),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_REQUEST, &json!("invalid_tenant"))
+    );
+    let (s, b) = root(&e.app, "POST", &uri, json!({"name": "Acme"})).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_REQUEST, &json!("invalid_body"))
+    );
+
+    // none of that touched anything
+    assert!(lock(&up.mock).revoked.is_empty(), "licences never called");
+    assert!(stored_token(&e, t).await.is_some());
+    assert_eq!(tenant_state(&e, t).await, (None, 1, 1));
+    assert_eq!(audited(&e, "tenant.offboard").await, 0);
+}
+
+#[tokio::test]
+async fn an_archived_tenant_is_refused_on_every_tenant_scoped_route() {
+    let (_up, e, t) = licensed().await;
+    let (s, b) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let suspended = (StatusCode::FORBIDDEN, json!("tenant_suspended"));
+    // the super-admin cannot switch into it, nor reach it by path
+    let (s, b) = as_root(&e, "/api/layers", Some(t)).await;
+    assert_eq!((s, code(&b).clone()), suspended, "switch: {b}");
+    let (s, b) = as_root(&e, &format!("/api/tenants/{t}/users"), None).await;
+    assert_eq!((s, code(&b).clone()), suspended, "by path: {b}");
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/users"),
+        json!({"sub": "carol", "role": "tenant_user"}),
+    )
+    .await;
+    assert_eq!((s, code(&b).clone()), suspended, "no one can be added: {b}");
+    // its former members have no workspace any more, and see no tenant
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, &json!("no_workspace"))
+    );
+    let (s, b) = member(&e.app, "GET", "/api/tenants", "alice", Value::Null).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(listed(&b).is_empty(), "{b}");
+}
+
+#[tokio::test]
+async fn an_archived_tenant_with_an_active_user_is_still_refused() {
+    // Defence in depth, gate 2 off, under RLS as `configurator_app`: a user row left active on an
+    // archived tenant (by hand, or a future path) is refused by the tenant, not served.
+    let e = common::env().await;
+    let t = tenant(&e).await;
+    let (s, _) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "control");
+    sqlx::query("UPDATE tenant SET archived_at = now() WHERE id = $1")
+        .bind(t)
+        .execute(common::pool(&e))
+        .await
+        .unwrap();
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, &json!("tenant_suspended")),
+        "{b}"
+    );
+    let (s, b) = member(
+        &e.app,
+        "GET",
+        &format!("/api/tenants/{t}/users"),
+        "alice",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, &json!("tenant_suspended")),
+        "{b}"
+    );
+    // a repeat offboard completes it: the user left active is disabled, licences is not involved
+    let (s, b) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        (&b["already_archived"], &b["users_disabled"]),
+        (&json!(true), &json!(1))
+    );
+    let (archived_at, users, active) = tenant_state(&e, t).await;
+    assert!(archived_at.is_some());
+    assert_eq!((users, active), (1, 0));
+    assert_eq!(audited(&e, "tenant.offboard").await, 1);
+}
