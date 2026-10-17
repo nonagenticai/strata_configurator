@@ -4,7 +4,11 @@
 
 use configurator_core::canonical::canonical_json;
 use configurator_core::compile::{EffectiveConfig, Selection, compile};
-use configurator_core::release::{HashError, ReleaseBodyV1, SCHEMA_V1, bundle_hash, release_body};
+use configurator_core::compile::{Entity, Relation};
+use configurator_core::release::{
+    BuildError, BundleV1, HashError, ReleaseBodyV1, SCHEMA_V1, Violation, build_bundle,
+    bundle_hash, release_body, validate,
+};
 use configurator_core::seed;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -176,4 +180,192 @@ fn seed_v2_job_content_equals_fixture_sections() {
         .expect("v1 job");
     assert_eq!(job.stance, v1_job.stance);
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}
+
+// --- Task 4: build and validate -----------------------------------------------------
+
+fn build_seeded() -> BundleV1 {
+    let cfg = compile_seeds(&retail_customer_care(), false);
+    build_bundle(&cfg).unwrap_or_else(|e| panic!("build: {e:#?}"))
+}
+
+fn entity_names(b: &BundleV1) -> Vec<&str> {
+    b.ontology
+        .entities
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect()
+}
+
+#[test]
+fn seed_v2_builds_a_valid_bundle() {
+    let b = build_seeded();
+    assert_eq!(validate(&b), Vec::<Violation>::new());
+    assert_eq!(b.context_spaces.len(), 5);
+    assert_eq!(b.procedures.len(), 6);
+    assert_eq!(b.connectors.len(), 1);
+    assert_eq!(b.knowledge_stores.len(), 2);
+    assert_eq!(b.job_settings.actor.as_deref(), Some("Customer care desk"));
+    assert!(b.job_settings.preamble.is_some() && b.job_settings.stance.is_some());
+    // Lists come sorted by natural key.
+    let keys: Vec<&str> = b.context_spaces.iter().map(|s| s.key.as_str()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(keys, sorted);
+    let names = entity_names(&b);
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted);
+    // It hashes, and the PUT body parses back as v1.
+    let body = release_body("cfg-2026-10-18.1", "customer_care_agent", &b).expect("body");
+    let again: ReleaseBodyV1 = serde_json::from_value(body).expect("parses back");
+    assert_eq!(again.bundle, b);
+}
+
+#[test]
+fn slice_closure_pulls_in_referenced_entities() {
+    let cfg = compile_seeds(&retail_customer_care(), false);
+    let slice = &cfg.job.as_ref().expect("job").ontology_slice;
+    assert!(!slice.iter().any(|n| n == "ReturnAuthorization"));
+    let b = build_bundle(&cfg).expect("builds");
+    let names = entity_names(&b);
+    for name in [
+        "ReturnAuthorization",
+        "WarrantyClaim",
+        "Shipment",
+        "Carrier",
+        "Refund",
+    ] {
+        assert!(names.contains(&name), "{name} missing from {names:?}");
+    }
+    for name in slice {
+        assert!(
+            names.contains(&name.as_str()),
+            "slice entity {name} missing"
+        );
+    }
+}
+
+#[test]
+fn relations_need_both_ends() {
+    let mut cfg = compile_seeds(&retail_customer_care(), false);
+    cfg.entities.insert(
+        "Ghost".into(),
+        Entity {
+            label: "Ghost".into(),
+            synonyms: vec![],
+            hidden: false,
+        },
+    );
+    cfg.relations.insert(
+        "Customer|haunts|Ghost".into(),
+        Relation {
+            subject: "Customer".into(),
+            predicate: "haunts".into(),
+            object: "Ghost".into(),
+            cardinality: "1:n".into(),
+        },
+    );
+    let b = build_bundle(&cfg).expect("builds");
+    assert!(
+        !entity_names(&b).contains(&"Ghost"),
+        "Ghost is outside the slice"
+    );
+    let names = entity_names(&b);
+    for r in &b.ontology.relations {
+        assert!(names.contains(&r.subject.as_str()) && names.contains(&r.object.as_str()));
+    }
+    assert!(!b.ontology.relations.iter().any(|r| r.predicate == "haunts"));
+}
+
+#[test]
+fn hidden_entities_are_dropped() {
+    let mut cfg = compile_seeds(&retail_customer_care(), false);
+    cfg.entities
+        .get_mut("Communication")
+        .expect("Communication in the seed")
+        .hidden = true;
+    let b = build_bundle(&cfg).expect("builds");
+    assert!(!entity_names(&b).contains(&"Communication"));
+    assert!(
+        !b.ontology
+            .relations
+            .iter()
+            .any(|r| r.subject == "Communication" || r.object == "Communication")
+    );
+}
+
+#[test]
+fn empty_job_content_is_refused() {
+    let cfg = compile_seeds(&retail_customer_care(), true);
+    match build_bundle(&cfg) {
+        Err(BuildError::Incomplete(v)) => {
+            let paths: Vec<&str> = v.iter().map(|x| x.path.as_str()).collect();
+            assert_eq!(paths, ["/bundle/context_spaces", "/bundle/procedures"]);
+        }
+        other => panic!("expected Incomplete, got {other:?}"),
+    }
+    // No job at all is incomplete too.
+    let sel = Selection {
+        job: None,
+        ..retail_customer_care()
+    };
+    assert!(matches!(
+        build_bundle(&compile_seeds(&sel, false)),
+        Err(BuildError::Incomplete(_))
+    ));
+}
+
+#[test]
+fn fixture_validates_clean() {
+    assert_eq!(validate(&typed().bundle), Vec::<Violation>::new());
+}
+
+#[test]
+fn violations_are_all_listed() {
+    let mut v = fixture();
+    v["bundle"]["context_spaces"][0]["procedure"] = json!("nope");
+    v["bundle"]["ontology"]["relations"][0]["object"] = json!("Ghost");
+    // return@1.4.0-beta PUBLISHED next to return@1.3.0: twice per name and per space.
+    v["bundle"]["procedures"][1]["status"] = json!("PUBLISHED");
+    v["bundle"]["ontology"]["entities"][0]["industry"] = json!("retail");
+    v["bundle"]["connectors"][0]["field_mappings"][0]["attribute"] = json!("Customer.nope");
+    v["bundle"]["knowledge_stores"][0]["parent"] = json!("faq-policies");
+    v["bundle"]["procedures"][0]["steps"][1]["step_number"] = json!(1);
+    v["bundle"]["connectors"][0]["timeout_ms"] = json!(50);
+    let body: ReleaseBodyV1 = serde_json::from_value(v).expect("still parses");
+    let paths: Vec<String> = validate(&body.bundle).into_iter().map(|x| x.path).collect();
+    for want in [
+        "/bundle/context_spaces/0/procedure",
+        "/bundle/ontology/relations/0/object",
+        "/bundle/procedures/1/status",
+        "/bundle/ontology/entities/0/industry",
+        "/bundle/connectors/0/field_mappings/0/attribute",
+        "/bundle/knowledge_stores/0/parent",
+        "/bundle/knowledge_stores/1/parent",
+        "/bundle/procedures/0/steps/1/step_number",
+        "/bundle/connectors/0/timeout_ms",
+    ] {
+        assert!(
+            paths.contains(&want.to_owned()),
+            "{want} missing in {paths:?}"
+        );
+    }
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| p.as_str() == "/bundle/procedures/1/status")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn build_is_deterministic() {
+    let a = serde_json::to_value(build_seeded()).expect("serialises");
+    let b = serde_json::to_value(build_seeded()).expect("serialises");
+    assert_eq!(
+        bundle_hash(&a).expect("hash"),
+        bundle_hash(&b).expect("hash")
+    );
 }
