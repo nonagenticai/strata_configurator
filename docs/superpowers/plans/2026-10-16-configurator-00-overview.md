@@ -61,6 +61,6 @@ P0 is the critical path: it gates every care-bus push. Start it in parallel with
 
 ## Owner inputs needed, and when
 
-- **Phase 3:** which LLM provider the generator uses (the `tenant/providers` `generate` slot).
+- **Phase 3:** which LLM provider the generator uses (the `tenant/providers` `generate` slot). ANSWER: same as care-bus-agent tenant-provided/configured commercial provider selection with local models via pgx:vllm/laya and mlx_api
 - **Phase 5:** the standard sources per job/industry (owner curates; spec §14 open item 1).
 - **First customer-hardware target:** reachability/auth for remote push (spec §14 open item 2).
