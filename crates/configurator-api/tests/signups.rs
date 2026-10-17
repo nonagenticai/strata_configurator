@@ -6,7 +6,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -35,9 +35,11 @@ struct Mock {
     /// Turnstile: the tokens verified; siteverify answers 500 while `turnstile_down`.
     verified: Vec<String>,
     turnstile_down: bool,
-    /// Telegram: every sendMessage payload; 500 while `telegram_down`.
+    /// Telegram: every accepted sendMessage payload; 500 while `telegram_down`. `telegram_calls`
+    /// counts every request, refused ones included.
     telegram: Vec<Value>,
     telegram_down: bool,
+    telegram_calls: usize,
 }
 
 type Shared = Arc<Mutex<Mock>>;
@@ -162,6 +164,7 @@ async fn siteverify(State(m): State<Shared>, body: String) -> Response {
 
 async fn send_message(State(m): State<Shared>, Json(b): Json<Value>) -> Response {
     let mut g = lock(&m);
+    g.telegram_calls += 1;
     if g.telegram_down {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -556,6 +559,42 @@ async fn a_full_queue_refuses_new_signups() {
 }
 
 #[tokio::test]
+async fn concurrent_intakes_serialise_on_the_queue_lock_and_cannot_overshoot_the_ceiling() {
+    let e = enabled(vec![("SIGNUP_QUEUE_MAX_PENDING", "1".into())]).await;
+    // Hold the queue lock: both intakes must wait for it, then decide one after the other.
+    let mut holder = common::pool(&e).begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(configurator_api::db::signups::QUEUE_LOCK)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let hold = Duration::from_millis(500);
+    let start = Instant::now();
+    let env = &e;
+    let timed = move |email: &'static str| async move {
+        let r = submit(env, signup(email)).await;
+        (r, start.elapsed())
+    };
+    let ((a, ta), (b, tb), ()) =
+        tokio::join!(timed("a@globex.com"), timed("b@globex.com"), async {
+            tokio::time::sleep(hold).await;
+            holder.rollback().await.unwrap();
+        });
+    assert!(
+        ta >= hold && tb >= hold,
+        "an intake did not wait for the queue lock: {ta:?} {tb:?}"
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::ACCEPTED, StatusCode::SERVICE_UNAVAILABLE],
+        "{a:?} {b:?}"
+    );
+    assert_eq!(count(&e, "SELECT count(*) FROM signup_approvals").await, 1);
+}
+
+#[tokio::test]
 async fn a_relayed_turnstile_token_is_verified_when_a_secret_is_set() {
     let up = upstream().await;
     let e = enabled(up.turnstile()).await;
@@ -636,6 +675,35 @@ async fn telegram_announces_new_signups_and_decisions_without_personal_data() {
     let text = msgs[1]["text"].as_str().unwrap();
     assert!(text.contains("approved"), "{text}");
     assert!(text.contains(b["tenant"]["id"].as_str().unwrap()), "{text}");
+    assert_eq!(b["invited"], true);
+    assert!(text.contains("invited by email"), "{text}");
+}
+
+#[tokio::test]
+async fn an_approval_that_links_an_existing_identity_does_not_claim_an_email() {
+    let up = upstream().await;
+    lock(&up.mock)
+        .users
+        .push(("kc-ann".into(), "ann@globex.com".into()));
+    let mut cfg = up.telegram();
+    cfg.extend(up.keycloak_admin());
+    let e = enabled(cfg).await;
+    submit(&e, signup("ann@globex.com")).await;
+    let id = signup_id(&e, "ann@globex.com").await;
+    let (s, b) = approve(&e, id, Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        (&b["invited"], &b["first_admin_sub"]),
+        (&json!(false), &json!("kc-ann"))
+    );
+    assert!(lock(&up.mock).emails.is_empty(), "no invite email went");
+    let msgs = telegram_messages(&up, 2).await;
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    let text = msgs[1]["text"].as_str().unwrap();
+    assert!(text.contains("approved"), "{text}");
+    assert!(!text.contains("invited by email"), "{text}");
+    assert!(text.contains("existing portal identity"), "{text}");
+    assert!(text.contains("no email was sent"), "{text}");
 }
 
 #[tokio::test]
@@ -645,6 +713,25 @@ async fn a_failed_telegram_send_never_fails_the_intake() {
     let e = enabled(up.telegram()).await;
     let (s, b) = submit(&e, signup("a@globex.com")).await;
     assert_eq!((s, b), (StatusCode::ACCEPTED, json!({"status": "queued"})));
+    // the send is detached, so prove it was attempted (and refused) while the intake succeeded
+    let mut calls = 0;
+    for _ in 0..40 {
+        calls = lock(&up.mock).telegram_calls;
+        if calls >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(calls >= 1, "the Telegram send was never attempted");
+    assert!(lock(&up.mock).telegram.is_empty(), "every send was refused");
+    assert_eq!(
+        count(
+            &e,
+            "SELECT count(*) FROM signup_approvals WHERE status = 'pending'"
+        )
+        .await,
+        1
+    );
     // nor does an unreachable Telegram
     let e = enabled(vec![
         ("TELEGRAM_BOT_TOKEN", BOT_TOKEN.into()),

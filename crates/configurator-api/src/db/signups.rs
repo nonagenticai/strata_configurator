@@ -98,6 +98,20 @@ pub struct NewSignup<'a> {
     pub intake_client: &'a str,
 }
 
+/// The transaction-scoped advisory lock key that serialises intakes, so the pending-queue ceiling is
+/// a hard cap: under READ COMMITTED two concurrent intakes could otherwise both count below it and
+/// both insert.
+pub const QUEUE_LOCK: i64 = 0x5167_a0e0;
+
+/// Take [`QUEUE_LOCK`] for the rest of the caller's transaction (released on commit or rollback).
+pub async fn lock_queue(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(QUEUE_LOCK)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// How many signups are pending.
 pub async fn pending_count(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM signup_approvals WHERE status = 'pending'")

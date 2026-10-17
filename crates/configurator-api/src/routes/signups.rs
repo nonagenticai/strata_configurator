@@ -22,14 +22,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::tenants::{MAX_NAME, Origin, approval_not_pending, clean, create_tenant, email_address};
+use super::tenants::{Origin, approval_not_pending, clean, create_tenant, email_address};
 use crate::audit;
 use crate::auth::{Caller, require_super_admin};
 use crate::db::signups::{self, NewSignup};
 use crate::error::ApiError;
 use crate::page::{self, Paged, TimeCursor};
 use crate::signup::{
-    default_tenant_name, multi_line_field, require_intake_caller, single_line_field,
+    Decision, default_tenant_name, multi_line_field, require_intake_caller, single_line_field,
 };
 use crate::state::AppState;
 
@@ -45,7 +45,9 @@ pub fn routes() -> Router<AppState> {
 const MAX_TEXT: usize = 160;
 const MAX_MESSAGE: usize = 2000;
 const MAX_TURNSTILE_TOKEN: usize = 4096;
-/// A workspace name given at approval (commonpractice `tenantName`: 2 to 120 characters).
+/// A workspace name at approval, given or suggested (commonpractice `tenantName`: 2 to 120
+/// characters).
+const MIN_TENANT_NAME: usize = 2;
 const MAX_TENANT_NAME: usize = 120;
 
 /// What the website backend or the signup chat may send. Strict, camelCase on the wire as in
@@ -63,6 +65,18 @@ struct Intake {
 
 fn invalid(msg: &str) -> ApiError {
     ApiError::BadRequest("invalid_body", msg.into())
+}
+
+/// The approval's workspace name, whether given as `tenantName` or the suggested default: [`clean`],
+/// then 2 to 120 characters.
+fn tenant_name(v: &str) -> Result<String, ApiError> {
+    let n = clean("tenantName", v, MAX_TENANT_NAME)?;
+    if n.chars().count() < MIN_TENANT_NAME {
+        return Err(invalid(&format!(
+            "tenantName must be at least {MIN_TENANT_NAME} characters"
+        )));
+    }
+    Ok(n)
 }
 
 /// Queue an early-access signup (see the module doc). Validation is commonpractice's: `email` an
@@ -108,6 +122,8 @@ async fn intake(
     // The SA's client id is recorded (and is in the audit event); its `sub` is not the requester's.
     let client = caller.azp.clone().unwrap_or_default();
     let mut tx = st.owner.begin().await?;
+    // Serialise intakes so count-then-insert cannot overshoot the ceiling.
+    signups::lock_queue(&mut tx).await?;
     let pending = signups::pending_count(&mut tx).await?;
     if pending >= cfg.max_pending {
         tracing::warn!(
@@ -240,20 +256,10 @@ async fn approve(
     if a.status != "pending" {
         return Err(approval_not_pending(id));
     }
-    let name = match b.tenant_name.as_deref() {
-        Some(n) => {
-            let n = clean("tenantName", n, MAX_TENANT_NAME)?;
-            if n.chars().count() < 2 {
-                return Err(invalid("tenantName must be at least 2 characters"));
-            }
-            n
-        }
-        None => clean(
-            "tenantName",
-            &default_tenant_name(a.company.as_deref(), &a.email, Some(a.name.as_str())),
-            MAX_NAME,
-        )?,
-    };
+    let name = tenant_name(&match b.tenant_name {
+        Some(n) => n,
+        None => default_tenant_name(a.company.as_deref(), &a.email, Some(a.name.as_str())),
+    })?;
     let created = create_tenant(
         &st,
         &caller.sub,
@@ -264,7 +270,13 @@ async fn approve(
     .await?;
     // W4: provision the new tenant down into care-bus here (spec 10.7: approval "provisions the tenant
     // down into care-bus once care-bus accepts it"). Not built: care-bus W3 has not landed.
-    st.signup.notify_decision(id, Some(created.tenant.id));
+    st.signup.notify_decision(
+        id,
+        Decision::Approved {
+            tenant: created.tenant.id,
+            invited: created.invited,
+        },
+    );
     Ok(Json(json!({
         "approval": created.signup,
         "tenant": created.tenant,
@@ -300,6 +312,23 @@ async fn reject(
     )
     .await?;
     tx.commit().await?;
-    st.signup.notify_decision(id, None);
+    st.signup.notify_decision(id, Decision::Rejected);
     Ok(Json(json!({"approval": a})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_names_are_2_to_120_characters() {
+        for bad in ["", " ", "x", " x ", "\u{e9}"] {
+            assert!(tenant_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(tenant_name(&"x".repeat(121)).is_err());
+        assert!(tenant_name("a\u{7}b").is_err());
+        assert_eq!(tenant_name(" ab ").unwrap(), "ab");
+        assert_eq!(tenant_name("\u{e9}\u{e9}").unwrap(), "\u{e9}\u{e9}");
+        assert_eq!(tenant_name(&"x".repeat(120)).unwrap(), "x".repeat(120));
+    }
 }

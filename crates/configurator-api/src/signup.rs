@@ -259,6 +259,18 @@ const BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 /// Ceiling on honouring Telegram's `retry_after` (429).
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// A signup decision, as announced in Telegram.
+#[derive(Debug, Clone, Copy)]
+pub enum Decision {
+    /// Approved into `tenant`; `invited` when a new identity was created and sent the invite email
+    /// (false: an existing portal identity was linked and no email went).
+    Approved {
+        tenant: Uuid,
+        invited: bool,
+    },
+    Rejected,
+}
+
 /// The signup settings and an HTTP client for Turnstile and Telegram.
 pub struct Signup {
     pub cfg: SignupConfig,
@@ -376,15 +388,23 @@ impl Signup {
         Some(payload)
     }
 
-    /// The `sendMessage` payload for a decision: the outcome and, for an approval, the tenant id.
-    pub fn decision_payload(&self, id: Uuid, tenant: Option<Uuid>) -> Option<Value> {
+    /// The `sendMessage` payload for a decision: the outcome and, for an approval, the tenant id and
+    /// whether the requester was invited by email (a new identity) or an existing portal identity was
+    /// linked (no email sent).
+    pub fn decision_payload(&self, id: Uuid, decision: Decision) -> Option<Value> {
         let t = self.cfg.telegram.as_ref()?;
-        let text = match tenant {
-            Some(tenant) => format!(
-                "Strata configurator signup approved\n\nTenant id: {tenant}\n\
-                 The requester was invited by email as its tenant admin.\nSignup id: {id}"
-            ),
-            None => format!("Strata configurator signup rejected\n\nSignup id: {id}"),
+        let text = match decision {
+            Decision::Approved { tenant, invited } => {
+                let how = if invited {
+                    "The requester was invited by email as its tenant admin."
+                } else {
+                    "The requester's existing portal identity was linked as its tenant admin; no email was sent by this approval."
+                };
+                format!(
+                    "Strata configurator signup approved\n\nTenant id: {tenant}\n{how}\nSignup id: {id}"
+                )
+            }
+            Decision::Rejected => format!("Strata configurator signup rejected\n\nSignup id: {id}"),
         };
         Some(json!({
             "chat_id": t.chat_id,
@@ -401,9 +421,9 @@ impl Signup {
         }
     }
 
-    /// Announce an approval (`Some(tenant)`) or a rejection (no-op while Telegram is off).
-    pub fn notify_decision(&self, id: Uuid, tenant: Option<Uuid>) {
-        if let Some(p) = self.decision_payload(id, tenant) {
+    /// Announce an approval or a rejection (no-op while Telegram is off).
+    pub fn notify_decision(&self, id: Uuid, decision: Decision) {
+        if let Some(p) = self.decision_payload(id, decision) {
             self.send(p, "decision");
         }
     }
