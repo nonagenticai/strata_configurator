@@ -5,6 +5,23 @@ spec (`docs/superpowers/specs/2026-10-16-configurator-design.md`, rev 2) and of 
 (`2026-10-16-configurator-00-overview.md`) that are listed in §3. The first task of the next
 session is spec rev 3 (W1.0), which folds these decisions into the spec.
 
+**Progress (2026-10-17, evening).** Done: W0, spec rev 3, W1 (incl. W1.1 invite), W2.1 gate 2,
+W2.2 issuance and W2.3 early-access signup. They ship in strata_configurator PR #2, with every
+integration dark by env; gitops-production#4752 carries the waypoint PSA fix, the `configurator_app`
+DB role, the Keycloak `super_admin` client role, the `strata-configurator-admin` SA, and in-cluster
+admin URLs plus egress and AuthZ. Open, in order:
+1. **W6** (licences repo). Gate 2 and issuance stay dark until it lands; then set
+   `LICENSES_ADMIN_*` and flip `LICENSE_GATE_2_ENABLED`.
+2. Keycloak client `configurator-signup-intake` plus the signup env, then flip
+   `EARLY_ACCESS_SIGNUP_ENABLED`.
+3. **W3**, after the care-bus session hands back its note (§8.1 item 4).
+4. **W4**, which includes provision-down at the `// W4:` marker in `routes/signups.rs` `approve`.
+
+Known gaps:
+- licence revoke on offboarding;
+- licence token encryption at rest;
+- removing the realm role `config-super-admin`.
+
 ## 1. Verified state (2026-10-17)
 
 | Fact | Evidence |
