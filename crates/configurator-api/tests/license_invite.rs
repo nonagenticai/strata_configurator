@@ -38,6 +38,10 @@ struct Mock {
     issue_down: bool,
     /// The token mint answers 503 while set (after the licence was created).
     mint_down: bool,
+    /// The token mint answers licences' 403 `long_lived_requires_license_admin` while set.
+    mint_refused: bool,
+    /// The query of every token mint, in order.
+    minted: Vec<HashMap<String, String>>,
     /// (tenant header, holder sub) of every licence created.
     issued: Vec<(String, String)>,
     revoked: Vec<String>,
@@ -179,12 +183,26 @@ async fn create_licence(
     Json(json!({"license_id": "lic-1", "subject_id": "subject-1"})).into_response()
 }
 
-async fn mint(State(m): State<Shared>, h: HeaderMap, Path(id): Path<String>) -> Response {
+async fn mint(
+    State(m): State<Shared>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     if !authed(&h) || id != "lic-1" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if lock(&m).mint_down {
+    let mut g = lock(&m);
+    g.minted.push(q);
+    if g.mint_down {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if g.mint_refused {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"detail": {"error": "long_lived_requires_license_admin"}})),
+        )
+            .into_response();
     }
     Json(json!({"token": format!("tok-{}", tenant_header(&h))})).into_response()
 }
@@ -527,6 +545,22 @@ async fn tenant_create_issues_and_stores_the_licence() {
     let cipher = e.state.token_cipher.as_deref().unwrap();
     assert_eq!(cipher.open(t, &sealed).unwrap(), format!("tok-{t}"));
     assert_eq!(audited(&e, "license.issue").await, 1);
+    let want: HashMap<String, String> = [
+        ("long_lived", "true"),
+        ("long_lived_owner", "strata-configurator"),
+        (
+            "long_lived_reason",
+            "tenant licence token for gate 2; revoked on offboarding",
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert_eq!(
+        lock(&up.mock).minted,
+        [want],
+        "one registered perpetual api token: no expires_days, no token_type"
+    );
     // the runtime role cannot read licence tokens at all
     let denied = sqlx::query("SELECT token_encrypted FROM tenant_license")
         .fetch_all(&e.state.db)
@@ -589,6 +623,31 @@ async fn a_failed_mint_revokes_the_created_licence() {
         .await
         .unwrap();
     assert_eq!(tenants, 0, "the tenant was not created");
+}
+
+#[tokio::test]
+async fn a_refused_long_lived_mint_fails_the_create_and_revokes_the_licence() {
+    let up = upstream().await;
+    lock(&up.mock).mint_refused = true;
+    let e = common::env_with(&up.licensing()).await;
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_GATEWAY, &json!("licences_unavailable"))
+    );
+    assert_eq!(lock(&up.mock).revoked, ["lic-1"]);
+    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant")
+        .fetch_one(common::pool(&e))
+        .await
+        .unwrap();
+    assert_eq!(tenants, 0, "the tenant was not created");
+    assert_eq!(audited(&e, "license.issue_failed").await, 1);
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ Multi-tenant configuration model, overlay compiler and read-only model explorer.
 
 The application is served at `https://configurator.internal`. `/api/*`, `/health` and `/ready` route to the API; all other paths route to the UI. `/health` and `/ready` are unauthenticated. Tenant requests require a bare non-nil UUID in `X-Tenant-Id`; the super-admin may omit it to inspect platform standards.
 
-Required API environment variables: `DATABASE_URL`, `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL`. Optional: `PORT` (8097), `KEYCLOAK_AUDIENCE` (`strata-configurator`), `SUPER_ADMIN_ROLE` (`config-super-admin`). Migrations and embedded seed versions apply at startup; existing versions are never re-applied over curated data.
+Required API environment variables: `DATABASE_URL`, `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL`. Optional: `PORT` (8097), `KEYCLOAK_AUDIENCE` (`strata-configurator`), `SUPER_ADMIN_ROLE` (`super_admin`, a client role on the `KEYCLOAK_AUDIENCE` client, read from `resource_access.<audience>.roles`; realm roles are ignored). Migrations and embedded seed versions apply at startup; existing versions are never re-applied over curated data.
 
 Optional, all dark by default (unset = off):
 - Invites by email (W1.1), on only when all four are set: `KEYCLOAK_ADMIN_TOKEN_URL`, `KEYCLOAK_ADMIN_CLIENT_ID` (`strata-configurator-admin`), `KEYCLOAK_ADMIN_CLIENT_SECRET`, `KEYCLOAK_ADMIN_API_URL` (`…/admin/realms/portal`). Without them, an `email` in `POST /api/tenants` or `POST /api/tenants/{id}/users` is 503 `invite_unavailable`.
