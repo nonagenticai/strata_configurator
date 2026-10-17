@@ -59,6 +59,7 @@ The phase-1 seed ontology differs from care-bus 0002 by the recorded deltas in `
 - **Ontology slice** = `job.ontology_slice` ∪ every entity named in `context_spaces[].entities` ∪ every entity in `connectors[].field_mappings[].attribute`. An empty or absent `ontology_slice` means every effective entity. Hidden entities are excluded. A relation is kept only when both its ends are in the slice.
 - `job_settings` keys are omitted when their source is `None` (`skip_serializing_if`). Every other nullable bundle field (`industry`, `department`, `base_url`, `rate_limit`, `parent`, `description`, `pddl_domain`) **serialises as `null`, never omitted**. Every bundle struct is `#[serde(deny_unknown_fields)]`.
 - The care-bus client is configured all-or-none by `CAREBUS_API_URL`, `CAREBUS_TOKEN_URL`, `CAREBUS_CLIENT_ID`, `CAREBUS_CLIENT_SECRET`. A partial set fails startup. With none set, push and drift return 503 `carebus_unconfigured` and provision-down is skipped (logged).
+- Provision-down is **behind a flag**: `CAREBUS_PROVISION_ENABLED` (bool, default `false`). While it is off, tenant create, signup approve and import never call care-bus (logged once at startup and per skipped provision, audited as `carebus.provision_skipped`), so tenant creation cannot fail or slow down while care-bus #23 (W3) is not deployed. Push and drift are not gated by it (they need the client config only). Turning it on is a gitops env change after W3 is live (Task 11), not a code change. Added 2026-10-18 (coordinator).
 - Provision-down is **best effort**: tenant create, signup approve and import succeed even when care-bus fails. The failure is audited as `carebus.provision_failed` and `tenant.carebus_provisioned_at` stays NULL. Every push first re-provisions the tenant and job, and both are idempotent upserts.
 - Roles: target, build and push need `tenant_admin` (a super-admin acting in the tenant counts). Reads need `tenant_user`. Import and provision retry are super-admin only. Licence gate 2 applies as it does on every tenant route.
 - No secret or token in logs, audit metadata, `push_step.response` or API responses. The care-bus bearer is never stored.
@@ -434,6 +435,7 @@ The steps are recorded before the error returns. Conflicts are read from `push_s
   - Present with another name, or archived: 409 `tenant_exists` / 403 `tenant_suspended`.
 - `provision::tenant_created(st, &Tenant, first_admin_sub) -> CarebusProvision` (`{ok: bool, steps: [StepOutcome]}`) calls `put_tenant` (active), then `put_user(first_admin, "tenant_admin")`. Best effort: it sets `carebus_provisioned_at` on success, and audits `carebus.provision_failed` (metadata `{step, status, code}`) on failure. It is called after the commit by create, signup approve and import, and its result is returned as `carebus` in each response.
 - `POST /api/tenants/{id}/carebus-provision` (super-admin): retries the same function, 200 with the outcome.
+- Flag (2026-10-18): `provision::tenant_created` first checks `CAREBUS_PROVISION_ENABLED` (config, default `false`). Off → it returns `{ok: false, skipped: true, steps: []}`, audits `carebus.provision_skipped`, and makes no HTTP call; create/approve/import respond exactly as before plus that `carebus` value. The retry route returns 409 `carebus_provision_disabled` while off. Tests: `provision_off_by_default_makes_no_carebus_call` (mock records zero requests on create, approve and import) and `provision_on_calls_put_tenant_then_put_user`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `import_creates_tenant_with_fixed_id_and_licence` (licences mock is called with that id);
@@ -455,7 +457,9 @@ The steps are recorded before the error returns. Conflicts are read from `push_s
 
 **Files:**
 - Create: `web/src/routes/releases/+page.svelte`, `web/tests/unit/Releases.test.ts`
-- Modify: `web/src/lib/api.ts` (types `Target`, `Release`, `PushStep`, `Conflict`, `Drift`), `web/src/routes/+layout.svelte` (nav link), `web/src/routes/tenants/+page.svelte` (super-admin "Import existing tenant": id, name, first admin; shows `carebus.ok` and a "Retry care-bus provision" button), `web/tests/unit/Tenants.test.ts`
+- Modify: `web/src/lib/api.ts` (types `Target`, `Release`, `PushStep`, `Conflict`, `Drift`), `web/src/routes/+layout.svelte` (nav link), `web/src/routes/tenants/+page.svelte` (super-admin "Create tenant": name + first admin email, `POST /api/tenants`; super-admin "Import existing tenant": id, name, first admin; both show `carebus.ok` (or "skipped" while `CAREBUS_PROVISION_ENABLED` is off) and a "Retry care-bus provision" button), `web/tests/unit/Tenants.test.ts`
+
+Scope addition 2026-10-18 (coordinator): the deployed web has **no create-tenant form**; a super-admin can only create a tenant through Signups approve, which is dark. Task 10 adds the "Create tenant" form next to the import form. Check the request body `POST /api/tenants` already accepts (routes/tenants.rs) before writing the form; the form sends exactly that shape.
 
 The page has four parts:
 - a target list, plus a create form with the job select and the selection fields used on the compile page;
@@ -471,12 +475,16 @@ Errors show their `code` and `message`; `bundle_incomplete` and `bundle_invalid`
   - `push renders conflicts`;
   - `push button hidden for tenant_user`;
   - `drift badge shows status`;
-  - Tenants: `import posts fixed id and shows carebus outcome`.
+  - Tenants: `import posts fixed id and shows carebus outcome`;
+  - Tenants: `create tenant form posts name and first admin email` (super-admin only; hidden for tenant_admin);
+  - Tenants: `carebus outcome shows skipped when provisioning is off`.
 - [ ] **Step 2:** Implement.
 - [ ] **Step 3:** Run: `cd web && npm run ci:verify && npm test && npm run lint`. Expected: 0 errors and 0 warnings; all tests PASS.
 - [ ] **Step 4: Commit** `feat(web): release page (targets, build, push, conflicts, drift) and tenant import`. Push; CI job `web` PASS.
 
 ### Task 11: gitops-production PR (one PR, in a worktree of gitops-production)
+
+Leave `CAREBUS_PROVISION_ENABLED` unset (off) in this PR unless care-bus W3 is already live; flipping it to `true` is its own one-line change once Task 12's token check passes.
 
 Before you start, check that no open gitops PR touches these files: `gh pr list -R nonagenticai/gitops-production --search "strata-configurator OR care-bus"`.
 
