@@ -40,7 +40,7 @@
 	);
 	let context = 0;
 	$effect(() => {
-		const tenant = session.tenant;
+		const activeTenant = session.activeTenant;
 		const controller = new AbortController();
 		const generation = ++context;
 		loading = true;
@@ -56,7 +56,7 @@
 		compiling = false;
 		async function load() {
 			try {
-				const opts = { tenant, signal: controller.signal };
+				const opts = { activeTenant, signal: controller.signal };
 				const [layers, templates, dims] = await Promise.all([
 					all<Layer>('/api/layers', opts),
 					all<Profile>('/api/profiles', opts),
