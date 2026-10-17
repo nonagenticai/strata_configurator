@@ -94,7 +94,7 @@ pub fn is_conflict(e: &sqlx::Error) -> bool {
 
 /// One page of the layer's current rows, optionally of one kind. Newest first.
 pub async fn list_current(
-    db: &PgPool,
+    db: &mut PgConnection,
     layer_id: Uuid,
     kind: Option<Kind>,
     before: Option<crate::page::TimeCursor>,
@@ -204,7 +204,7 @@ pub async fn retire(
 
 /// One page of every revision of `(layer, kind, key)`, newest first; `before` is a revision number.
 pub async fn revisions(
-    db: &PgPool,
+    db: &mut PgConnection,
     layer_id: Uuid,
     kind: Kind,
     key: &str,

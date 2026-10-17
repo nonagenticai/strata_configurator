@@ -4,6 +4,12 @@
 //! JWKS cache and the static-key mode. care-bus's static service tokens are dropped: every caller
 //! here is a person with a portal-realm token. The static key is RS256 like production, so tests
 //! exercise the same algorithm as Keycloak.
+//!
+//! Keycloak only authenticates (commonpractice's identity model, plan 2026-10-17 §2): from the token
+//! this reads `sub`, `preferred_username` and the roles of this app's own client
+//! (`resource_access.<KEYCLOAK_AUDIENCE>.roles`), of which only `super_admin` means anything. Realm
+//! roles are never read: the shared realm `super_admin` belongs to other apps. Tenancy and tenant
+//! roles live in this service's `users` table.
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -27,7 +33,9 @@ const JWKS_MIN_REFRESH: Duration = Duration::from_secs(30);
 pub struct Claims {
     pub sub: String,
     pub preferred_username: Option<String>,
-    /// Keycloak realm roles (`realm_access.roles`).
+    /// The client the token was issued to (a service account's client id).
+    pub azp: Option<String>,
+    /// This app's client roles (`resource_access.<audience>.roles`); realm roles are ignored.
     pub roles: Vec<String>,
 }
 
@@ -47,11 +55,13 @@ impl Claims {
 struct RawClaims {
     sub: String,
     preferred_username: Option<String>,
+    azp: Option<String>,
+    /// Client roles by client id. `realm_access` is deliberately not parsed.
     #[serde(default)]
-    realm_access: RealmAccess,
+    resource_access: HashMap<String, ClientRoles>,
 }
 #[derive(Deserialize, Default)]
-struct RealmAccess {
+struct ClientRoles {
     #[serde(default)]
     roles: Vec<String>,
 }
@@ -123,13 +133,23 @@ impl Verifier {
         v.set_audience(&[&self.audience]);
         v.leeway = 5;
         let data = decode::<RawClaims>(token, &key, &v).map_err(|_| ApiError::Unauthorized)?;
-        if data.claims.sub.is_empty() {
+        let RawClaims {
+            sub,
+            preferred_username,
+            azp,
+            mut resource_access,
+        } = data.claims;
+        if sub.is_empty() {
             return Err(ApiError::Unauthorized);
         }
         Ok(Claims {
-            sub: data.claims.sub,
-            preferred_username: data.claims.preferred_username,
-            roles: data.claims.realm_access.roles,
+            sub,
+            preferred_username,
+            azp,
+            roles: resource_access
+                .remove(&self.audience)
+                .map(|c| c.roles)
+                .unwrap_or_default(),
         })
     }
 
@@ -205,12 +225,17 @@ async fn fetch(
 /// The authenticated person. Missing or invalid token → 401.
 #[derive(Clone, Debug)]
 pub struct Caller {
-    /// The stable identity: matches `member.sub` and is the audit actor.
+    /// The stable identity: matches `users.sub` and is the audit actor.
     pub sub: String,
     /// `preferred_username`, else `sub`: for display only (usernames can change).
     pub actor: String,
-    /// Holds the configured super-admin realm role (`config-super-admin` by default).
+    /// Holds the configured super-admin client role (`super_admin` by default) on this app's client.
     pub super_admin: bool,
+    /// This app's client roles: only the super-admin role and the signup intake role mean anything.
+    pub roles: Vec<String>,
+    /// The client the token was issued to; the signup intake pins it (commonpractice
+    /// `signup-intake-auth.ts`).
+    pub azp: Option<String>,
 }
 
 impl FromRequestParts<AppState> for Caller {
@@ -232,6 +257,8 @@ impl FromRequestParts<AppState> for Caller {
             super_admin: c.has(&st.cfg.super_admin_role),
             actor: c.actor(),
             sub: c.sub,
+            roles: c.roles,
+            azp: c.azp,
         })
     }
 }
@@ -348,7 +375,8 @@ mod tests {
         jsonwebtoken::encode(
             &h,
             &serde_json::json!({"sub":"u-9","preferred_username":"j.devries","exp":exp(),"iss":ISS,"aud":aud,
-                "realm_access":{"roles":["config-super-admin"]}}),
+                "realm_access":{"roles":["realm-only"]},
+                "resource_access":{"aud":{"roles":["super_admin"]},"other-client":{"roles":["elsewhere"]}}}),
             &jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
         )
         .unwrap()
@@ -389,13 +417,32 @@ mod tests {
         let c = v.verify(&rs256(&KEY_A.pem, "k1", "aud")).await.unwrap();
         assert_eq!(c.sub, "u-9");
         assert_eq!(c.actor(), "j.devries");
-        assert_eq!(c.roles, vec!["config-super-admin".to_string()]);
+        // only this client's roles: not the realm's, not another client's
+        assert_eq!(c.roles, vec!["super_admin".to_string()]);
         // the parsed key is cached: a second token does not re-fetch
         v.verify(&rs256(&KEY_A.pem, "k1", "aud")).await.unwrap();
         assert_eq!(s.hits.load(Ordering::SeqCst), 1);
         // wrong audience still refused on the production path
         let r = v.verify(&rs256(&KEY_A.pem, "k1", "other")).await;
         assert!(matches!(r, Err(ApiError::Unauthorized)));
+    }
+
+    #[tokio::test]
+    async fn realm_roles_are_never_read() {
+        let s = stub_jwks(jwks_a()).await;
+        let v = verifier(&s);
+        let mut h = jsonwebtoken::Header::new(Algorithm::RS256);
+        h.kid = Some("k1".into());
+        let tok = jsonwebtoken::encode(
+            &h,
+            &serde_json::json!({"sub":"u-1","exp":exp(),"iss":ISS,"aud":"aud",
+                "realm_access":{"roles":["super_admin"]}}),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(KEY_A.pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let c = v.verify(&tok).await.unwrap();
+        assert!(c.roles.is_empty(), "{:?}", c.roles);
+        assert!(!c.has("super_admin"));
     }
 
     #[tokio::test]

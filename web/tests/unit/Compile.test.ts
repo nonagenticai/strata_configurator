@@ -10,7 +10,7 @@ import { all, api, ApiError } from '../../src/lib/api';
 import { session } from '../../src/lib/session.svelte';
 afterEach(cleanup);
 beforeEach(() => {
-	session.tenant = '';
+	session.activeTenant = '';
 	vi.mocked(all).mockImplementation(async (path) => {
 		if (path === '/api/layers')
 			return [

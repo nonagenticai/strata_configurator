@@ -77,10 +77,8 @@ async fn run(
             "supply profile_id or profile, not both".into(),
         ));
     }
-    let mut tx = st.db.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await?;
+    // One snapshot, in the tenant acted in (RLS) or, for the platform view, on the owner pool.
+    let mut tx = st.snapshot(who.tenant()).await?;
     let profile = if let Some(id) = b.profile_id {
         profiles::get(&mut tx, who.tenant(), id)
             .await?

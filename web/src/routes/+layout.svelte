@@ -3,7 +3,7 @@
 	import { page } from '$app/state';
 	import { initAuth, logout } from '$lib/auth';
 	import { api, all } from '$lib/api';
-	import { session } from '$lib/session.svelte';
+	import { roleLabel, session, type Workspace } from '$lib/session.svelte';
 	import './app.css';
 	let { data, children } = $props();
 	let error = $state('');
@@ -13,20 +13,19 @@
 			try {
 				const name = await initAuth(data.config);
 				const me = await api<{
+					sub: string;
 					super_admin: boolean;
-					memberships: { tenant: string; name: string; role: string }[];
-				}>('/api/me', undefined, { tenant: '' });
+					tenant: Workspace | null;
+				}>('/api/me', undefined, { activeTenant: '' });
 				const tenants = me.super_admin
-					? (await all<{ id: string; name: string }>('/api/tenants', { tenant: '' })).map((t) => ({
-							...t,
-							role: 'Super-admin',
-						}))
-					: me.memberships.map((t) => ({ id: t.tenant, name: t.name, role: t.role }));
+					? await all<{ id: string; name: string }>('/api/tenants', { activeTenant: '' })
+					: [];
 				if (!active) return;
 				session.name = name;
 				session.superAdmin = me.super_admin;
+				session.workspace = me.tenant;
 				session.tenants = tenants;
-				session.tenant = me.super_admin ? '' : tenants[0]?.id || '';
+				session.activeTenant = '';
 				session.ready = true;
 			} catch (e) {
 				if (active) error = e instanceof Error ? e.message : String(e);
@@ -59,6 +58,10 @@
 			>
 			<a href="/layers" class:active={page.url.pathname === '/layers'}><span>▱</span> Layers</a>
 		</nav>
+		{#if session.superAdmin}<div class="nav-label">PLATFORM</div>
+			<nav aria-label="Platform navigation">
+				<a href="/signups" class:active={page.url.pathname === '/signups'}><span>✉</span> Signups</a>
+			</nav>{/if}
 		<div class="sidebar-note">
 			<span class="status-dot"></span> Standard model · v1
 			<p>Assembled from standard parts.<br />Configured for your organisation.</p>
@@ -68,15 +71,29 @@
 		<header>
 			<span class="breadcrumb"
 				>Workspace <span>/</span>
-				<strong>{page.url.pathname === '/layers' ? 'Layers' : 'Compile'}</strong></span
+				<strong
+					>{page.url.pathname === '/layers'
+						? 'Layers'
+						: page.url.pathname === '/signups'
+							? 'Signups'
+							: 'Compile'}</strong
+				></span
 			>
 			<div class="account">
 				{#if session.ready}
-					<label for="tenant" class="sr-only">Tenant</label>
-					<select id="tenant" bind:value={session.tenant}>
-						{#if session.superAdmin}<option value="">Platform standards</option>{/if}
-						{#each session.tenants as t}<option value={t.id}>{t.name} · {t.role}</option>{/each}
-					</select>
+					{#if session.superAdmin}
+						<label for="tenant" class="sr-only">Tenant</label>
+						<select id="tenant" bind:value={session.activeTenant}>
+							<option value=""
+								>{session.workspace ? `${session.workspace.name} · Home` : 'Platform standards'}</option
+							>
+							{#each session.tenants as t}<option value={t.id}>{t.name} · Super-admin</option>{/each}
+						</select>
+					{:else if session.workspace}
+						<span class="workspace-name" data-testid="workspace"
+							>{session.workspace.name} · {roleLabel(session.workspace.role)}</span
+						>
+					{/if}
 					<span class="user-name">{session.name}</span><button class="text-button" onclick={() => logout()}
 						>Sign out</button
 					>
@@ -94,8 +111,9 @@
 					<h1>Your standard model.<br />Your configuration.</h1>
 					<p>Signing you in securely…</p>
 				</div>
-			{:else if !session.superAdmin && !session.tenant}<div class="empty">
-					You have no workspace memberships. Ask your administrator to add you to a tenant.
+			{:else if !session.superAdmin && !session.workspace}<div class="empty" role="status">
+					<h2>No workspace</h2>
+					<p>Your account is not assigned to a workspace yet. Ask your administrator to add you to one.</p>
 				</div>
 			{:else}{@render children()}{/if}
 		</main>

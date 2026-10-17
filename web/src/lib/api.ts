@@ -58,13 +58,14 @@ export class ApiError extends Error {
 export async function api<T>(
 	path: string,
 	body?: unknown,
-	options: { tenant?: string; signal?: AbortSignal } = {},
+	options: { activeTenant?: string; signal?: AbortSignal } = {},
 ): Promise<T> {
-	// Capture the tenant before awaiting token refresh; a picker change cannot retarget an in-flight request.
-	const tenant = options.tenant ?? session.tenant;
+	// Capture the selection before awaiting token refresh; a switcher change cannot retarget an in-flight request.
+	// Only a super-admin selects a tenant; everyone else is scoped to their home tenant by the server.
+	const activeTenant = session.superAdmin ? (options.activeTenant ?? session.activeTenant) : '';
 	const send = async (force: boolean) => {
 		const headers: Record<string, string> = { Authorization: `Bearer ${await getToken(force)}` };
-		if (tenant) headers['X-Tenant-Id'] = tenant;
+		if (activeTenant) headers['X-Active-Tenant-Id'] = activeTenant;
 		if (body !== undefined) headers['Content-Type'] = 'application/json';
 		return fetch(path, {
 			method: body === undefined ? 'GET' : 'POST',
@@ -86,17 +87,17 @@ export async function api<T>(
 }
 export async function all<T>(
 	path: string,
-	options: { tenant?: string; signal?: AbortSignal } = {},
+	options: { activeTenant?: string; signal?: AbortSignal } = {},
 ): Promise<T[]> {
 	const items: T[] = [];
 	let next: string | null = null;
-	const tenant = options.tenant ?? session.tenant;
+	const activeTenant = options.activeTenant ?? session.activeTenant;
 	do {
 		const join = path.includes('?') ? '&' : '?';
 		const page: Page<T> = await api(
 			`${path}${join}limit=500${next ? `&before=${encodeURIComponent(next)}` : ''}`,
 			undefined,
-			{ ...options, tenant },
+			{ ...options, activeTenant },
 		);
 		items.push(...page.items);
 		next = page.next;

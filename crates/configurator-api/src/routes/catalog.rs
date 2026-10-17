@@ -1,4 +1,8 @@
 //! Catalog reads and transactional, audited writes (plan Task 10).
+//!
+//! Reads run in the tenant acted in (runtime pool, RLS) or, in the platform view, on the owner pool
+//! ([`AppState::tx`]). Platform writes (axes, values, rules, dimensions, platform profiles and
+//! dimension values) are the super-admin's and run on the owner pool; tenant writes run under RLS.
 use crate::{
     audit,
     auth::require_super_admin,
@@ -86,22 +90,22 @@ fn invalid_axis(e: impl std::fmt::Display) -> ApiError {
 
 async fn list_axes(
     State(st): State<AppState>,
-    _who: Acting,
+    who: Acting,
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<Axis>>, ApiError> {
     let Query(q) = q?;
-    let rows = axes::load(&mut *st.db.acquire().await?).await?;
+    let rows = axes::load(&mut *st.tx(who.tenant()).await?).await?;
     Ok(Json(key_page(rows, &q, |a| a.key.clone())?))
 }
 
 async fn list_axis_values(
     State(st): State<AppState>,
-    _who: Acting,
+    who: Acting,
     Path(key): Path<String>,
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<AxisValue>>, ApiError> {
     let Query(q) = q?;
-    let axis = axes::load(&mut *st.db.acquire().await?)
+    let axis = axes::load(&mut *st.tx(who.tenant()).await?)
         .await?
         .into_iter()
         .find(|a| a.key == key)
@@ -142,7 +146,7 @@ async fn create_axis(
         label: b.label,
         description: b.description,
     };
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.owner.begin().await?;
     sqlx::query("INSERT INTO axis (key, cardinality, label, description) VALUES ($1, $2, $3, $4)")
         .bind(&a.key)
         .bind(match a.cardinality {
@@ -187,7 +191,7 @@ async fn create_axis_value(
         v.label = Some(v.key.rsplit('.').next().unwrap_or(&v.key).to_owned());
     }
     nonempty("invalid_axis", v.label.as_deref().unwrap_or_default())?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.owner.begin().await?;
     let mut axis = axes::load(&mut tx)
         .await?
         .into_iter()
@@ -221,13 +225,14 @@ struct Rule {
 
 async fn list_rules(
     State(st): State<AppState>,
-    _who: Acting,
+    who: Acting,
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<Rule>>, ApiError> {
     let Query(q) = q?;
+    let mut tx = st.tx(who.tenant()).await?;
     let rows =
         sqlx::query_as("SELECT key, priority, condition, layer_id FROM axis_rule ORDER BY key")
-            .fetch_all(&st.db)
+            .fetch_all(&mut *tx)
             .await?;
     Ok(Json(key_page(rows, &q, |r: &Rule| r.key.clone())?))
 }
@@ -248,7 +253,7 @@ async fn create_rule(
     require_super_admin(who.caller())?;
     let Json(b) = b?;
     nonempty("invalid_condition", &b.key)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.owner.begin().await?;
     b.condition
         .validate(&axes::load(&mut tx).await?)
         .map_err(|e| ApiError::BadRequest("invalid_condition", e.to_string()))?;
@@ -302,11 +307,11 @@ async fn create_rule(
 
 async fn list_dimensions(
     State(st): State<AppState>,
-    _who: Acting,
+    who: Acting,
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<dimensions::Dimension>>, ApiError> {
     let Query(q) = q?;
-    let rows = dimensions::load(&mut *st.db.acquire().await?).await?;
+    let rows = dimensions::load(&mut *st.tx(who.tenant()).await?).await?;
     Ok(Json(key_page(rows, &q, |d| d.key.clone())?))
 }
 
@@ -326,7 +331,7 @@ async fn create_dimension(
     let Json(b) = b?;
     nonempty("invalid_dimension", &b.key)?;
     nonempty("invalid_dimension", &b.label)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.owner.begin().await?;
     sqlx::query("INSERT INTO dimension (key, label) VALUES ($1, $2)")
         .bind(&b.key)
         .bind(&b.label)
@@ -355,7 +360,7 @@ async fn list_dimension_values(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<dimensions::DimensionValue>>, ApiError> {
     let Query(q) = q?;
-    let mut conn = st.db.acquire().await?;
+    let mut conn = st.tx(who.tenant()).await?;
     if !dimensions::load(&mut conn)
         .await?
         .iter()
@@ -377,13 +382,16 @@ async fn create_dimension_value(
     Path(key): Path<String>,
     b: Result<Json<Named>, JsonRejection>,
 ) -> Result<(StatusCode, Json<dimensions::DimensionValue>), ApiError> {
-    if let Acting::Tenant(ctx) = &who {
-        ctx.require(Role::Editor)?;
+    // Platform values (no tenant in scope) are the super-admin's: only the super-admin acts with
+    // no tenant. Tenant values need `tenant_admin`.
+    match &who {
+        Acting::Tenant(ctx) => ctx.require(Role::TenantAdmin)?,
+        Acting::Platform(c) => require_super_admin(c)?,
     }
     let Json(b) = b?;
     nonempty("invalid_dimension", &b.key)?;
     nonempty("invalid_dimension", &b.label)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(who.tenant()).await?;
     if !dimensions::load(&mut tx)
         .await?
         .iter()
@@ -420,7 +428,7 @@ async fn list_profiles(
         .map(Uuid::parse_str)
         .transpose()
         .map_err(|_| ApiError::BadRequest("invalid_cursor", "expected profile cursor".into()))?;
-    let rows = profiles::load(&mut *st.db.acquire().await?, who.tenant())
+    let rows = profiles::load(&mut *st.tx(who.tenant()).await?, who.tenant())
         .await?
         .into_iter()
         .filter(|r| before.is_none_or(|b| r.id < b))
@@ -436,7 +444,7 @@ async fn visible_profile(
 ) -> Result<profiles::SavedProfile, ApiError> {
     let missing = || ApiError::Missing("profile_not_found", "profile does not exist".into());
     let id = Uuid::parse_str(id).map_err(|_| missing())?;
-    profiles::get(&mut *st.db.acquire().await?, who.tenant(), id)
+    profiles::get(&mut *st.tx(who.tenant()).await?, who.tenant(), id)
         .await?
         .ok_or_else(missing)
 }
@@ -460,9 +468,9 @@ fn may_write_profile(who: &Acting, tenant: Option<Uuid>) -> Result<(), ApiError>
     if tenant.is_none() {
         require_super_admin(who.caller())
     } else if let Acting::Tenant(ctx) = who {
-        ctx.require(Role::Editor)
+        ctx.require(Role::TenantAdmin)
     } else {
-        Err(ApiError::Forbidden("editor"))
+        Err(ApiError::Forbidden(Role::TenantAdmin.as_str()))
     }
 }
 
@@ -474,7 +482,7 @@ async fn create_profile(
     may_write_profile(&who, who.tenant())?;
     let Json(b) = b?;
     nonempty("invalid_profile", &b.name)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(who.tenant()).await?;
     b.values
         .validate(&axes::load(&mut tx).await?)
         .map_err(|e| ApiError::BadRequest("invalid_profile", e.to_string()))?;
@@ -517,7 +525,7 @@ async fn update_profile(
     may_write_profile(&who, old.tenant)?;
     let Json(b) = b?;
     nonempty("invalid_profile", &b.name)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(old.tenant).await?;
     // Lock before reading the audit's before-image so concurrent updates have an accurate chain.
     sqlx::query("SELECT id FROM profile WHERE id = $1 FOR UPDATE")
         .bind(old.id)

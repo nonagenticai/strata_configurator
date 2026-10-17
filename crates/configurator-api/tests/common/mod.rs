@@ -174,36 +174,119 @@ pub async fn migrated_pool() -> PgPool {
     pool
 }
 
-pub fn test_config(database_url: String) -> Config {
-    Config::from_lookup(|k| match k {
-        "DATABASE_URL" => Some(database_url.clone()),
-        "KEYCLOAK_ISSUER" => Some(TEST_ISSUER.into()),
-        "KEYCLOAK_JWKS_URL" => Some("https://issuer.test/certs".into()),
-        _ => None,
+/// The runtime role the migrations create, and the password the harness gives it. The role is
+/// cluster-global, so every test database on the server shares it.
+pub const APP_ROLE: &str = "configurator_app";
+pub const APP_PASSWORD: &str = "configurator-app-test";
+
+/// `url` with its user and password replaced.
+fn with_credentials(url: &str, user: &str, password: &str) -> String {
+    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let host = match rest[..authority_end].rfind('@') {
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    };
+    format!("{}{user}:{password}@{host}", &url[..scheme_end])
+}
+
+/// Let `configurator_app` log in to the database `owner` is connected to and return its URL (built
+/// from `owner_url`). Concurrent tests race on the one cluster-global role row ("tuple concurrently
+/// updated"), so the ALTER is retried.
+pub async fn enable_app_role(owner: &PgPool, owner_url: &str) -> String {
+    let mut last = String::new();
+    let mut done = false;
+    for _ in 0..20 {
+        match sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER ROLE {APP_ROLE} LOGIN PASSWORD '{APP_PASSWORD}'"
+        )))
+        .execute(owner)
+        .await
+        {
+            Ok(_) => {
+                done = true;
+                break;
+            }
+            Err(e) => {
+                last = e.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    assert!(done, "ALTER ROLE {APP_ROLE}: {last}");
+    let name: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(owner)
+        .await
+        .expect("current database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "GRANT CONNECT ON DATABASE \"{name}\" TO {APP_ROLE}"
+    )))
+    .execute(owner)
+    .await
+    .expect("grant connect");
+    with_credentials(owner_url, APP_ROLE, APP_PASSWORD)
+}
+
+pub fn test_config(database_url: String, migrate_database_url: String) -> Config {
+    test_config_with(database_url, migrate_database_url, &[])
+}
+
+/// [`test_config`] plus `extra` settings (e.g. the admin SAs and licence gate pointed at a local mock).
+pub fn test_config_with(
+    database_url: String,
+    migrate_database_url: String,
+    extra: &[(&str, String)],
+) -> Config {
+    Config::from_lookup(|k| {
+        if let Some((_, v)) = extra.iter().find(|(key, _)| *key == k) {
+            return Some(v.clone());
+        }
+        match k {
+            "DATABASE_URL" => Some(database_url.clone()),
+            "MIGRATE_DATABASE_URL" => Some(migrate_database_url.clone()),
+            "KEYCLOAK_ISSUER" => Some(TEST_ISSUER.into()),
+            "KEYCLOAK_JWKS_URL" => Some("https://issuer.test/certs".into()),
+            _ => None,
+        }
     })
     .expect("test config")
 }
 
-/// A migrated fresh database (no seeds) and the router over it.
+/// A migrated fresh database (no seeds) and the router over it. As in production, requests run as
+/// `configurator_app` (under RLS) and the owner pool is the superuser that migrated.
 pub async fn env() -> TestEnv {
-    let url = database().await;
-    let pool = db::connect(&url)
+    env_with(&[]).await
+}
+
+/// [`env`] with `extra` settings.
+pub async fn env_with(extra: &[(&str, String)]) -> TestEnv {
+    let owner_url = database().await;
+    let owner = db::connect(&owner_url)
         .await
         .expect("connect to the test database");
-    db::migrate(&pool).await.expect("migrations apply");
-    let cfg = test_config(url);
+    db::migrate(&owner).await.expect("migrations apply");
+    let app_url = enable_app_role(&owner, &owner_url).await;
+    let runtime = db::connect(&app_url)
+        .await
+        .expect("connect as configurator_app");
+    db::assert_runtime_role(&runtime)
+        .await
+        .expect("the runtime pool is under RLS");
+    let cfg = test_config_with(app_url, owner_url, extra);
     let verifier = Verifier::static_key(
         &cfg.keycloak_issuer,
         &cfg.keycloak_audience,
         keys::decoding_key(),
     );
-    let state = AppState::new(cfg, pool).with_verifier(verifier);
+    let state = AppState::new(cfg, runtime, owner).with_verifier(verifier);
     let app = routes::router(state.clone());
     TestEnv { state, app }
 }
 
+/// The owner pool, for assertions and fixtures that must see every tenant's rows.
 pub fn pool(e: &TestEnv) -> &PgPool {
-    &e.state.db
+    &e.state.owner
 }
 
 pub async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {

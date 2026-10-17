@@ -1,10 +1,14 @@
 //! Layers and their overlay rows, with revision history (spec sections 4.1 and 10.1).
 //!
 //! Visibility: a tenant caller sees every platform layer and its own tenant's layer; the super-admin
-//! without `X-Tenant-Id` sees platform layers only. Another tenant's layer is 404 on every route, the
-//! same as a layer that does not exist. Reads need any membership (`viewer`); writes to a tenant layer
-//! need `editor`, writes to a platform layer need the super-admin. Every write is audited in its
-//! transaction.
+//! in the platform view sees platform layers only. Another tenant's layer is 404 on every route, the
+//! same as a layer that does not exist. Reads need any tenant role (`tenant_user`); writes to a tenant
+//! layer need `tenant_admin`, writes to a platform layer need the super-admin. Every write is audited
+//! in its transaction.
+//!
+//! Database access follows the data: a tenant's layer through the runtime pool with that tenant set
+//! (RLS), platform layers through the owner pool ([`AppState::tx`]). The SQL tenant predicates stay
+//! as defence in depth.
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -120,17 +124,18 @@ async fn visible(st: &AppState, who: &Acting, id: &str) -> Result<Layer, ApiErro
     let Ok(uuid) = Uuid::parse_str(id) else {
         return Err(layer_not_found(id));
     };
-    match layers::get(&st.db, uuid).await? {
+    let mut tx = st.tx(who.tenant()).await?;
+    match layers::get(&mut tx, uuid).await? {
         Some(l) if l.key.tenant.is_none() || l.key.tenant == who.tenant() => Ok(l),
         _ => Err(layer_not_found(id)),
     }
 }
 
-/// Platform layers are the super-admin's; a tenant layer is its tenant's editors'.
+/// Platform layers are the super-admin's; a tenant layer is its tenant's `tenant_admin`s'.
 fn may_write(who: &Acting, l: &Layer) -> Result<(), ApiError> {
     match (l.key.tenant, who) {
         (None, _) => require_super_admin(who.caller()),
-        (Some(_), Acting::Tenant(ctx)) => ctx.require(Role::Editor),
+        (Some(_), Acting::Tenant(ctx)) => ctx.require(Role::TenantAdmin),
         // `visible` never returns a tenant layer in the platform view.
         (Some(_), Acting::Platform(_)) => Err(layer_not_found(&l.id.to_string())),
     }
@@ -177,7 +182,8 @@ async fn list(
         industry: q.industry,
         job: q.job,
     };
-    let items = layers::list(&st.db, who.tenant(), &f, before, page::fetch(limit)).await?;
+    let mut tx = st.tx(who.tenant()).await?;
+    let items = layers::list(&mut tx, who.tenant(), &f, before, page::fetch(limit)).await?;
     Ok(Json(Paged::new(items, limit, |l| {
         TimeCursor::encode(l.ts_us, l.id)
     })))
@@ -191,7 +197,7 @@ async fn show(
     Ok(Json(visible(&st, &who, &id).await?))
 }
 
-/// A layer key without `tenant`: a `tenant` layer is always the caller's `X-Tenant-Id` tenant.
+/// A layer key without `tenant`: a `tenant` layer is always the tenant the caller acts in.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewLayer {
@@ -203,7 +209,7 @@ struct NewLayer {
     dimension: Option<(String, String)>,
 }
 
-/// `POST /api/layers`: scope `tenant` needs `editor` in the `X-Tenant-Id` tenant; any other scope needs
+/// `POST /api/layers`: scope `tenant` needs `tenant_admin` in the tenant acted in; any other scope needs
 /// the super-admin. 400 `invalid_layer` for a key that breaks the spec 4.1 table; 409 `layer_exists`.
 async fn create(
     State(st): State<AppState>,
@@ -214,7 +220,7 @@ async fn create(
     let tenant = if b.scope == Scope::Tenant {
         match &who {
             Acting::Tenant(ctx) => {
-                ctx.require(Role::Editor)?;
+                ctx.require(Role::TenantAdmin)?;
                 Some(ctx.tenant)
             }
             Acting::Platform(_) => return Err(tenant_required()),
@@ -234,7 +240,7 @@ async fn create(
     };
     key.validate()
         .map_err(|e| ApiError::BadRequest("invalid_layer", e.to_string()))?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(key.tenant).await?;
     let Some(l) = layers::create(&mut tx, &key).await? else {
         return Err(ApiError::Conflict(
             "layer_exists",
@@ -276,7 +282,8 @@ async fn list_rows(
     let kind = q.kind.as_deref().map(parse_kind).transpose()?;
     let limit = page::limit(q.limit.as_deref())?;
     let before = TimeCursor::decode(q.before.as_deref())?;
-    let items = rows::list_current(&st.db, l.id, kind, before, page::fetch(limit)).await?;
+    let mut tx = st.tx(who.tenant()).await?;
+    let items = rows::list_current(&mut tx, l.id, kind, before, page::fetch(limit)).await?;
     Ok(Json(Paged::new(items, limit, |r| {
         TimeCursor::encode(r.ts_us, r.id)
     })))
@@ -305,7 +312,7 @@ async fn add_row(
     let Json(b) = body?;
     check_key(b.kind, &b.key)?;
     check_fields(b.kind, b.op, &b.fields)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(l.key.tenant).await?;
     let latest = rows::latest(&mut tx, l.id, b.kind, &b.key).await?;
     if latest.as_ref().is_some_and(|r| r.is_current) {
         return Err(row_exists(b.kind, &b.key));
@@ -375,7 +382,7 @@ async fn revise_row(
     check_key(kind, &key)?;
     let Json(b) = body?;
     check_fields(kind, b.op, &b.fields)?;
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(l.key.tenant).await?;
     let Some(prev) = rows::retire(&mut tx, l.id, kind, &key, b.expected_rev).await? else {
         return Err(no_match(&mut tx, &l, kind, &key).await?);
     };
@@ -430,7 +437,7 @@ async fn retire_row(
             "expected_rev is required".into(),
         ));
     };
-    let mut tx = st.db.begin().await?;
+    let mut tx = st.tx(l.key.tenant).await?;
     let Some(prev) = rows::retire(&mut tx, l.id, kind, &key, expected_rev).await? else {
         return Err(no_match(&mut tx, &l, kind, &key).await?);
     };
@@ -466,7 +473,8 @@ async fn revisions(
     let Query(q) = q?;
     let limit = page::limit(q.limit.as_deref())?;
     let before = page::rev_cursor(q.before.as_deref())?;
-    let items = rows::revisions(&st.db, l.id, kind, &key, before, page::fetch(limit)).await?;
+    let mut tx = st.tx(who.tenant()).await?;
+    let items = rows::revisions(&mut tx, l.id, kind, &key, before, page::fetch(limit)).await?;
     if items.is_empty() && before.is_none() {
         return Err(row_not_found(kind, &key));
     }

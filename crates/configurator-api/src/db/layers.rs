@@ -1,7 +1,7 @@
 //! `layer` queries (spec section 4.1). Writes take the caller's transaction so the audit event shares it.
 use configurator_core::layer::LayerKey;
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::from_text;
@@ -60,8 +60,9 @@ fn layers(rows: Vec<LayerTuple>) -> Result<Vec<Layer>, sqlx::Error> {
     rows.into_iter().map(layer).collect()
 }
 
-/// The layer `id`, whoever owns it. Callers decide visibility.
-pub async fn get(db: &PgPool, id: Uuid) -> Result<Option<Layer>, sqlx::Error> {
+/// The layer `id`, if the connection may see it (RLS on the runtime pool). Callers still decide
+/// visibility.
+pub async fn get(db: &mut PgConnection, id: Uuid) -> Result<Option<Layer>, sqlx::Error> {
     let row = sqlx::query_as::<_, LayerTuple>(
         "SELECT id, scope, industry, department, job, rule, dimension_key, dimension_value, tenant, \
                 to_jsonb(created_at) #>> '{}', (extract(epoch FROM created_at) * 1000000)::bigint \
@@ -84,7 +85,7 @@ pub struct Filter {
 /// One page of the layers visible in `tenant`: every platform layer (`tenant IS NULL`) and that tenant's
 /// own layer. `tenant = None` is the platform view (platform layers only). Newest first.
 pub async fn list(
-    db: &PgPool,
+    db: &mut PgConnection,
     tenant: Option<Uuid>,
     f: &Filter,
     before: Option<TimeCursor>,

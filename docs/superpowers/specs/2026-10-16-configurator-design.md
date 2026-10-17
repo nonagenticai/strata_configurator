@@ -1,7 +1,23 @@
 # strata-configurator — design spec
 
-Status: **rev 2 — owner decisions applied (§14).** No code yet.
-Date: 2026-10-16
+Status: **rev 3 (2026-10-17) — tenancy, identity and care-bus handoff decisions applied (§14).**
+Phase 1 is merged and live (PR #1); everything rev 3 adds is **design, not built**.
+Date: 2026-10-16 (rev 1–2), 2026-10-17 (rev 3)
+
+**Rev 3 changelog.** Folds in §2–§3 of
+`docs/superpowers/plans/2026-10-17-configurator-02-tenancy-and-carebus-handoff.md`. Identity
+copies commonpractice's *code* (patterns only, no shared code): Keycloak only authenticates;
+an app-owned `users(sub, tenant_id, tenant_role)` table, one tenant per identity, replaces
+`member`; the only Keycloak role is the client role `super_admin` on `strata-configurator`;
+`X-Tenant-Id` is gone, a super-admin switches tenant with `X-Active-Tenant-Id`; roles are
+`tenant_user` (read) and `tenant_admin` (edit + approve/release), replacing
+viewer/editor/approver/admin (§8, §10.1, §10.2). The configurator mints tenant ids and provisions
+tenant + first `tenant_admin` down into care-bus (§2, §3). Isolation moves from query
+predicates to Postgres RLS (§10.4). care-bus P0 becomes tenant **and job** scope with RLS and
+its own `users` table; the care-bus handoff becomes a versioned base release that care-bus keeps
+apart from tenant refinements (§2, §6.3, §9, §11); P4 becomes a dedicated `release-writer` SA.
+New: licensing gate 2 (§10.6), metering outbox (§10.3, lands with phase 3 only), early-access
+signup (§10.7). Phasing reordered (§12).
 Parent direction: `care-bus-agents/docs/superpowers/specs/2026-10-16-interaction-layer-vision.md`
 (called "the vision" below; § numbers prefixed `V§` refer to it).
 Implementation plans: `docs/superpowers/plans/2026-10-16-configurator-00-overview.md` (all phases)
@@ -32,7 +48,9 @@ It also owns the approval workflow that decides what goes live.
 - It does not ingest or store knowledge. That stays in strata_ingest and strata_rag.
 - It has no graph or entity-extraction service. KAG, karma and hirag stay out (owner, 2026-10-16).
 - It shares no library with care-bus, rag or ingest, and nothing with `commonpractice`.
-  `commonpractice` is a reference only (V§6.1). Wire contracts are copied as structs and covered by contract tests.
+  `commonpractice` is a reference only (V§6.1): its identity, RLS, overlay/tombstone, licence-gate,
+  metering-outbox and early-access *patterns* are copied (owner, 2026-10-17), never its code.
+  Wire contracts are copied as structs and covered by contract tests.
 - It does not hold job, industry or department knowledge in code. That knowledge is seed data (§4.6).
 
 ---
@@ -64,9 +82,22 @@ Why:
 4. **Blast radius.** A bad overlay edit is a draft in the configurator. It only reaches a runtime
    cell through an explicit, approved, recorded release (§8).
 
-What this means: care-bus's existing admin pages stay valid for **runtime-local edits**
-(e.g. an operator tweaking a model route). The configurator **detects** those edits as drift
-(§9) rather than forbidding them.
+5. **Tenant ids are minted here.** The configurator creates the tenant uuid and provisions the
+   tenant and its first care-bus `tenant_admin` down into care-bus (a tenant-create call
+   authenticated by the configurator's SA), then pushes releases for it. care-bus never mints
+   tenant ids. After provisioning, care-bus admins manage care-bus users themselves.
+
+**Handoff to care-bus = a versioned base** (owner, 2026-10-17). The configurator pushes an
+approved release (snapshot N) per `(tenant, job)`. care-bus stores that **base** apart from
+the tenant admin's **refinements** (overrides, extensions, `hidden` tombstones keyed like the
+base row — commonpractice's overlay pattern). Applying release N+1 keeps the refinements and
+reports conflicts. care-bus keeps running when the configurator is down. **Jobs live in
+care-bus**: one care-bus is multi-tenant and multi-job; context spaces, procedures, connectors,
+knowledge stores and model routes are keyed by `(tenant, job)` (P0, §11).
+
+What this means: care-bus's admin pages stay valid for **tenant refinements** on top of the
+base (e.g. a connector credential, a model route). They are the run organisation's to make;
+the configurator reads them back as drift (§9) rather than forbidding or overwriting them.
 
 ---
 
@@ -89,8 +120,11 @@ What this means: care-bus's existing admin pages stay valid for **runtime-local 
 A **deployment target** is the unit the configurator provisions:
 `(tenant, care-bus base URL, strata_rag base URL, strata_ingest base URL)`. Every cell is
 multi-tenant, so a target addresses one tenant inside each cell, with the **same tenant uuid**
-in all of them (the configurator's tenant id is passed down as `X-Tenant-Id`, as rag and
-ingest already accept). A tenant with runtime instances in several regions (EU, US) or on
+in all of them: the configurator mints it (§2). care-bus receives it by tenant provisioning and
+in the release path (§6.3). rag and ingest receive it today through their existing tenant
+convention (`<tenant>:<token>` / `X-Tenant-Id` on *their* APIs); they are shared by many apps
+and will move to the w2v cell pattern (provision-down + tenant-x-app licence), not to this
+spec's identity model. A tenant with runtime instances in several regions (EU, US) or on
 customer hardware has one target per instance. A customer-hardware instance is just a target
 whose base URLs are outside the cluster; the configurator never ships with a deployment.
 
@@ -117,7 +151,7 @@ scope ∈ { base, profile, industry, industry_dept, job, tenant }
 | industry | `industry` | super-admin |
 | industry_dept | `industry`, `department` | super-admin |
 | job | `job`, optional `dimension` (`key=value`, e.g. `channel=voice`) | super-admin |
-| tenant | `tenant` | that tenant's editors |
+| tenant | `tenant` | that tenant's `tenant_admin`s |
 
 Any other key set is a 400. This extends care-bus's
 `ontology_scope = generic | industry | industry_dept`. care-bus's `generic` maps to the
@@ -369,7 +403,9 @@ This mapping is lossy only for job/tenant adds, and care-bus never reads scope a
 
 ## 6. Emission — from effective config to cell configuration (V§4.3 step 4)
 
-Each approved use case becomes:
+Each approved use case becomes the outputs below. For care-bus the "existing API" column is
+what exists today (verified 2026-10-16); in rev 3 the care-bus outputs are **sections of one
+release bundle** sent through the release endpoint (§6.3, P4), not per-object calls.
 
 | Target | Output | Existing API (verified) | Gap |
 |---|---|---|---|
@@ -405,21 +441,28 @@ The store template compiles to a router/leaf tree under one root per deployment 
 - A **release** (§8) is pushed per target, per cell, in order:
   1. rag stores;
   2. ingest bootstrap jobs;
-  3. care-bus ontology;
-  4. connectors and mappings;
-  5. context spaces;
-  6. procedures (created DRAFT → `PUBLISHED` last).
-- Every call is idempotent. The configurator keeps a `push_step` row per call, holding the
-  request hash and the response.
-- A failed step stops the release at that point. A re-push resumes from the failed step.
+  3. care-bus release bundle.
+- **rag/ingest:** every call is idempotent. The configurator keeps a `push_step` row per call,
+  holding the request hash and the response. A failed step stops the release at that point; a
+  re-push resumes from the failed step.
+- **care-bus (design; needs P0 + P4):** one call,
+  `PUT /api/tenants/{tenant}/jobs/{job}/releases/{release_id}` on care-bus, authenticated as the
+  configurator's `release-writer` SA (§10.2). The SA token carries no tenant, so the tenant is a
+  path segment (decided rev 3); care-bus rejects a tenant it was not provisioned with.
+  - Body: the bundle — ontology slice, context spaces/use cases, procedures, job settings,
+    connector **slots** (no secrets), knowledge store layout — plus its hash.
+  - Idempotent on `(tenant, job, release_id, hash)`; a re-push is a no-op.
+  - care-bus applies it in one transaction: swaps its base rows to the new release and returns
+    a **conflict** for every tenant refinement whose base target disappeared or changed.
+    Conflicts are kept and flagged in care-bus's admin UI; the configurator records them on the
+    `push_step` and shows them on the release page.
+  - `GET /api/tenants/{tenant}/jobs/{job}/releases/current` on care-bus is the read-back for drift (§9).
+  - Procedure versioning and the one-PUBLISHED-per-context-space rule are care-bus's to keep
+    inside the apply.
 - Partial state is visible in the UI and is never reported as live.
-- Procedures go out as new versions. The previous PUBLISHED version stays until the new one
-  is published, so care-bus always has exactly one PUBLISHED version per context space.
-  This keeps its unique partial index satisfied.
-- Credentials are never pushed as values. Pushes carry `secret_ref` names, as care-bus already
-  requires. Source credentials go into care-bus's sealed `credentials` field only when a person
-  enters them in the configurator UI. They are forwarded in the same request and **not stored**
-  in the configurator.
+- Credentials are never pushed as values. rag/ingest pushes carry `secret_ref` names; the
+  care-bus bundle carries connector slots only, and the tenant admin fills credentials in
+  care-bus as a refinement (the run organisation owns them).
 
 ---
 
@@ -457,7 +500,7 @@ It is not one long LLM call.
 | 4. Emit | use case → context space / procedure / mappings / stores / ingest jobs | **no** (deterministic templates over use case + effective ontology) | — |
 | 5. SOP link | use case → SOPs + source location | yes for suggestions (rag search over SOP stores), a person confirms | link required |
 | 6. Approve | configured use case → `approved` | no | **required** |
-| 7. Release | approved set → push (§6.3) | no | **required** (`approver` role) |
+| 7. Release | approved set → push (§6.3) | no | **required** (`tenant_admin`) |
 
 Rules:
 
@@ -475,8 +518,9 @@ Rules:
   No cron and no background trigger may cause LLM or GPU calls.
 - **Release** = an immutable snapshot of `{effective_hash, approved use cases, emitted payloads, target}`.
   Rollback = re-push an earlier release.
-- **Approve and release are two actions, not two people** (owner, 2026-10-16). One person with
-  the `approver` role may do both. Each action records its own actor (`approved_by`,
+- **Approve and release are two actions, not two people** (owner, 2026-10-16). One
+  `tenant_admin` may do both (rev 3: approval collapses onto `tenant_admin`; there is no
+  separate approver role). Each action records its own actor (`approved_by`,
   `released_by`), so a per-tenant "releaser must differ from approver" policy can be added
   later without a data migration. That policy is **not built** now.
 
@@ -494,10 +538,13 @@ A drift check recomputes these:
 - **Upstream drift.** If the ontology, an SOP, a tool schema or a seed changed, the use case
   becomes `stale` and shows a diff. A stale use case is never auto-updated and never
   auto-pushed.
-- **Downstream drift.** The configurator reads back each target cell (`GET` on the same
-  endpoints it pushes to) and compares with the last release. A local edit in care-bus admin
-  is shown as drift, which the user can **adopt** (it becomes a tenant overlay) or **overwrite**
-  (on the next release).
+- **Downstream drift.** The configurator reads back each target cell and compares with the
+  last release. rag/ingest: `GET` on the same endpoints it pushes to. care-bus:
+  `GET /api/tenants/{tenant}/jobs/{job}/releases/current` (the base it holds) plus the tenant refinements on top.
+  A release mismatch is drift. A care-bus refinement is **not** overwritten by the next release
+  (care-bus keeps refinements, §6.3); the configurator shows it and the user can **adopt** it
+  (it becomes a configurator tenant overlay, so the next base carries it) or leave it as a
+  run-side refinement. Conflicts care-bus reported on the last apply are shown with it.
 
 Drift checks run on demand and on a timer. Drift checks are pure HTTP/DB reads and hashing,
 with **no LLM**, so a timer is allowed. SOP hashes come from rag document `content_hash` and
@@ -509,10 +556,16 @@ with **no LLM**, so a timer is allowed. SOP hashes come from rag document `conte
 
 ### 10.1 HTTP API (unversioned `/api/<resource>`, `Paged{items,next}`, `limit` 50 / max 500, cursor `before`, errors `{"error":{"code","message"}}`)
 
-- **Identity and tenants**
-  - `GET /api/me` (sub, `super_admin`, memberships)
-  - `GET|POST /api/tenants` (super-admin), `GET|POST /api/tenants/{id}/members`,
-    `DELETE /api/tenants/{id}/members/{sub}` (super-admin or that tenant's `admin`)
+- **Identity and tenants** (rev 3 shape — design; phase 1 shipped `members` routes)
+  - `GET /api/me` (sub, `super_admin`, `tenant_id`, `tenant_role`, active tenant)
+  - `GET|POST /api/tenants` (super-admin; POST mints the tenant uuid and provisions down, §2)
+  - `GET /api/users`, `POST /api/users` (invite: creates the Keycloak identity + action email
+    through the admin SA), `PUT /api/users/{sub}` (change role), `POST /api/users/{sub}/disable`
+    — super-admin or that tenant's `tenant_admin`
+- **Early access** (§10.7)
+  - `POST /api/signup-approvals/intake` (intake client only)
+  - `GET /api/signup-approvals`, `POST /api/signup-approvals/{id}/approve|reject` (super-admin)
+- **Licence** — `GET /api/license/status` (§10.6)
 - **Layers and overlay rows** (one generic surface for every layered kind, §4.1)
   - `GET|POST /api/layers`
   - `GET|POST /api/layers/{id}/rows?kind=` — POST body `{kind, key, op, fields}`
@@ -556,27 +609,51 @@ with **no LLM**, so a timer is allowed. SOP hashes come from rag document `conte
 
 ### 10.2 Tenancy and auth
 
-- **Identity** comes from the shared Keycloak **portal realm** (all apps log in there), with a
-  new public client `strata-configurator` (PKCE for the UI) and audience `strata-configurator`
-  for API tokens. Keycloak only authenticates.
-- **Super-admin** is the one platform-level role, the Keycloak realm role
-  `config-super-admin`, held by the owner. It writes everything that is shared: base, profile,
-  industry, industry_dept and job layers; axes, axis rules, dimensions and standard dimension
-  values; and (later) standard sources, the tool catalogue, knowledge kinds, store templates and
-  generator prompts. It also creates tenants and their first admin.
-- **Tenants are owned by the configurator**, as cells do (`tenant`, `member` tables). Tenant
-  roles live in the configurator DB, not in Keycloak:
-  - `viewer` — read and compile;
-  - `editor` — write that tenant's layer and its dimension values;
-  - `approver` — editor + approve and release (§8);
-  - `admin` — approver + manage members.
-- The caller names its tenant in `X-Tenant-Id` (the rag/ingest convention): exactly one header,
-  a bare non-nil uuid. Missing on a tenant-scoped route → 400 `tenant_required`; malformed or nil
-  → 400 `invalid_tenant`; not a member → 403. Super-admin may act in any tenant.
+Rev 3 model (copied from commonpractice's code, `cp-identity.ts` / `keycloak-admin.ts`).
+**Design, not built:** phase 1 shipped a `member(tenant, sub, role)` table, `X-Tenant-Id` and
+the realm role `config-super-admin`; W1 replaces them (migration `0003`, forward-only, pre-prod).
+
+- **Identity** comes from the shared Keycloak **portal realm** (all apps log in there), with the
+  public client `strata-configurator` (PKCE for the UI) and audience `strata-configurator` for
+  API tokens; `exp`, `iss`, `aud` and `sub` are required claims. **Keycloak only
+  authenticates.** The API reads only `sub` and the client role below; any `tenant_id` claim and
+  every other role in the token are ignored.
+- **Super-admin** is the one Keycloak role: the **client role `super_admin` on client
+  `strata-configurator`**, read from `resource_access.strata-configurator.roles` — never from
+  `realm_access`, never the shared realm `super_admin` (commonpractice reads that one). Roles do
+  not overlap between apps; care-bus has its own `super_admin` on its own client. Held by the
+  owner. It writes everything that is shared: base, profile, industry, industry_dept and job
+  layers; axes, axis rules, dimensions and standard dimension values; and (later) standard
+  sources, the tool catalogue, knowledge kinds, store templates and generator prompts. It
+  creates tenants (minting the uuid) and their first `tenant_admin`.
+- **Tenants and roles are owned by the configurator**, in its own DB: `tenant` and
+  `users(sub pk, tenant_id, tenant_role)`, **one tenant per identity**.
+  `tenant_role ∈ {tenant_admin, tenant_user}`:
+  - `tenant_user` — read and compile, nothing else;
+  - `tenant_admin` — write that tenant's layer and its dimension values, approve and release
+    (§8), manage that tenant's users.
+
+  These roles exist only in the configurator's `users` table and mean nothing to any other
+  app. care-bus has its own `tenant_admin`/`tenant_user` in its own `users` table (the run
+  organisation), so a person can administer a tenant's configuration without administering
+  its running agents, and the reverse.
+- **Tenant context.** A normal user's tenant comes from `users` by `sub`; there is no tenant
+  header. A `sub` with no `users` row (and no `super_admin`) → 403. A disabled user → 403.
+  A **super-admin** picks the active tenant with `X-Active-Tenant-Id` (exactly one header, a bare
+  non-nil uuid; malformed or nil → 400 `invalid_tenant`; unknown → 404). Each switch is an
+  `audit_event`; one tenant is active per request. Without the header a super-admin has the
+  platform view (platform rows only). Any other caller sending `X-Active-Tenant-Id` → 403.
+- **User lifecycle.** Invite creates the Keycloak identity (create user + action email) and the
+  `users` row; disable disables both. Keycloak calls go through a portal-realm
+  client-credentials admin SA `strata-configurator-admin`, scoped to create users and send
+  action emails (modelled on commonpractice's `commonpractice-admin`). No Keycloak user
+  attribute or realm role is ever written.
 - Every write records an `audit_event` (actor, action, object, before/after hash).
 - **Outbound to targets:**
-  - **care-bus:** a Keycloak client-credentials service account with care-admin, plus
-    `X-Tenant-Id` once care-bus is multi-tenant (P0). care-bus's static service tokens are
+  - **care-bus:** a Keycloak client-credentials SA holding the care-bus **client role
+    `release-writer`**, valid only on care-bus's two provision-down endpoints — tenant provisioning
+    (`PUT /api/tenants/{tenant}` with its first `tenant_admin`, §2) and the release endpoint — with
+    `aud`/`iss` required by care-bus (P4). Not care-admin; care-bus's static service tokens are
     read-only today (§11).
   - **rag/ingest:** a tenant-scoped bearer token per target (`<tenant>:<token>`, the existing
     rag/ingest format).
@@ -597,14 +674,39 @@ with **no LLM**, so a timer is allowed. SOP hashes come from rag document `conte
 - In production with no provider → 409 `provider_not_configured`. There is no silent fallback.
 - Every LLM call records the model, token usage and the stage it ran for, on the run row.
 - Prompts are versioned seed data. A generator run pins `generator_version`.
+- **Metering (design; lands with phase 3 only).** Metering covers LLM/GPU calls only, and the
+  configurator makes none before phase 3, so none of this is built earlier. Pattern copied from
+  commonpractice (`host/metering-emit.ts`, `metering-outbox-drainer.ts`, migration `0090`):
+  each LLM call writes a local `usage_ledger` row and a `metering_outbox` row **in the same
+  transaction** (tenant, actor `sub`, model, tokens, stage, run id); a drainer XADDs outbox rows
+  to the Redis stream `billing:costs`, where billing-service prices them. Ships dark behind
+  `METERING_EMIT_ENABLED` so customer-hardware installs can run without central billing.
 
 ### 10.4 Storage
 
-- Postgres 18, own DB `strata_configurator`, own role. It is created with
-  `provision-service-db.sh` (born locked).
-- sqlx 0.9, `sqlx::migrate!("./migrations")` at startup.
+- Postgres 18, own DB `strata_configurator`, created with `provision-service-db.sh` (born
+  locked). **Two DB users** (rev 3, design): the owner role runs migrations; the runtime role
+  `configurator_app` is a **non-bypass** role (no `BYPASSRLS`, not the table owner). If the
+  provisioning script cannot create the second user, it is extended in gitops first.
+- sqlx 0.9, `sqlx::migrate!("./migrations")` at startup (as the owner role).
+- **Isolation is Postgres RLS** (rev 3, design; phase 1 isolates by query predicates). Pattern
+  copied from commonpractice migrations `0028`/`0029`/`0032`/`0057`:
+  - every request runs in a transaction that does `SET LOCAL app.current_tenant = '<uuid>'`
+    (the user's tenant, or the super-admin's active tenant; unset for the platform view) and
+    `SET LOCAL app.is_super_admin = 'on'` only for a super-admin;
+  - every table with a `tenant` column has RLS enabled and policies: tenant rows are visible and
+    writable only when `tenant = current_setting('app.current_tenant')`; **platform rows
+    (`tenant IS NULL`) are readable by all and writable only when `app.is_super_admin` is on**;
+  - tables without their own `tenant` column are policed through their parent (`overlay_row`
+    through its `layer`); policies cover at least `tenant`, `users`, `layer`, `overlay_row`,
+    `dimension_value`, `profile`, `audit_event`, and every later tenant table;
+  - **CI anti-drift test:** every table with a `tenant`/`tenant_id` column has RLS enabled and
+    at least one policy; a new table without them fails CI;
+  - a test proves raw SQL as `configurator_app` with tenant A set cannot see tenant B's rows.
+
+  The API's own predicates stay as defence in depth (cross-tenant id → 404, not 403).
 - Main tables:
-  - `tenant`, `member`;
+  - `tenant`, `users` (replaces `member`), `signup_approvals` (§10.7);
   - `layer`, `overlay_row` (all layered kinds, §4.1);
   - `axis`, `axis_value`, `axis_rule`;
   - `dimension`, `dimension_value`;
@@ -619,6 +721,7 @@ with **no LLM**, so a timer is allowed. SOP hashes come from rag document `conte
   - `target`;
   - `release`, `push_step`;
   - `drift_finding`;
+  - `usage_ledger`, `metering_outbox` (phase 3 only, §10.3);
   - `audit_event`.
 - **No `create_all`.** Migrations only. Each migration is tested by `upgrade` from empty and
   from the previous release.
@@ -636,7 +739,10 @@ with **no LLM**, so a timer is allowed. SOP hashes come from rag document `conte
   `Dockerfile.rust` with a `PACKAGE` arg (the care-bus pattern).
 - **CI:** `.github/workflows/ci.yml` calls gitops-production `rust-service.yml@main` (api) and
   `ts-service.yml@main` (web).
-  - **Deploy:** namespace `strata-configurator`.
+  - **Deploy:** namespace `strata-configurator`, ambient mesh with a waypoint; Pod Security
+    `enforce: baseline` + `warn: restricted` (as care-bus, strata-rag, commonpractice — Istio's
+    waypoint pod does not set `seccompProfile`, so `enforce: restricted` keeps the waypoint down
+    and the Service-targeted AuthorizationPolicies unenforced; fixed in gitops by W0).
   - **Manifests:** `gitops-production/clusters/strato/services/strata-configurator/`.
 - **Tests:**
   - **DB tests:** one Postgres testcontainer per test binary and a fresh DB per test (copy the
@@ -651,6 +757,38 @@ with **no LLM**, so a timer is allowed. SOP hashes come from rag document `conte
     enough to replace a hand seed.
 - No local cargo builds (owner ruling 2026-10-16). Rust is verified in CI only.
 
+### 10.6 Licensing gate 2 (design)
+
+In-app licence check, a Rust port of commonpractice `middleware/license-gate.ts` +
+`services/license-client.ts`. It ships **dark**: `LICENSE_GATE_2_ENABLED` (off by default),
+`LICENSE_INTROSPECT_URL` (`http://licenses.licenses.svc.cluster.local:8544/license/introspect`),
+`LICENSE_APP_KEY=strata-configurator`, `LICENSE_CACHE_TTL_SEC` (300).
+
+- Each tenant-scoped request introspects the active tenant's licence; results are cached 300 s.
+- **Fail-closed:** 402 `license_required | license_inactive | license_expired |
+  license_unreadable | license_unavailable`; 403 `license_app_mismatch | license_tenant_mismatch`.
+- Exempt: `/health`, `/ready`, super-admin platform routes, `GET /api/license/status`.
+- **Issuance:** tenant creation (super-admin or early-access approval) calls
+  `POST /licenses/user/{sub}` through a `secure-apps` client-credentials SA
+  `strata-configurator-licenses-admin` (secret in SOPS; egress NetworkPolicy + AuthZ in gitops);
+  offboarding revokes. The app and a test plan are registered in the licences service first.
+- Rollout, as commonpractice: backfill licences, smoke-test introspect, then flip the flag.
+
+### 10.7 Early-access signup (design)
+
+A copy of commonpractice's early-access self-signup (`docs/runbooks/early-access-signup.md`,
+`routes/onboarding.ts`, `services/plan-posture.ts`), built so it can be switched on after
+testing. Everything ships dark behind env flags.
+
+- A website or chat backend calls `POST /api/signup-approvals/intake` with a client-credentials
+  token from client `configurator-signup-intake` (holding its intake role). The request lands as
+  a row in the `signup_approvals` queue. Turnstile verification and a Telegram notification are
+  optional and off by default.
+- A super-admin approves or rejects in the UI. Approval, in one flow: mints the tenant, creates
+  the first `tenant_admin` (Keycloak invite through the admin SA + `users` row), issues the
+  licence with a default plan (§10.6), and provisions the tenant down into care-bus once care-bus
+  accepts it (P0).
+
 ---
 
 ## 11. Prerequisites in the other cells
@@ -661,11 +799,11 @@ what the target can accept.
 
 | # | Repo | Change | Blocks |
 |---|---|---|---|
-| P0 | care-bus | **Multi-tenancy** (owner, 2026-10-16: all apps become multi-tenant): tenant column on ontology, context spaces, procedures, connectors, sources, model routes; tenant from `X-Tenant-Id`/token; streams and audit tenant-scoped. Today care-bus has no tenant anywhere (verified @ 3b88445) and `ontology_entities.name` is a global PK | any push to care-bus |
+| P0 | care-bus | **Multi-tenant and multi-job** (owner, 2026-10-16/17): `tenant_id` + `job_id` on every config table (ontology, context spaces, procedures, connectors + field mappings, knowledge stores, sources, model routes) with RLS and the anti-drift test; a `job` table; streams and audit `(tenant, job)`-scoped. Its own `users(sub, tenant_id, tenant_role)` table and `care-bus` client role `super_admin`, same model as §10.2; tenants and the first `tenant_admin` provisioned down by the configurator (§2); the single `CAREBUS_TENANT_ID` goes. **Base vs refinement:** config rows carry `origin = base \| tenant`, base rows a `release_id`; tenant edits are overrides/extensions/`hidden` tombstones on the base row's natural key; effective view = base(current release) ⊕ tenant rows at read time. Today care-bus has no tenant anywhere (`config.rs`: "one tenant's cell by design", re-verified 2026-10-17) and `ontology_entities.name` is a global PK | any push to care-bus |
 | P1 | care-bus | Write API for context spaces (`POST/PUT /api/context-spaces`) | emitting new context spaces |
 | P2 | care-bus | Make `RequestType`/`area`/`space`/required params **data-driven** from `context_spaces` (`domain.rs:44-77`, `tools.rs:38-50`); intake classifies into loaded request types | any use case beyond the 5 hardcoded ones going *live* |
-| P3 | care-bus | Write API for ontology relations | pushing relations |
-| P4 | care-bus | Service-account write access (care-admin via client credentials) for the configurator | any push to care-bus |
+| P3 | care-bus | Write API for ontology relations — **done** (`routes/ontology.rs`, verified 2026-10-17) | — |
+| P4 | care-bus | Release endpoint `PUT /api/tenants/{tenant}/jobs/{job}/releases/{release_id}` + tenant provisioning `PUT /api/tenants/{tenant}` + `GET …/releases/current` (§6.3), accepted only from a client-credentials SA holding the dedicated `care-bus` client role **`release-writer`** (not care-admin), with `exp`/`iss`/`aud`/`sub` required. Today care-bus's JWT check does not require `aud`/`iss` (`auth.rs`, no `set_required_spec_claims`) — fixed first | any push to care-bus |
 | P5 | care-bus | MCP tool catalogue + `SIDE_EFFECT_TOOLS` + method→tool mapping from config instead of `mcp.rs` constants | tool grants per job |
 | P6 | care-bus | Job-level settings (stance/preamble, actor instead of `customer_id`) from config instead of `interaction.rs` | non-customer-care jobs |
 | P7 | strata_ingest | `metadata` (object) on `POST /api/ingest/jobs`, merged into every delivered document | ontology-tagged bootstrap ingest |
@@ -679,23 +817,36 @@ migration 0005) and document metadata with a containment filter (migration 0004)
 
 ## 12. Phasing
 
-Each phase is shippable on its own and verified live.
+Each phase is shippable on its own and verified live. Order per the 2026-10-17 plan §5.
 
-1. **Model + compiler.**
+1. **Model + compiler** — **merged and live** (PR #1, 2026-10-17).
    - Repo, DB, auth, tenants, layers, overlay rows, axes, rules, dimensions, profiles, jobs,
      seeds (base + retail + electricity template + `customer_care_agent`, `employee_care_agent`).
    - `POST /api/compile` (+ `?view=carebus`), platform export.
    - The golden test against the care-bus seed.
    - Read-only UI with provenance. Live in the cluster.
-2. **Targets + release for what exists today.**
-   - Targets; rag store layout first (rag is multi-tenant today, so this needs nothing).
-   - care-bus ontology entities, connector mappings, sources and model routes; procedures for
-     the existing 5 request types. Needs P0 and P4.
-   - Downstream drift read-back.
+   - Prerequisite fix (gitops, W0): namespace Pod Security `baseline` so the waypoint runs and
+     the API AuthorizationPolicies are enforced (§10.5).
+1a. **Identity, tenancy and RLS** (W1). `users` replaces `member`; `super_admin` client role;
+   `X-Active-Tenant-Id`; tenant creation mints the uuid; invite/role/disable through the
+   Keycloak admin SA; `configurator_app` + RLS + anti-drift test (§10.2, §10.4). Web: no tenant
+   picker for normal users, a tenant switcher for the super-admin.
+1b. **Licensing gate 2 + early-access signup** (W2), in parallel with 1a once its `users` model
+   exists. Both dark (§10.6, §10.7). Needs the licences-service registration of
+   `strata-configurator` and a test plan. No metering yet.
+2. **Targets + release.**
+   - 2a: targets; rag store layout (rag is multi-tenant today, so this needs nothing).
+   - 2b: care-bus release push (W4): `target` and `release` tables, bundle builder from compile
+     output, push as the `release-writer` SA, record response and conflicts, drift read-back,
+     release page. Needs 1a, P0 and P4 live. Exit: release 1 for a test tenant's
+     `customer_care_agent` job; care-bus answers a return request with it; a tenant refinement
+     survives release 2; a removed base object shows as a conflict.
 3. **Conversation + funnel.**
    - Job agent, generator tracks A/B/C, harmonise, use cases, SOP linking, approval.
    - Releases of use cases mapping onto existing request types only.
-4. **New request types live.** Needs P1 and P2: generated use cases become live care-bus context spaces.
+   - LLM via the same provider selection as care-bus (tenant-provided commercial, or local
+     pgx vllm / mlx_api). **Metering lands here** (§10.3), with the first LLM call.
+4. **New request types live.** Needs P1 and P2 (P3 done): generated use cases become live care-bus context spaces.
 5. **Knowledge bootstrap.**
    - Standard sources, ingest jobs with tags, retrieval scoping by metadata.
    - Needs P7, then P8.
@@ -713,7 +864,10 @@ Each phase is shippable on its own and verified live.
     procedure, using rag documents filtered by the use case's metadata tags.
 - Changing a linked SOP marks its use cases `stale` within one drift interval, and the next
   release is refused for those use cases until they are re-approved.
-- An edit in care-bus admin shows up as downstream drift and can be adopted or overwritten.
+- A tenant refinement in care-bus admin shows up as downstream drift, survives the next
+  release, and can be adopted into the configurator; a refinement whose base object a release
+  removed shows as a conflict.
+- Tenant B's rows are invisible to tenant A at the DB level (RLS), not only through the API.
 
 ---
 
@@ -725,11 +879,28 @@ Owner decisions, 2026-10-16:
    multi-tenant configurator. (The rev-1 proposal; the owner proceeded on it without objection.)
 2. §4.3 — classifier tables + profile-as-selection + axis rules. (Same.)
 3. V§7.3 — **the owner curates the standard data sources**, as super-admin (§4.10, §10.2).
-4. Four-eyes — **not required.** One approver may approve and release. Kept possible as a future
-   per-tenant option by recording both actors (§8). Not built.
+4. Four-eyes — **not required.** One `tenant_admin` may approve and release. Kept possible as a
+   future per-tenant option by recording both actors (§8). Not built.
 5. Customer hardware — **all apps become multi-tenant**; the owner as super-admin manages the
    standard assets centrally. A customer-hardware runtime is a target (§3). This adds P0
    (care-bus multi-tenancy) as a prerequisite for every care-bus push.
+
+Owner decisions, 2026-10-17 (rev 3):
+
+6. Copy commonpractice's *patterns* (no code): overlay + tombstones, Postgres RLS with an
+   anti-drift test, identity as its code does it, deployment shape, metering outbox, licence
+   gate 2, early-access signup (§10.2–§10.7).
+7. Identity: Keycloak only authenticates; app-owned `users`, one tenant per identity; per-app
+   client role `super_admin` only; per-app `tenant_admin`/`tenant_user`, no overlap between
+   apps (configurator vs care-bus = configuration vs run organisation).
+8. The configurator mints tenant ids and provisions them (and care-bus's first
+   `tenant_admin`) down. strata_rag/strata_ingest do not adopt this model; they follow the w2v
+   cell pattern.
+9. Handoff = versioned base release; care-bus keeps base and refinements apart; jobs live in
+   care-bus, multi-tenant and multi-job (§2, P0, P4).
+10. Central licensing and billing are accepted, but ship **dark** (`LICENSE_GATE_2_ENABLED`,
+    `METERING_EMIT_ENABLED`) so customer-hardware installs stay possible (reconciles the
+    2026-10-08 apps-are-cells "no new central coupling" ruling).
 
 Still open:
 
@@ -738,3 +909,6 @@ Still open:
 2. Network reachability and auth for pushing into a customer-hardware target (outbound HTTPS
    from the cluster with a per-target token is the assumption). Needed only when the first such
    target exists.
+3. ~~How the care-bus release call names its tenant, and whether `release-writer` covers tenant
+   provisioning.~~ Decided rev 3: tenant is a path segment; `release-writer` covers exactly the two
+   provision-down endpoints (§6.3, §10.2). care-bus's W3 plan may refine route names.

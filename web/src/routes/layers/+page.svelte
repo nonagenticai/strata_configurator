@@ -22,7 +22,7 @@
 	const scopes = ['base', 'profile', 'industry', 'industry_dept', 'job', 'tenant'];
 	let visibleRows = $derived(rows.filter((r) => r.key.toLowerCase().includes(search.toLowerCase())));
 	$effect(() => {
-		const tenant = session.tenant,
+		const activeTenant = session.activeTenant,
 			target = page.url.searchParams.get('row');
 		const current = ++generation;
 		++rowGeneration;
@@ -37,7 +37,7 @@
 		const controller = new AbortController();
 		async function load() {
 			try {
-				const found = await all<Layer>('/api/layers', { tenant, signal: controller.signal });
+				const found = await all<Layer>('/api/layers', { activeTenant, signal: controller.signal });
 				if (current !== generation) return;
 				layers = found.sort(
 					(a, b) =>
@@ -46,7 +46,7 @@
 				if (target) {
 					for (const layer of layers) {
 						const values = await all<Row>(`/api/layers/${layer.id}/rows`, {
-							tenant,
+							activeTenant,
 							signal: controller.signal,
 						});
 						if (current !== generation) return;
