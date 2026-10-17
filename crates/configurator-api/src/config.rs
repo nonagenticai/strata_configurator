@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::license_token::TokenKey;
+
 #[derive(Clone)]
 pub struct Config {
     /// The runtime connection: the non-bypass app role (`configurator_app`), under RLS.
@@ -19,6 +21,9 @@ pub struct Config {
     /// The `secure-apps` SA that issues tenant licences (W2.2); `None` (no issuance) unless all four
     /// `LICENSES_ADMIN_*` settings are set.
     pub licenses_admin: Option<LicensesAdminConfig>,
+    /// `LICENSE_TOKEN_ENC_KEY`: the AES-256-GCM key the tenant licence token is stored under. Required
+    /// (a startup error otherwise) whenever issuance or gate 2 is on, since both need the token.
+    pub license_token_key: Option<TokenKey>,
     /// Early-access self-signup (W2.3); off by default.
     pub signup: SignupConfig,
 }
@@ -177,6 +182,7 @@ impl std::fmt::Debug for Config {
             .field("keycloak_admin", &self.keycloak_admin)
             .field("license_gate", &self.license_gate)
             .field("licenses_admin", &self.licenses_admin)
+            .field("license_token_key", &self.license_token_key)
             .field("signup", &self.signup)
             .finish_non_exhaustive()
     }
@@ -255,6 +261,20 @@ impl Config {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
+        // Fail loud: a key that is set must be valid whatever else is on, and issuance or gate 2
+        // without one is a misconfiguration, not "store the token in clear" or "deny everyone".
+        let license_token_key = trimmed("LICENSE_TOKEN_ENC_KEY")
+            .map(|v| {
+                TokenKey::from_base64(&v)
+                    .map_err(|why| anyhow::anyhow!("LICENSE_TOKEN_ENC_KEY {why}"))
+            })
+            .transpose()?;
+        if license_token_key.is_none() && (licenses_admin.is_some() || license_gate.enabled) {
+            anyhow::bail!(
+                "LICENSE_TOKEN_ENC_KEY is not set: licence issuance and gate 2 store and read the \
+                 tenant licence token encrypted under it (base64 of 32 bytes)"
+            );
+        }
         let max_pending =
             match trimmed("SIGNUP_QUEUE_MAX_PENDING") {
                 Some(v) => v.parse::<i64>().ok().filter(|n| *n >= 1).with_context(
@@ -319,6 +339,7 @@ impl Config {
             keycloak_admin,
             license_gate,
             licenses_admin,
+            license_token_key,
         })
     }
 
@@ -428,7 +449,12 @@ mod tests {
             "https://auth.test/admin/realms/portal",
         ),
     ];
-    const LICENSES_ADMIN: [(&str, &str); 4] = [
+    /// A valid `LICENSE_TOKEN_ENC_KEY` (base64 of 32 bytes).
+    const ENC_KEY: (&str, &str) = (
+        "LICENSE_TOKEN_ENC_KEY",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    );
+    const LICENSES_ADMIN: [(&str, &str); 5] = [
         (
             "LICENSES_ADMIN_TOKEN_URL",
             "https://auth.test/realms/secure-apps/protocol/openid-connect/token",
@@ -439,9 +465,10 @@ mod tests {
         ),
         ("LICENSES_ADMIN_CLIENT_SECRET", "licences-admin-secret"),
         ("LICENSES_ADMIN_URL", "http://licenses.test:8544"),
+        ENC_KEY,
     ];
 
-    const BOTH: [(&str, &str); 8] = [
+    const BOTH: [(&str, &str); 9] = [
         KEYCLOAK_ADMIN[0],
         KEYCLOAK_ADMIN[1],
         KEYCLOAK_ADMIN[2],
@@ -450,6 +477,7 @@ mod tests {
         LICENSES_ADMIN[1],
         LICENSES_ADMIN[2],
         LICENSES_ADMIN[3],
+        LICENSES_ADMIN[4],
     ];
 
     #[test]
@@ -482,7 +510,7 @@ mod tests {
         assert!(!shown.contains("licences-admin-secret"), "{shown}");
 
         // half a service account is an error naming what is missing, not "off"
-        for group in [&KEYCLOAK_ADMIN, &LICENSES_ADMIN] {
+        for group in [&KEYCLOAK_ADMIN[..], &LICENSES_ADMIN[..]] {
             let (missing, _) = group[2];
             let partial: Vec<(&str, &str)> = group
                 .iter()
@@ -512,6 +540,7 @@ mod tests {
             ),
             ("LICENSE_APP_KEY", "other-app"),
             ("LICENSE_CACHE_TTL_SEC", "5"),
+            ENC_KEY,
         ]))
         .unwrap();
         assert!(c.license_gate.enabled);
@@ -537,6 +566,48 @@ mod tests {
             assert!(err.contains(key), "{err}");
         }
     }
+    #[test]
+    fn the_token_key_is_required_with_issuance_or_gate_2_and_must_be_valid() {
+        // all dark: no key needed
+        let c = Config::from_lookup(base).unwrap();
+        assert!(c.license_token_key.is_none());
+        // issuance, or gate 2, without the key is a startup error naming it
+        let issuance: Vec<(&str, &str)> = LICENSES_ADMIN[..4].to_vec();
+        let err = Config::from_lookup(|k| {
+            issuance
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+                .or_else(|| base(k))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LICENSE_TOKEN_ENC_KEY"), "{err}");
+        let err = Config::from_lookup(with(&[("LICENSE_GATE_2_ENABLED", "true")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LICENSE_TOKEN_ENC_KEY"), "{err}");
+        // with it, both start, and the key never prints
+        let c = Config::from_lookup(with(&LICENSES_ADMIN)).unwrap();
+        assert!(c.license_token_key.is_some());
+        let shown = format!("{c:?}");
+        assert!(!shown.contains(ENC_KEY.1), "{shown}");
+        // a key that is set must be valid, even with everything else off
+        for bad in ["not-base64!", "AAECAwQFBgcICQoLDA0ODw=="] {
+            let err = Config::from_lookup(|k| {
+                if k == "LICENSE_TOKEN_ENC_KEY" {
+                    Some(bad.into())
+                } else {
+                    base(k)
+                }
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("LICENSE_TOKEN_ENC_KEY"), "{err}");
+            assert!(!err.contains(bad), "the value is not echoed: {err}");
+        }
+    }
+
     #[test]
     fn early_access_is_dark_by_default_and_parses_strictly() {
         let c = Config::from_lookup(base).unwrap();

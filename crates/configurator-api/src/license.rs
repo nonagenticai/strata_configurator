@@ -11,9 +11,15 @@
 //! passed (402 `license_expired`), `app.key` must be `LICENSE_APP_KEY` (403 `license_app_mismatch`)
 //! and `tenant_id` the resolved tenant (403 `license_tenant_mismatch`), which binds the two gates.
 //! 402 `license_unreadable` is an introspection whose `expires_at` is present but not an RFC 3339
-//! timestamp: it is never read as "no expiry" (fail-closed) and never cached. (commonpractice's other
-//! `license_unreadable`, a stored token that will not decrypt, cannot happen here: the token is not
-//! encrypted at rest, see migration 0004.)
+//! timestamp: it is never read as "no expiry" (fail-closed) and never cached. The same 402
+//! `license_unreadable` is commonpractice's other one: a stored token that will not decrypt (a wrong or
+//! rotated `LICENSE_TOKEN_ENC_KEY`, or a corrupt row; see [`crate::license_token`]). That one does not
+//! fix itself and needs an operator.
+//!
+//! Whose licence: the tenant the request acts in, as commonpractice `licenseCallerTenant` resolves it
+//! (see `tenancy`): a member's own tenant; for the super-admin the `X-Active-Tenant-Id` tenant, else
+//! their own. The super-admin with no tenant in scope (the platform view: tenant list and create, the
+//! signup queue) is not gated, as there is no tenant to license.
 //!
 //! Off unless `LICENSE_GATE_2_ENABLED`: then [`check`] is a no-op that touches neither the database
 //! nor the network.
@@ -232,6 +238,13 @@ fn unavailable() -> ApiError {
     )
 }
 
+fn unreadable() -> ApiError {
+    ApiError::PaymentRequired(
+        "license_unreadable",
+        "the tenant licence could not be read; access denied".into(),
+    )
+}
+
 /// The checks after a successful introspection, in commonpractice's order.
 fn verdict(app_key: &str, tenant: Uuid, c: &Cached, now_us: i64) -> Result<(), ApiError> {
     if c.v.active != Some(true) {
@@ -267,14 +280,14 @@ fn verdict(app_key: &str, tenant: Uuid, c: &Cached, now_us: i64) -> Result<(), A
 }
 
 /// Gate 2 for a caller acting in `tenant`. Called where the tenant is resolved (`tenancy`), for
-/// everyone but the super-admin.
+/// every caller acting in a tenant, the super-admin included.
 pub async fn check(st: &AppState, tenant: Uuid) -> Result<(), ApiError> {
     let gate = &st.license;
     if !gate.enabled() {
         return Ok(());
     }
     // The lookup is fail-closed too: a database error denies (402), never surfaces as a 500.
-    let token = match db::licenses::token(&st.owner, tenant).await {
+    let sealed = match db::licenses::sealed_token(&st.owner, tenant).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err(ApiError::PaymentRequired(
@@ -287,6 +300,19 @@ pub async fn check(st: &AppState, tenant: Uuid) -> Result<(), ApiError> {
             return Err(unavailable());
         }
     };
+    // Config refuses to start with the gate on and no key, so a missing cipher is unreachable; it
+    // still denies, and as unreadable (an operator fault), not as a transient outage.
+    let opened = match st.token_cipher.as_deref() {
+        Some(c) => c.open(tenant, &sealed),
+        None => Err(crate::license_token::TokenError::Undecryptable),
+    };
+    let token = match opened {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(%tenant, error = %e, "stored licence token is unreadable; denying");
+            return Err(unreadable());
+        }
+    };
     let c = match gate.introspect(&token).await {
         Ok(c) => c,
         Err(IntrospectError::Upstream(e)) => {
@@ -295,10 +321,7 @@ pub async fn check(st: &AppState, tenant: Uuid) -> Result<(), ApiError> {
         }
         Err(IntrospectError::Unreadable(raw)) => {
             tracing::warn!(%tenant, expires_at = %raw, "licence expires_at is unreadable; denying");
-            return Err(ApiError::PaymentRequired(
-                "license_unreadable",
-                "the tenant licence could not be read; access denied".into(),
-            ));
+            return Err(unreadable());
         }
     };
     verdict(&gate.cfg.app_key, tenant, &c, now_us())

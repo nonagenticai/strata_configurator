@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::db;
 use crate::keycloak_admin::KeycloakAdmin;
 use crate::license::LicenseGate;
+use crate::license_token::TokenCipher;
 use crate::licenses_admin::LicensesAdmin;
 use crate::signup::Signup;
 
@@ -40,6 +41,9 @@ pub struct AppState {
     pub license: Arc<LicenseGate>,
     /// The `secure-apps` SA that issues tenant licences; `None` when not configured.
     pub licenses_admin: Option<Arc<LicensesAdmin>>,
+    /// Seals and opens the stored licence token (`LICENSE_TOKEN_ENC_KEY`); `None` only when neither
+    /// issuance nor gate 2 is on (config refuses to start otherwise).
+    pub token_cipher: Option<Arc<TokenCipher>>,
     /// Early-access signup settings, Turnstile and Telegram (W2.3).
     pub signup: Arc<Signup>,
 }
@@ -71,6 +75,10 @@ impl AppState {
                 http.clone(),
             ))
         });
+        let token_cipher = cfg
+            .license_token_key
+            .as_ref()
+            .map(|k| Arc::new(TokenCipher::new(k)));
         let signup = Arc::new(Signup::new(cfg.signup.clone(), http.clone()));
         let auth = Arc::new(Verifier::jwks(
             &cfg.keycloak_issuer,
@@ -87,6 +95,7 @@ impl AppState {
             keycloak_admin,
             license,
             licenses_admin,
+            token_cipher,
             signup,
         }
     }

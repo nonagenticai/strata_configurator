@@ -407,11 +407,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "configurator-core",
  "http-body-util",
  "jsonwebtoken",
  "libc",
  "reqwest",
+ "ring",
  "rsa",
  "serde",
  "serde_json",
