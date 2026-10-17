@@ -9,7 +9,7 @@
 //! licence create takes ids, not codes), create the licence for the holder's `sub`, and mint its
 //! opaque token, which gate 2 then introspects. Every call is fatal on failure.
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -259,18 +259,42 @@ impl LicensesAdmin {
         })
     }
 
-    /// Mint `license_id`'s opaque token.
+    /// Mint `license_id`'s opaque token: a registered PERPETUAL (`long_lived`) `internal` token.
+    /// Licences gives a mint without `expires_days` a bounded default (365 days), which would fail
+    /// gate 2 for every tenant a year after onboarding while its licence is still active. Licences
+    /// refuses a long-lived `api` token outside LONG_LIVED_API_TENANTS (422
+    /// `long_lived_not_permitted`) but registers `internal` ones; the token is only used server-side
+    /// for gate 2's `/license/introspect`, which never reads the token type. A long-lived mint needs
+    /// the SA's `license-admin` realm role (else 403 `long_lived_requires_license_admin`); a refusal
+    /// keeps licences' `detail.error` in the error, and still fails the issuance.
     async fn mint(&self, tenant: Uuid, license_id: &str) -> Result<String, UpstreamError> {
         let what = "licences mint token";
+        let path = format!(
+            "licenses/{}/tokens?token_type=internal&long_lived=true&long_lived_owner={}&long_lived_reason={}",
+            encode(license_id),
+            encode(MINT_OWNER),
+            encode(MINT_REASON),
+        );
         let resp = self
             .send(
-                self.http
-                    .post(self.url(&format!("licenses/{}/tokens", encode(license_id))))
-                    .json(&json!({})),
+                self.http.post(self.url(&path)).json(&json!({})),
                 Some(tenant),
                 what,
             )
             .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let refusal = resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|b| refusal_code(&b));
+            let message = match refusal {
+                Some(code) => format!("{what} failed: HTTP {status}: {code}"),
+                None => format!("{what} failed: HTTP {status}"),
+            };
+            return Err(UpstreamError::new(Some(status.as_u16()), message));
+        }
         let t: WireToken = Self::ok_json(resp, what).await?;
         t.token
             .filter(|s| !s.is_empty())
@@ -312,6 +336,22 @@ impl LicensesAdmin {
     }
 }
 
+/// `long_lived_owner` of every tenant licence token: who answers for the perpetual token.
+const MINT_OWNER: &str = "strata-configurator";
+/// `long_lived_reason` of every tenant licence token.
+const MINT_REASON: &str = "tenant licence token for gate 2; revoked on offboarding";
+
+/// Licences' refusal code in an error body: `detail.error` (`{"detail": {"error": ...}}`) or a plain
+/// string `detail`.
+fn refusal_code(body: &Value) -> Option<String> {
+    let detail = body.get("detail")?;
+    detail
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| detail.as_str())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +367,19 @@ mod tests {
         assert_eq!(registry_name("Zürich", id), "z-rich-1e2f3a4b");
         let long = registry_name(&"a".repeat(100), id);
         assert_eq!(long, format!("{}-1e2f3a4b", "a".repeat(40)));
+    }
+
+    #[test]
+    fn refusal_codes_are_read_from_licences_error_bodies() {
+        assert_eq!(
+            refusal_code(&json!({"detail": {"error": "long_lived_requires_license_admin"}})),
+            Some("long_lived_requires_license_admin".to_string())
+        );
+        assert_eq!(
+            refusal_code(&json!({"detail": "License not found"})),
+            Some("License not found".to_string())
+        );
+        assert_eq!(refusal_code(&json!({"detail": {"remedy": "x"}})), None);
+        assert_eq!(refusal_code(&json!({"error": "x"})), None);
     }
 }
