@@ -37,7 +37,10 @@ pub async fn ping(pool: &PgPool) -> bool {
         .is_ok()
 }
 
+pub mod axes;
+pub mod dimensions;
 pub mod layers;
+pub mod profiles;
 pub mod rows;
 pub mod tenants;
 
