@@ -66,14 +66,19 @@ pub fn sha256_hex(s: &str) -> String {
 
 /// The hash of an effective config. Provenance, warnings and the hash itself
 /// are excluded, so a revision that changes nothing does not change it.
+/// Job content is included only when there is some, so phase-1 hashes (no job
+/// content, no job preamble/actor_label) do not move.
 pub fn effective_hash(e: &EffectiveConfig) -> String {
-    let v = json!({
+    let mut v = json!({
         "selection": e.selection,
         "entities": e.entities,
         "attributes": e.attributes,
         "relations": e.relations,
         "job": e.job,
     });
+    if !e.job_content.is_empty() {
+        v["job_content"] = json!(e.job_content);
+    }
     sha256_hex(&canonical_json(&v))
 }
 

@@ -10,9 +10,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::canonical::{canonical_json, sha256_hex};
+use crate::overlay::Kind;
 
 pub const SCHEMA_V1: &str = "care-bus.release/1";
 
@@ -234,4 +235,64 @@ pub fn release_body(release_id: &str, job: &str, bundle: &BundleV1) -> Result<Va
         "hash": hash,
         "bundle": bundle,
     }))
+}
+
+// --- job-content overlay rows ---------------------------------------------------
+
+/// One job-content object (an overlay row of a job-content kind), typed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentItem {
+    ContextSpace(ContextSpaceV1),
+    Procedure(ProcedureV1),
+    ConnectorSlot(ConnectorSlotV1),
+    KnowledgeStore(KnowledgeStoreV1),
+}
+
+/// care-bus's `Phase.gate` is nullable; a row stores an unset gate by omission.
+fn normalise_plan(plan: &mut Value) {
+    if let Some(phases) = plan.get_mut("phases").and_then(Value::as_array_mut) {
+        for phase in phases.iter_mut().filter_map(Value::as_object_mut) {
+            phase.entry("gate").or_insert(Value::Null);
+        }
+    }
+}
+
+/// The bundle v1 item of a job-content row: its `fields` plus what its key
+/// supplies (`key`; `name` and `version` from `name@version`; `id`). The error
+/// is the serde message.
+pub fn content_item(
+    kind: Kind,
+    key: &str,
+    fields: &Map<String, Value>,
+) -> Result<ContentItem, String> {
+    let mut obj = fields.clone();
+    match kind {
+        Kind::ContextSpace | Kind::KnowledgeStore => {
+            obj.insert("key".into(), json!(key));
+        }
+        Kind::ConnectorSlot => {
+            obj.insert("id".into(), json!(key));
+        }
+        Kind::Procedure => {
+            let (name, version) = key
+                .split_once('@')
+                .ok_or_else(|| format!("procedure key {key:?} is not name@version"))?;
+            obj.insert("name".into(), json!(name));
+            obj.insert("version".into(), json!(version));
+        }
+        Kind::Entity | Kind::Attribute | Kind::Relation | Kind::Job => {
+            return Err(format!("{kind:?} is not a job-content kind"));
+        }
+    }
+    let v = Value::Object(obj);
+    let parsed = match kind {
+        Kind::ContextSpace => serde_json::from_value(v).map(ContentItem::ContextSpace),
+        Kind::Procedure => serde_json::from_value::<ProcedureV1>(v).map(|mut p| {
+            normalise_plan(&mut p.plan);
+            ContentItem::Procedure(p)
+        }),
+        Kind::ConnectorSlot => serde_json::from_value(v).map(ContentItem::ConnectorSlot),
+        _ => serde_json::from_value(v).map(ContentItem::KnowledgeStore),
+    };
+    parsed.map_err(|e| e.to_string())
 }

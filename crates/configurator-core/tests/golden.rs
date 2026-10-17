@@ -178,3 +178,16 @@ fn seed_v1_has_no_warnings() {
         assert!(cfg.warnings.is_empty(), "{sel:?}: {:?}", cfg.warnings);
     }
 }
+
+/// The golden hash before W4 (main, CI run 39076619471). Seed v1 has no job
+/// content and no job preamble/actor_label, so adding them must not move it.
+#[test]
+fn phase1_hash_unchanged() {
+    let b = v1();
+    let cfg = compile_v1(&b, &retail_customer_care());
+    assert!(cfg.job_content.is_empty());
+    assert_eq!(
+        cfg.hash,
+        "7a0f9b6ba479f368ef2e8bae39e84653598e8a04941efed30b4ba6a60e0c3125"
+    );
+}
