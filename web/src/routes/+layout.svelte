@@ -58,6 +58,10 @@
 			>
 			<a href="/layers" class:active={page.url.pathname === '/layers'}><span>▱</span> Layers</a>
 		</nav>
+		{#if session.superAdmin}<div class="nav-label">PLATFORM</div>
+			<nav aria-label="Platform navigation">
+				<a href="/signups" class:active={page.url.pathname === '/signups'}><span>✉</span> Signups</a>
+			</nav>{/if}
 		<div class="sidebar-note">
 			<span class="status-dot"></span> Standard model · v1
 			<p>Assembled from standard parts.<br />Configured for your organisation.</p>
@@ -67,7 +71,13 @@
 		<header>
 			<span class="breadcrumb"
 				>Workspace <span>/</span>
-				<strong>{page.url.pathname === '/layers' ? 'Layers' : 'Compile'}</strong></span
+				<strong
+					>{page.url.pathname === '/layers'
+						? 'Layers'
+						: page.url.pathname === '/signups'
+							? 'Signups'
+							: 'Compile'}</strong
+				></span
 			>
 			<div class="account">
 				{#if session.ready}

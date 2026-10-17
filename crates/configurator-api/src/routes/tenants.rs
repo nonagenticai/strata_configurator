@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::auth::{Caller, require_super_admin};
-use crate::db::{licenses, tenants, users};
+use crate::db::{licenses, signups, tenants, users};
 use crate::error::ApiError;
 use crate::licenses_admin::{Issued, registry_name};
 use crate::page::{self, Paged, TimeCursor};
@@ -40,7 +40,7 @@ fn paged<T: serde::Serialize>(items: Vec<T>) -> Json<Value> {
 
 /// `v` trimmed: 400 `invalid_body` when empty, longer than `max` characters, or holding control
 /// characters. The trimmed value is what gets stored.
-fn clean(field: &'static str, v: &str, max: usize) -> Result<String, ApiError> {
+pub(crate) fn clean(field: &'static str, v: &str, max: usize) -> Result<String, ApiError> {
     let t = v.trim();
     let bad = |why: &str| ApiError::BadRequest("invalid_body", format!("{field} {why}"));
     if t.is_empty() {
@@ -55,13 +55,13 @@ fn clean(field: &'static str, v: &str, max: usize) -> Result<String, ApiError> {
     Ok(t.to_string())
 }
 
-const MAX_NAME: usize = 200;
+pub(crate) const MAX_NAME: usize = 200;
 const MAX_SUB: usize = 255;
 const MAX_EMAIL: usize = 254;
 
 /// `v` as an email address: [`clean`], then one `@` with a non-empty local part and a dotted domain,
 /// and no whitespace. Keycloak checks the rest.
-fn email_address(field: &'static str, v: &str) -> Result<String, ApiError> {
+pub(crate) fn email_address(field: &'static str, v: &str) -> Result<String, ApiError> {
     let e = clean(field, v, MAX_EMAIL)?;
     let ok = !e.chars().any(char::is_whitespace)
         && e.matches('@').count() == 1
@@ -152,17 +152,8 @@ fn last_admin() -> ApiError {
     )
 }
 
-/// Super-admin only: mint the tenant id, create the tenant and its first `tenant_admin` (by
-/// `first_admin_sub`, or invited by `first_admin_email`) in one transaction (owner pool: platform work),
-/// audited. 409 `user_exists` when the first admin already belongs to a tenant; then nothing is
-/// created. Audit events name the caller by token `sub`.
-///
-/// With licence issuance configured, the licence is issued for the new id, held by the first admin,
-/// BEFORE the transaction, and stored in it. As in commonpractice (`tenant-service.ts` `createTenant`),
-/// a failed issuance fails the create: 502 `licences_unavailable`, nothing is created, and the failure
-/// is audited as `license.issue_failed`. A licence issued for a create that fails before its commit is
-/// revoked again; when the commit itself fails it may still have landed, so the licence is kept and
-/// the pair logged for reconciliation by hand (revoking could leave a live tenant unlicensed).
+/// Super-admin only: create a tenant and its first `tenant_admin` (by `first_admin_sub`, or invited by
+/// `first_admin_email`); see [`create_tenant`]. 201 with the tenant.
 async fn create(
     State(st): State<AppState>,
     caller: Caller,
@@ -171,12 +162,57 @@ async fn create(
     require_super_admin(&caller)?;
     let Json(b) = body?;
     let name = clean("name", &b.name, MAX_NAME)?;
-    let (first_admin_sub, invited) = subject(
+    let created = create_tenant(
         &st,
-        ("first_admin_sub", b.first_admin_sub),
-        ("first_admin_email", b.first_admin_email),
+        &caller.sub,
+        &name,
+        (b.first_admin_sub, b.first_admin_email),
+        Origin::Manual,
     )
     .await?;
+    Ok((StatusCode::CREATED, Json(json!(created.tenant))))
+}
+
+/// What asked for a tenant: a super-admin's `POST /api/tenants`, or their approval of an early-access
+/// signup (W2.3), which is marked approved in the same transaction as the tenant.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Origin {
+    Manual,
+    Signup(Uuid),
+}
+
+/// A tenant [`create_tenant`] created.
+pub(crate) struct Created {
+    pub tenant: tenants::Tenant,
+    pub first_admin_sub: String,
+    /// The first admin's identity was created (and sent the invite email) by this call.
+    pub invited: bool,
+    /// The approved signup, for [`Origin::Signup`].
+    pub signup: Option<signups::Approval>,
+}
+
+/// The one tenant-create path (the caller has checked it is the super-admin and cleaned `name`): mint
+/// the tenant id, resolve the first admin (`(sub, email)`, exactly one; see [`subject`]), create the
+/// tenant and its first `tenant_admin` in one transaction (owner pool: platform work), audited. 409
+/// `user_exists` when the first admin already belongs to a tenant; then nothing is created. Audit events
+/// name the caller by token `sub`. For [`Origin::Signup`] the signup is locked first and marked approved
+/// in the same transaction (409 `approval_not_pending` when it was decided meanwhile).
+///
+/// With licence issuance configured, the licence is issued for the new id, held by the first admin,
+/// BEFORE the transaction, and stored in it. As in commonpractice (`tenant-service.ts` `createTenant`),
+/// a failed issuance fails the create: 502 `licences_unavailable`, nothing is created, and the failure
+/// is audited as `license.issue_failed`. A licence issued for a create that fails before its commit is
+/// revoked again; when the commit itself fails it may still have landed, so the licence is kept and
+/// the pair logged for reconciliation by hand (revoking could leave a live tenant unlicensed).
+pub(crate) async fn create_tenant(
+    st: &AppState,
+    actor: &str,
+    name: &str,
+    (sub, email): (Option<String>, Option<String>),
+    origin: Origin,
+) -> Result<Created, ApiError> {
+    let (first_admin_sub, invited) =
+        subject(st, ("first_admin_sub", sub), ("first_admin_email", email)).await?;
     let id = Uuid::new_v4();
 
     let licence = match st.licenses_admin.as_deref() {
@@ -188,7 +224,7 @@ async fn create(
                 return Err(user_exists(&first_admin_sub));
             }
             match la
-                .issue(id, &registry_name(&name, id), &first_admin_sub)
+                .issue(id, &registry_name(name, id), &first_admin_sub)
                 .await
             {
                 Ok(l) => Some(l),
@@ -197,7 +233,7 @@ async fn create(
                     let attempted = json!({"tenant": id, "holder_sub": first_admin_sub});
                     audit::record(
                         &mut *st.owner.acquire().await?,
-                        &caller.sub,
+                        actor,
                         Some(id),
                         "license.issue_failed",
                         &format!("tenant:{id}"),
@@ -215,23 +251,25 @@ async fn create(
     };
 
     let staged = insert_tenant(
-        &st,
-        &caller.sub,
+        st,
+        actor,
         id,
-        &name,
+        name,
         &first_admin_sub,
         licence.as_ref(),
+        origin,
     )
     .await;
-    let (t, tx) = match staged {
+    let (tenant, signup, tx) = match staged {
         Ok(Some(staged)) => staged,
         Ok(None) => {
-            give_back(&st, id, licence.as_ref()).await;
+            give_back(st, id, licence.as_ref()).await;
             kept_identity(&first_admin_sub, invited);
             return Err(user_exists(&first_admin_sub));
         }
         Err(e) => {
-            give_back(&st, id, licence.as_ref()).await;
+            give_back(st, id, licence.as_ref()).await;
+            kept_identity(&first_admin_sub, invited);
             return Err(e);
         }
     };
@@ -244,7 +282,20 @@ async fn create(
         }
         return Err(ApiError::from(e));
     }
-    Ok((StatusCode::CREATED, Json(json!(t))))
+    Ok(Created {
+        tenant,
+        first_admin_sub,
+        invited,
+        signup,
+    })
+}
+
+/// 409 `approval_not_pending`: the signup was approved or rejected already.
+pub(crate) fn approval_not_pending(id: Uuid) -> ApiError {
+    ApiError::Conflict(
+        "approval_not_pending",
+        format!("signup {id} is no longer pending"),
+    )
 }
 
 /// Revoke the licence issued for tenant `id`, whose create failed before its commit (best effort; a
@@ -258,9 +309,16 @@ async fn give_back(st: &AppState, id: Uuid, licence: Option<&Issued>) {
     }
 }
 
-/// The tenant, its first admin, its licence (when one was issued) and their audit events, staged in
-/// one owner transaction that the caller commits (so it can tell a commit failure, which may have
-/// landed, from a failure before it). `None` when the first admin already belongs to a tenant.
+/// The tenant, its first admin, its licence (when one was issued), the approved signup (for
+/// [`Origin::Signup`]) and their audit events, staged in one owner transaction that the caller commits
+/// (so it can tell a commit failure, which may have landed, from a failure before it). `None` when the
+/// first admin already belongs to a tenant.
+type Staged = (
+    tenants::Tenant,
+    Option<signups::Approval>,
+    Transaction<'static, Postgres>,
+);
+
 async fn insert_tenant(
     st: &AppState,
     actor: &str,
@@ -268,8 +326,16 @@ async fn insert_tenant(
     name: &str,
     first_admin_sub: &str,
     licence: Option<&Issued>,
-) -> Result<Option<(tenants::Tenant, Transaction<'static, Postgres>)>, ApiError> {
+    origin: Origin,
+) -> Result<Option<Staged>, ApiError> {
     let mut tx = st.owner.begin().await?;
+    // The signup first: its row lock serialises concurrent decisions on it before anything else is
+    // written, so the second one is a clean 409 rather than a `user_exists` from the users insert.
+    if let Origin::Signup(sid) = origin
+        && signups::lock_pending(&mut tx, sid).await?.is_none()
+    {
+        return Err(approval_not_pending(sid));
+    }
     let Some(t) = tenants::create(&mut tx, id, name, first_admin_sub).await? else {
         return Ok(None);
     };
@@ -299,7 +365,29 @@ async fn insert_tenant(
         )
         .await?;
     }
-    Ok(Some((t, tx)))
+    let signup = match origin {
+        Origin::Manual => None,
+        Origin::Signup(sid) => {
+            let Some(a) = signups::approve(&mut tx, sid, t.id, actor).await? else {
+                return Err(approval_not_pending(sid));
+            };
+            let before = json!({"signup": sid, "status": "pending"});
+            let after = json!({"signup": sid, "status": a.status, "tenant": t.id,
+                               "first_admin_sub": first_admin_sub});
+            audit::record(
+                &mut tx,
+                actor,
+                Some(t.id),
+                "signup.approve",
+                &format!("signup:{sid}"),
+                Some(&before),
+                Some(&after),
+            )
+            .await?;
+            Some(a)
+        }
+    };
+    Ok(Some((t, signup, tx)))
 }
 
 #[derive(Deserialize)]

@@ -105,6 +105,7 @@ pub mod layers;
 pub mod licenses;
 pub mod profiles;
 pub mod rows;
+pub mod signups;
 pub mod tenants;
 pub mod users;
 

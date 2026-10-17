@@ -19,6 +19,70 @@ pub struct Config {
     /// The `secure-apps` SA that issues tenant licences (W2.2); `None` (no issuance) unless all four
     /// `LICENSES_ADMIN_*` settings are set.
     pub licenses_admin: Option<LicensesAdminConfig>,
+    /// Early-access self-signup (W2.3); off by default.
+    pub signup: SignupConfig,
+}
+
+/// Early-access self-signup (W2.3), after commonpractice `config.ts` `signupIntakeConfig`,
+/// `turnstileConfig` and `signupTelegramConfig`.
+#[derive(Clone)]
+pub struct SignupConfig {
+    /// `EARLY_ACCESS_SIGNUP_ENABLED`: off, every `/api/signup-approvals` route is the unknown-route 404.
+    pub enabled: bool,
+    /// `SIGNUP_INTAKE_AZP`: the client ids (`azp`) allowed to call the intake.
+    pub intake_azp: Vec<String>,
+    /// `SIGNUP_INTAKE_ROLE`: the client role (on this app's client) an intake token must hold.
+    pub intake_role: String,
+    /// `SIGNUP_QUEUE_MAX_PENDING`: pending rows past which the intake refuses (503 `signup_queue_full`).
+    pub max_pending: i64,
+    /// `TURNSTILE_SECRET`: when set, a relayed Turnstile token is verified.
+    pub turnstile_secret: Option<String>,
+    pub turnstile_verify_url: String,
+    pub turnstile_timeout_ms: u64,
+    /// Telegram notices; `None` (off) unless all three `TELEGRAM_*` values are set.
+    pub telegram: Option<TelegramConfig>,
+    /// `CONFIGURATOR_PUBLIC_URL`: the UI origin the Telegram Approve/Reject buttons open.
+    pub public_url: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub chat_id: String,
+    /// The forum topic's `message_thread_id`.
+    pub thread_id: i64,
+    /// `TELEGRAM_API_BASE`, without a trailing slash (overridable for tests only).
+    pub api_base: String,
+}
+
+impl std::fmt::Debug for SignupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignupConfig")
+            .field("enabled", &self.enabled)
+            .field("intake_azp", &self.intake_azp)
+            .field("intake_role", &self.intake_role)
+            .field("max_pending", &self.max_pending)
+            .field(
+                "turnstile_secret",
+                &self.turnstile_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("turnstile_verify_url", &self.turnstile_verify_url)
+            .field(
+                "telegram",
+                &self.telegram.as_ref().map(|t| (&t.chat_id, &t.thread_id)),
+            )
+            .field("public_url", &self.public_url)
+            .finish()
+    }
+}
+
+/// `true`/`1` or `false`/`0`/unset; anything else is an error naming `key`.
+fn flag(get: &impl Fn(&str) -> Option<String>, key: &str) -> Result<bool> {
+    match get(key).as_deref().map(str::trim) {
+        None | Some("" | "false" | "0") => Ok(false),
+        Some("true" | "1") => Ok(true),
+        Some(v) => anyhow::bail!("{key} must be true or false, not {v:?}"),
+    }
 }
 
 /// Client credentials for `strata-configurator-admin` in the portal realm.
@@ -113,6 +177,7 @@ impl std::fmt::Debug for Config {
             .field("keycloak_admin", &self.keycloak_admin)
             .field("license_gate", &self.license_gate)
             .field("licenses_admin", &self.licenses_admin)
+            .field("signup", &self.signup)
             .finish_non_exhaustive()
     }
 }
@@ -151,11 +216,7 @@ impl Config {
                 api_url,
             },
         );
-        let enabled = match get("LICENSE_GATE_2_ENABLED").as_deref().map(str::trim) {
-            None | Some("" | "false" | "0") => false,
-            Some("true" | "1") => true,
-            Some(v) => anyhow::bail!("LICENSE_GATE_2_ENABLED must be true or false, not {v:?}"),
-        };
+        let enabled = flag(&get, "LICENSE_GATE_2_ENABLED")?;
         let cache_ttl_sec = match get("LICENSE_CACHE_TTL_SEC").filter(|v| !v.is_empty()) {
             Some(v) => v
                 .parse::<u64>()
@@ -189,7 +250,65 @@ impl Config {
                 plan_code: opt("LICENSE_PLAN_CODE", "standard"),
             },
         );
+        let trimmed = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let max_pending =
+            match trimmed("SIGNUP_QUEUE_MAX_PENDING") {
+                Some(v) => v.parse::<i64>().ok().filter(|n| *n >= 1).with_context(
+                    || "SIGNUP_QUEUE_MAX_PENDING must be a whole number of at least 1",
+                )?,
+                None => 500,
+            };
+        let turnstile_timeout_ms = match trimmed("TURNSTILE_TIMEOUT_MS") {
+            Some(v) => v
+                .parse::<u64>()
+                .with_context(|| "TURNSTILE_TIMEOUT_MS is not a number of milliseconds")?,
+            None => 5000,
+        };
+        // As commonpractice: Telegram is off unless the token, chat and forum topic are all set.
+        let telegram = match (
+            trimmed("TELEGRAM_BOT_TOKEN"),
+            trimmed("TELEGRAM_SIGNUP_CHAT_ID"),
+            trimmed("TELEGRAM_SIGNUP_THREAD_ID"),
+        ) {
+            (Some(bot_token), Some(chat_id), Some(thread_id)) => Some(TelegramConfig {
+                bot_token,
+                chat_id,
+                thread_id: thread_id
+                    .parse::<i64>()
+                    .with_context(|| "TELEGRAM_SIGNUP_THREAD_ID is not a message_thread_id")?,
+                api_base: trimmed("TELEGRAM_API_BASE")
+                    .unwrap_or_else(|| "https://api.telegram.org".into())
+                    .trim_end_matches('/')
+                    .to_string(),
+            }),
+            _ => None,
+        };
+        let signup = SignupConfig {
+            enabled: flag(&get, "EARLY_ACCESS_SIGNUP_ENABLED")?,
+            intake_azp: trimmed("SIGNUP_INTAKE_AZP")
+                .unwrap_or_else(|| "configurator-signup-intake".into())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            intake_role: trimmed("SIGNUP_INTAKE_ROLE")
+                .unwrap_or_else(|| "configurator-signup-intake".into()),
+            max_pending,
+            turnstile_secret: trimmed("TURNSTILE_SECRET"),
+            turnstile_verify_url: trimmed("TURNSTILE_VERIFY_URL").unwrap_or_else(|| {
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify".into()
+            }),
+            turnstile_timeout_ms,
+            telegram,
+            public_url: trimmed("CONFIGURATOR_PUBLIC_URL")
+                .map(|u| u.trim_end_matches('/').to_string()),
+        };
         Ok(Self {
+            signup,
             database_url: req("DATABASE_URL")?,
             migrate_database_url: get("MIGRATE_DATABASE_URL").filter(|v| !v.trim().is_empty()),
             port,
@@ -411,6 +530,52 @@ mod tests {
         for (key, bad) in [
             ("LICENSE_GATE_2_ENABLED", "yes"),
             ("LICENSE_CACHE_TTL_SEC", "five"),
+        ] {
+            let err = Config::from_lookup(|k| if k == key { Some(bad.into()) } else { base(k) })
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{err}");
+        }
+    }
+    #[test]
+    fn early_access_is_dark_by_default_and_parses_strictly() {
+        let c = Config::from_lookup(base).unwrap();
+        assert!(!c.signup.enabled);
+        assert_eq!(c.signup.intake_azp, ["configurator-signup-intake"]);
+        assert_eq!(c.signup.intake_role, "configurator-signup-intake");
+        assert_eq!(c.signup.max_pending, 500);
+        assert!(c.signup.turnstile_secret.is_none());
+        assert!(c.signup.telegram.is_none());
+
+        let c = Config::from_lookup(with(&[
+            ("EARLY_ACCESS_SIGNUP_ENABLED", "true"),
+            ("SIGNUP_INTAKE_AZP", "site, chat ,"),
+            ("TURNSTILE_SECRET", "ts-secret"),
+            ("TELEGRAM_BOT_TOKEN", "123:bot-secret"),
+            ("TELEGRAM_SIGNUP_CHAT_ID", "-100"),
+            ("TELEGRAM_SIGNUP_THREAD_ID", "7"),
+        ]))
+        .unwrap();
+        assert!(c.signup.enabled);
+        assert_eq!(c.signup.intake_azp, ["site", "chat"]);
+        let t = c.signup.telegram.as_ref().unwrap();
+        assert_eq!(t.api_base, "https://api.telegram.org");
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("ts-secret"), "{shown}");
+        assert!(!shown.contains("bot-secret"), "{shown}");
+
+        // two of the three Telegram settings: off, as in commonpractice
+        let c = Config::from_lookup(with(&[
+            ("TELEGRAM_BOT_TOKEN", "123:bot-secret"),
+            ("TELEGRAM_SIGNUP_CHAT_ID", "-100"),
+        ]))
+        .unwrap();
+        assert!(c.signup.telegram.is_none());
+
+        for (key, bad) in [
+            ("EARLY_ACCESS_SIGNUP_ENABLED", "yes"),
+            ("SIGNUP_QUEUE_MAX_PENDING", "0"),
+            ("SIGNUP_QUEUE_MAX_PENDING", "many"),
         ] {
             let err = Config::from_lookup(|k| if k == key { Some(bad.into()) } else { base(k) })
                 .unwrap_err()

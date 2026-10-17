@@ -33,6 +33,8 @@ const JWKS_MIN_REFRESH: Duration = Duration::from_secs(30);
 pub struct Claims {
     pub sub: String,
     pub preferred_username: Option<String>,
+    /// The client the token was issued to (a service account's client id).
+    pub azp: Option<String>,
     /// This app's client roles (`resource_access.<audience>.roles`); realm roles are ignored.
     pub roles: Vec<String>,
 }
@@ -53,6 +55,7 @@ impl Claims {
 struct RawClaims {
     sub: String,
     preferred_username: Option<String>,
+    azp: Option<String>,
     /// Client roles by client id. `realm_access` is deliberately not parsed.
     #[serde(default)]
     resource_access: HashMap<String, ClientRoles>,
@@ -133,6 +136,7 @@ impl Verifier {
         let RawClaims {
             sub,
             preferred_username,
+            azp,
             mut resource_access,
         } = data.claims;
         if sub.is_empty() {
@@ -141,6 +145,7 @@ impl Verifier {
         Ok(Claims {
             sub,
             preferred_username,
+            azp,
             roles: resource_access
                 .remove(&self.audience)
                 .map(|c| c.roles)
@@ -226,6 +231,11 @@ pub struct Caller {
     pub actor: String,
     /// Holds the configured super-admin client role (`super_admin` by default) on this app's client.
     pub super_admin: bool,
+    /// This app's client roles: only the super-admin role and the signup intake role mean anything.
+    pub roles: Vec<String>,
+    /// The client the token was issued to; the signup intake pins it (commonpractice
+    /// `signup-intake-auth.ts`).
+    pub azp: Option<String>,
 }
 
 impl FromRequestParts<AppState> for Caller {
@@ -247,6 +257,8 @@ impl FromRequestParts<AppState> for Caller {
             super_admin: c.has(&st.cfg.super_admin_role),
             actor: c.actor(),
             sub: c.sub,
+            roles: c.roles,
+            azp: c.azp,
         })
     }
 }

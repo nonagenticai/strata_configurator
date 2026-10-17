@@ -9,6 +9,7 @@ use crate::db;
 use crate::keycloak_admin::KeycloakAdmin;
 use crate::license::LicenseGate;
 use crate::licenses_admin::LicensesAdmin;
+use crate::signup::Signup;
 
 /// Whether the seed versions applied cleanly at startup (spec section 4.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,8 @@ pub struct AppState {
     pub license: Arc<LicenseGate>,
     /// The `secure-apps` SA that issues tenant licences; `None` when not configured.
     pub licenses_admin: Option<Arc<LicensesAdmin>>,
+    /// Early-access signup settings, Turnstile and Telegram (W2.3).
+    pub signup: Arc<Signup>,
 }
 
 impl AppState {
@@ -68,6 +71,7 @@ impl AppState {
                 http.clone(),
             ))
         });
+        let signup = Arc::new(Signup::new(cfg.signup.clone(), http.clone()));
         let auth = Arc::new(Verifier::jwks(
             &cfg.keycloak_issuer,
             &cfg.keycloak_audience,
@@ -83,6 +87,7 @@ impl AppState {
             keycloak_admin,
             license,
             licenses_admin,
+            signup,
         }
     }
 

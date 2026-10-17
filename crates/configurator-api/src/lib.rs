@@ -10,5 +10,6 @@ pub mod page;
 pub mod routes;
 pub mod seeder;
 pub mod service_token;
+pub mod signup;
 pub mod state;
 pub mod tenancy;

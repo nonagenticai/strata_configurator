@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
     let pool = db::connect(&cfg.database_url).await?;
     db::assert_runtime_role(&pool).await?;
     let state = AppState::new(cfg, pool, owner);
+    state.signup.log_status();
 
     let bundles = seeder::embedded()?;
     match seeder::apply(&state.owner, &bundles).await {
