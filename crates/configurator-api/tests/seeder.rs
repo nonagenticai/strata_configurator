@@ -6,10 +6,10 @@ use configurator_api::state::SeedStatus;
 use configurator_core::seed::to_rows;
 use sqlx::PgPool;
 
-/// Every table of migration 0001.
+/// Every table after all migrations (0003 replaced `member` with `users`).
 const TABLES: [&str; 12] = [
     "tenant",
-    "member",
+    "users",
     "layer",
     "overlay_row",
     "axis",
@@ -25,7 +25,7 @@ const TABLES: [&str; 12] = [
 /// `SELECT count(*)` per data table, in `TABLES` order.
 const COUNTS: [&str; 12] = [
     "SELECT count(*) FROM tenant",
-    "SELECT count(*) FROM member",
+    "SELECT count(*) FROM users",
     "SELECT count(*) FROM layer",
     "SELECT count(*) FROM overlay_row",
     "SELECT count(*) FROM axis",
@@ -53,6 +53,21 @@ async fn counts(pool: &PgPool) -> Vec<(&'static str, i64)> {
     out
 }
 
+/// `counts` of every table but the identity tables, which 0003 rebuilds.
+async fn data_counts(pool: &PgPool) -> Vec<(&'static str, i64)> {
+    counts_of(pool, &["users"]).await
+}
+
+async fn counts_of(pool: &PgPool, skip: &[&str]) -> Vec<(&'static str, i64)> {
+    let mut out = Vec::new();
+    for (table, sql) in TABLES.iter().zip(COUNTS) {
+        if !skip.contains(table) {
+            out.push((*table, count(pool, sql).await));
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn migration_upgrade_preserves_existing_seed_data() {
     let pool = common::empty_pool().await;
@@ -67,15 +82,60 @@ async fn migration_upgrade_preserves_existing_seed_data() {
     seeder::apply(&pool, &seeder::embedded().unwrap())
         .await
         .unwrap();
-    let before = counts(&pool).await;
+    // memberships as 0001 held them: several tenants per subject
+    let (t1, t2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO tenant (id, name) VALUES ($1, 'One'), ($2, 'Two')")
+        .bind(t1)
+        .bind(t2)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO member (tenant, sub, role, created_at) VALUES \
+         ($1, 'ann', 'admin',  '2026-01-02'), ($2, 'ann', 'viewer', '2026-01-01'), \
+         ($1, 'bo',  'editor', '2026-01-01'), ($2, 'bo',  'admin',  '2026-01-03'), \
+         ($1, 'cy',  'viewer', '2026-01-01'), ($2, 'cy',  'editor', '2026-01-02'), \
+         ($1, 'di',  'viewer', '2026-01-02'), ($2, 'di',  'viewer', '2026-01-01'), \
+         ($2, 'ed',  'approver', '2026-01-01')",
+    )
+    .bind(t1)
+    .bind(t2)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = data_counts(&pool).await;
     configurator_api::db::migrate(&pool).await.unwrap();
-    assert_eq!(counts(&pool).await, before);
-    let indexed: bool =
-        sqlx::query_scalar("SELECT to_regclass('public.member_sub_idx') IS NOT NULL")
-            .fetch_one(&pool)
+    assert_eq!(data_counts(&pool).await, before);
+    // one row per subject: the highest role wins, then the earliest membership
+    let users: Vec<(String, uuid::Uuid, String)> =
+        sqlx::query_as("SELECT sub, tenant, tenant_role::text FROM users ORDER BY sub")
+            .fetch_all(&pool)
             .await
             .unwrap();
-    assert!(indexed);
+    let row = |sub: &str, t: uuid::Uuid, r: &str| (sub.to_string(), t, r.to_string());
+    assert_eq!(
+        users,
+        [
+            row("ann", t1, "tenant_admin"),
+            row("bo", t2, "tenant_admin"),
+            row("cy", t2, "tenant_user"),
+            row("di", t2, "tenant_user"),
+            row("ed", t2, "tenant_user"),
+        ]
+    );
+    let gone: (bool, bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('public.member') IS NULL, \
+                to_regclass('public.member_sub_idx') IS NULL, \
+                NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'member_role')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        gone,
+        (true, true, true),
+        "member, its index and its type are dropped"
+    );
     assert_eq!(
         count(&pool, "SELECT count(*) FROM _sqlx_migrations").await,
         configurator_api::db::MIGRATOR.iter().count() as i64
@@ -106,8 +166,8 @@ async fn migrations_apply_on_empty_db() {
     // Every embedded migration is recorded exactly once.
     let embedded = configurator_api::db::MIGRATOR.iter().count() as i64;
     assert!(
-        embedded >= 2,
-        "0001_core and 0002_member_sub_index are embedded"
+        embedded >= 3,
+        "0001_core, 0002_member_sub_index and 0003_users_rls are embedded"
     );
     assert_eq!(
         count(&pool, "SELECT count(*) FROM _sqlx_migrations").await,

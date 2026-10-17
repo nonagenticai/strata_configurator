@@ -1,42 +1,44 @@
-//! Tenants and tenant roles (spec section 10.2). Roles live in the configurator DB, not in Keycloak.
+//! Tenants and tenant roles (spec section 10.2, rev 3: commonpractice's identity model). Keycloak only
+//! authenticates; the tenant and tenant role of a person come from this service's `users` table, one
+//! tenant per identity. Only the super-admin can act elsewhere, by naming a tenant in
+//! `X-Active-Tenant-Id`; every such switch is audited.
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::Caller;
-use crate::db::tenants;
+use crate::db::{tenants, users};
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// A tenant role, weakest first: each role includes the ones before it.
+/// The super-admin's tenant switch. Ignored for everyone else.
+pub const ACTIVE_TENANT_HEADER: &str = "x-active-tenant-id";
+
+/// A tenant role, weakest first: each role includes the ones before it. `tenant_user` reads;
+/// `tenant_admin` also edits and approves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    Viewer,
-    Editor,
-    Approver,
-    Admin,
+    TenantUser,
+    TenantAdmin,
 }
 
 impl Role {
-    /// The `member_role` enum label.
+    /// The `tenant_role` enum label.
     pub fn as_str(self) -> &'static str {
         match self {
-            Role::Viewer => "viewer",
-            Role::Editor => "editor",
-            Role::Approver => "approver",
-            Role::Admin => "admin",
+            Role::TenantUser => "tenant_user",
+            Role::TenantAdmin => "tenant_admin",
         }
     }
 
     pub fn parse(s: &str) -> Option<Role> {
         match s {
-            "viewer" => Some(Role::Viewer),
-            "editor" => Some(Role::Editor),
-            "approver" => Some(Role::Approver),
-            "admin" => Some(Role::Admin),
+            "tenant_user" => Some(Role::TenantUser),
+            "tenant_admin" => Some(Role::TenantAdmin),
             _ => None,
         }
     }
@@ -87,43 +89,34 @@ pub fn parse_tenant_id(s: &str) -> Result<Uuid, ApiError> {
     Ok(id)
 }
 
-/// The caller's role in `tenant`: 404 `tenant_not_found` when it does not exist, the super-admin is
-/// `admin` in every tenant, anyone else needs a membership (403 `not_a_member`).
-pub async fn resolve(st: &AppState, caller: Caller, tenant: Uuid) -> Result<TenantCtx, ApiError> {
-    let Some(role) = tenants::role_in(&st.db, tenant, &caller.sub).await? else {
-        return Err(ApiError::Missing(
-            "tenant_not_found",
-            format!("tenant {tenant} does not exist"),
-        ));
-    };
-    let role = if caller.super_admin {
-        Role::Admin
-    } else {
-        role.ok_or_else(|| {
-            ApiError::Denied(
-                "not_a_member",
-                format!("you are not a member of tenant {tenant}"),
-            )
-        })?
-    };
-    Ok(TenantCtx {
-        caller,
-        tenant,
-        role,
-    })
-}
-
-/// 400 `tenant_required`: a tenant-scoped route without `X-Tenant-Id`.
-pub fn tenant_required() -> ApiError {
-    ApiError::BadRequest(
-        "tenant_required",
-        "this route needs an X-Tenant-Id header".into(),
+fn tenant_not_found(tenant: Uuid) -> ApiError {
+    ApiError::Missing(
+        "tenant_not_found",
+        format!("tenant {tenant} does not exist"),
     )
 }
 
-/// The `X-Tenant-Id` header: `None` when absent; 400 `invalid_tenant` when malformed, nil or repeated.
-pub fn tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
-    let mut values = headers.get_all("x-tenant-id").iter();
+/// 403 `no_workspace`: the caller has no active `users` row.
+fn no_workspace() -> ApiError {
+    ApiError::Denied(
+        "no_workspace",
+        "you do not belong to a workspace (or your access was disabled)".into(),
+    )
+}
+
+/// 400 `tenant_required`: the super-admin, with no workspace of their own, on a tenant-scoped route
+/// without `X-Active-Tenant-Id`.
+pub fn tenant_required() -> ApiError {
+    ApiError::BadRequest(
+        "tenant_required",
+        "this route needs an X-Active-Tenant-Id header".into(),
+    )
+}
+
+/// The `X-Active-Tenant-Id` header: `None` when absent; 400 `invalid_tenant` when malformed, nil or
+/// repeated.
+pub fn active_tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
+    let mut values = headers.get_all(ACTIVE_TENANT_HEADER).iter();
     let Some(first) = values.next() else {
         return Ok(None);
     };
@@ -134,25 +127,99 @@ pub fn tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
     parse_tenant_id(raw).map(Some)
 }
 
-/// Reads `X-Tenant-Id`: exactly one header holding a bare non-nil uuid. Missing → 400 `tenant_required`;
-/// malformed, nil or repeated → 400 `invalid_tenant`. The token is checked first (401 before 400).
+/// Who the request acts as.
+///
+/// - Anyone but the super-admin: their own tenant and role from `users`; no row, or a disabled one, is
+///   403 `no_workspace`. `X-Active-Tenant-Id` is ignored, so it cannot be used to probe tenants.
+/// - The super-admin: the header's tenant (400 `invalid_tenant` when malformed, 404 `tenant_not_found`
+///   when unknown) as `tenant_admin`, audited as `tenant.scope_switch` unless it is their own tenant;
+///   without the header their own tenant if they have one, else the platform view.
+pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acting, ApiError> {
+    if !caller.super_admin {
+        let (tenant, role) = users::home(&st.db, &caller.sub)
+            .await?
+            .ok_or_else(no_workspace)?;
+        return Ok(Acting::Tenant(TenantCtx {
+            caller,
+            tenant,
+            role,
+        }));
+    }
+    let header = active_tenant_header(&parts.headers)?;
+    let home = users::home(&st.db, &caller.sub).await?.map(|(t, _)| t);
+    let tenant = match (header, home) {
+        (Some(t), Some(h)) if t == h => t,
+        (Some(t), _) => {
+            if !tenants::exists(&st.db, t).await? {
+                return Err(tenant_not_found(t));
+            }
+            audit::scope_switch(
+                &mut *st.db.acquire().await?,
+                &caller.sub,
+                t,
+                parts.method.as_str(),
+                parts.uri.path(),
+            )
+            .await?;
+            t
+        }
+        (None, Some(h)) => h,
+        (None, None) => return Ok(Acting::Platform(caller)),
+    };
+    Ok(Acting::Tenant(TenantCtx {
+        caller,
+        tenant,
+        role: Role::TenantAdmin,
+    }))
+}
+
+/// The caller in the tenant a route's path names (`/api/tenants/{id}/…`): the path wins over the
+/// active scope. The super-admin is `tenant_admin` in any tenant that exists (404 `tenant_not_found`
+/// otherwise); anyone else must belong to it, and a tenant that is not theirs is the same 404 as one
+/// that does not exist (no workspace at all is 403 `no_workspace`).
+pub async fn in_tenant(st: &AppState, caller: Caller, tenant: Uuid) -> Result<TenantCtx, ApiError> {
+    if caller.super_admin {
+        if !tenants::exists(&st.db, tenant).await? {
+            return Err(tenant_not_found(tenant));
+        }
+        return Ok(TenantCtx {
+            caller,
+            tenant,
+            role: Role::TenantAdmin,
+        });
+    }
+    let (home, role) = users::home(&st.db, &caller.sub)
+        .await?
+        .ok_or_else(no_workspace)?;
+    if home != tenant {
+        return Err(tenant_not_found(tenant));
+    }
+    Ok(TenantCtx {
+        caller,
+        tenant,
+        role,
+    })
+}
+
+/// The caller in a tenant, as [`acting`]; the super-admin in the platform view → 400
+/// `tenant_required`. The token is checked first (401 before 400/403).
 impl FromRequestParts<AppState> for TenantCtx {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
         let caller = Caller::from_request_parts(parts, st).await?;
-        let Some(tenant) = tenant_header(&parts.headers)? else {
-            return Err(tenant_required());
-        };
-        resolve(st, caller, tenant).await
+        match acting(st, caller, parts).await? {
+            Acting::Tenant(ctx) => Ok(ctx),
+            Acting::Platform(_) => Err(tenant_required()),
+        }
     }
 }
 
-/// Who a request acts as on routes where the super-admin may leave out `X-Tenant-Id`.
+/// Who a request acts as on routes where the super-admin may work on platform data.
 #[derive(Clone, Debug)]
 pub enum Acting {
-    /// The super-admin without `X-Tenant-Id`: platform data only, no tenant's data.
+    /// The super-admin with no tenant in scope: platform data only, no tenant's data.
     Platform(Caller),
-    /// The caller in the `X-Tenant-Id` tenant (the super-admin there is `admin`).
+    /// The caller in a tenant (the super-admin there is `tenant_admin`).
     Tenant(TenantCtx),
 }
 
@@ -173,17 +240,12 @@ impl Acting {
     }
 }
 
-/// `X-Tenant-Id` as for [`TenantCtx`], except that the super-admin may leave it out
-/// ([`Acting::Platform`]). Anyone else without it → 400 `tenant_required`.
+/// See [`acting`].
 impl FromRequestParts<AppState> for Acting {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
         let caller = Caller::from_request_parts(parts, st).await?;
-        match tenant_header(&parts.headers)? {
-            Some(tenant) => Ok(Acting::Tenant(resolve(st, caller, tenant).await?)),
-            None if caller.super_admin => Ok(Acting::Platform(caller)),
-            None => Err(tenant_required()),
-        }
+        acting(st, caller, parts).await
     }
 }
 
@@ -193,10 +255,9 @@ mod tests {
 
     #[test]
     fn roles_order_weakest_first() {
-        assert!(Role::Viewer < Role::Editor);
-        assert!(Role::Editor < Role::Approver);
-        assert!(Role::Approver < Role::Admin);
-        for r in [Role::Viewer, Role::Editor, Role::Approver, Role::Admin] {
+        assert!(Role::TenantUser < Role::TenantAdmin);
+        assert_eq!(Role::parse("admin"), None, "the old member roles are gone");
+        for r in [Role::TenantUser, Role::TenantAdmin] {
             assert_eq!(Role::parse(r.as_str()), Some(r));
             assert_eq!(serde_json::to_value(r).unwrap(), r.as_str());
         }

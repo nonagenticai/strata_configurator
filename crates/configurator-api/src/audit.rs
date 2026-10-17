@@ -34,3 +34,25 @@ pub async fn record(
     .await?;
     Ok(())
 }
+
+/// Record that the super-admin acted in `tenant` through `X-Active-Tenant-Id`: one event per request
+/// that switches scope, with the request's method and path as metadata.
+pub async fn scope_switch(
+    conn: &mut PgConnection,
+    actor: &str,
+    tenant: Uuid,
+    method: &str,
+    path: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO audit_event (actor, tenant, action, object, metadata) \
+         VALUES ($1, $2, 'tenant.scope_switch', $3, $4)",
+    )
+    .bind(actor)
+    .bind(tenant)
+    .bind(format!("tenant:{tenant}"))
+    .bind(serde_json::json!({"method": method, "path": path}))
+    .execute(conn)
+    .await?;
+    Ok(())
+}

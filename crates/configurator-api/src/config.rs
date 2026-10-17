@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 
 #[derive(Clone)]
 pub struct Config {
+    /// The runtime connection: the non-bypass app role (`configurator_app`), under RLS.
     pub database_url: String,
+    /// The owner connection (migrations, seeder, super-admin platform work); `DATABASE_URL` when unset.
+    pub migrate_database_url: Option<String>,
     pub port: u16,
     pub keycloak_issuer: String,
     pub keycloak_audience: String,
@@ -14,6 +17,10 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("database_url", &"[redacted]")
+            .field(
+                "migrate_database_url",
+                &self.migrate_database_url.as_ref().map(|_| "[redacted]"),
+            )
             .field("port", &self.port)
             .field("keycloak_issuer", &self.keycloak_issuer)
             .field("keycloak_audience", &self.keycloak_audience)
@@ -40,12 +47,20 @@ impl Config {
         };
         Ok(Self {
             database_url: req("DATABASE_URL")?,
+            migrate_database_url: get("MIGRATE_DATABASE_URL").filter(|v| !v.trim().is_empty()),
             port,
             keycloak_issuer: req("KEYCLOAK_ISSUER")?,
             keycloak_audience: opt("KEYCLOAK_AUDIENCE", "strata-configurator"),
             keycloak_jwks_url: req("KEYCLOAK_JWKS_URL")?,
-            super_admin_role: opt("SUPER_ADMIN_ROLE", "config-super-admin"),
+            super_admin_role: opt("SUPER_ADMIN_ROLE", "super_admin"),
         })
+    }
+
+    /// The owner connection: `MIGRATE_DATABASE_URL`, else `DATABASE_URL`.
+    pub fn owner_database_url(&self) -> &str {
+        self.migrate_database_url
+            .as_deref()
+            .unwrap_or(&self.database_url)
     }
 }
 
@@ -68,7 +83,33 @@ mod tests {
         let c = Config::from_lookup(base).unwrap();
         assert_eq!(c.port, 8097);
         assert_eq!(c.keycloak_audience, "strata-configurator");
-        assert_eq!(c.super_admin_role, "config-super-admin");
+        assert_eq!(c.super_admin_role, "super_admin");
+        assert_eq!(c.migrate_database_url, None);
+        assert_eq!(c.owner_database_url(), "postgres://u@h/configurator");
+    }
+
+    #[test]
+    fn migrate_database_url_is_the_owner_connection() {
+        let c = Config::from_lookup(|k| {
+            if k == "MIGRATE_DATABASE_URL" {
+                Some("postgres://owner@h/configurator".into())
+            } else {
+                base(k)
+            }
+        })
+        .unwrap();
+        assert_eq!(c.database_url, "postgres://u@h/configurator");
+        assert_eq!(c.owner_database_url(), "postgres://owner@h/configurator");
+        // blank means unset
+        let c = Config::from_lookup(|k| {
+            if k == "MIGRATE_DATABASE_URL" {
+                Some("  ".into())
+            } else {
+                base(k)
+            }
+        })
+        .unwrap();
+        assert_eq!(c.owner_database_url(), "postgres://u@h/configurator");
     }
 
     #[test]
@@ -87,14 +128,14 @@ mod tests {
                     .is_err()
             );
         }
-        let c = Config::from_lookup(|k| {
-            if k == "DATABASE_URL" {
-                Some("postgres://user:private-password@db/app".into())
-            } else {
-                base(k)
-            }
+        let c = Config::from_lookup(|k| match k {
+            "DATABASE_URL" => Some("postgres://user:private-password@db/app".into()),
+            "MIGRATE_DATABASE_URL" => Some("postgres://owner:owner-secret@db/app".into()),
+            _ => base(k),
         })
         .unwrap();
-        assert!(!format!("{c:?}").contains("private-password"));
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("private-password"), "{shown}");
+        assert!(!shown.contains("owner-secret"), "{shown}");
     }
 }

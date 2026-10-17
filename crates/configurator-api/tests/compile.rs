@@ -59,13 +59,12 @@ async fn unknown_industry_400_names_key() {
 #[tokio::test]
 async fn tenant_patch_of_tombstoned_entity_422() {
     let e = seeded().await;
-    let a = tenant(&e.app, "alice").await;
+    tenant(&e.app, "alice").await;
     let (_, layer) = member(
         &e.app,
         "POST",
         "/api/layers",
         "alice",
-        a,
         json!({"scope":"tenant"}),
     )
     .await;
@@ -75,7 +74,6 @@ async fn tenant_patch_of_tombstoned_entity_422() {
         "POST",
         &uri,
         "alice",
-        a,
         json!({"kind":"entity", "key":"Order", "op":"patch", "fields":{"label":"Our order"}}),
     )
     .await;
@@ -93,7 +91,7 @@ async fn tenant_patch_of_tombstoned_entity_422() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{out}");
-    let (s, out) = member(&e.app, "POST", "/api/compile", "alice", a, json!({})).await;
+    let (s, out) = member(&e.app, "POST", "/api/compile", "alice", json!({})).await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
     assert!(
         out["errors"]
@@ -125,45 +123,35 @@ async fn carebus_view_shape() {
 async fn tenant_layer_of_other_tenant_never_applied() {
     let e = seeded().await;
     let a = tenant(&e.app, "alice").await;
-    let b = tenant(&e.app, "bob").await;
+    tenant(&e.app, "bob").await;
     let (_, l) = member(
         &e.app,
         "POST",
         "/api/layers",
         "alice",
-        a,
         json!({"scope":"tenant"}),
     )
     .await;
-    let (s, out) = member(&e.app, "POST", &format!("/api/layers/{}/rows", l["id"].as_str().unwrap()), "alice", a, json!({"kind":"entity", "key":"Customer", "op":"patch", "fields":{"label":"Private label"}})).await;
+    let (s, out) = member(&e.app, "POST", &format!("/api/layers/{}/rows", l["id"].as_str().unwrap()), "alice", json!({"kind":"entity", "key":"Customer", "op":"patch", "fields":{"label":"Private label"}})).await;
     assert_eq!(s, StatusCode::CREATED, "{out}");
-    let (_, own) = member(&e.app, "POST", "/api/compile", "alice", a, json!({})).await;
-    let (_, other) = member(&e.app, "POST", "/api/compile", "bob", b, json!({})).await;
+    let (_, own) = member(&e.app, "POST", "/api/compile", "alice", json!({})).await;
+    let (_, other) = member(&e.app, "POST", "/api/compile", "bob", json!({})).await;
     assert_eq!(own["entities"]["Customer"]["label"], "Private label");
     assert_ne!(other["entities"]["Customer"]["label"], "Private label");
-    let (s, _) = member(
-        &e.app,
-        "POST",
-        "/api/compile",
-        "bob",
-        b,
-        json!({"tenant":a}),
-    )
-    .await;
+    let (s, _) = member(&e.app, "POST", "/api/compile", "bob", json!({"tenant":a})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn private_profile_and_dimension_never_compile_for_other_tenant() {
     let e = seeded().await;
-    let a = tenant(&e.app, "alice").await;
-    let b = tenant(&e.app, "bob").await;
+    tenant(&e.app, "alice").await;
+    tenant(&e.app, "bob").await;
     let (_, profile) = member(
         &e.app,
         "POST",
         "/api/profiles",
         "alice",
-        a,
         json!({"name":"Private", "values":{}}),
     )
     .await;
@@ -172,7 +160,6 @@ async fn private_profile_and_dimension_never_compile_for_other_tenant() {
         "POST",
         "/api/compile",
         "bob",
-        b,
         json!({"profile_id":profile["id"]}),
     )
     .await;
@@ -182,7 +169,6 @@ async fn private_profile_and_dimension_never_compile_for_other_tenant() {
         "POST",
         "/api/dimensions/department/values",
         "alice",
-        a,
         json!({"key":"private", "label":"Private"}),
     )
     .await;
@@ -192,7 +178,6 @@ async fn private_profile_and_dimension_never_compile_for_other_tenant() {
         "POST",
         "/api/compile",
         "bob",
-        b,
         json!({"industry":"retail", "departments":["private"]}),
     )
     .await;
@@ -202,7 +187,6 @@ async fn private_profile_and_dimension_never_compile_for_other_tenant() {
         "POST",
         "/api/compile",
         "alice",
-        a,
         json!({"industry":"retail", "departments":["private"]}),
     )
     .await;
@@ -220,16 +204,8 @@ async fn export_round_trips() {
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "{out}");
-    let a = tenant(&e.app, "alice").await;
-    let (s, _) = member(
-        &e.app,
-        "GET",
-        "/api/platform/export",
-        "alice",
-        a,
-        Value::Null,
-    )
-    .await;
+    tenant(&e.app, "alice").await;
+    let (s, _) = member(&e.app, "GET", "/api/platform/export", "alice", Value::Null).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, out) = root(&e.app, "GET", "/api/platform/export", Value::Null).await;
     assert_eq!(s, StatusCode::OK, "{out}");
@@ -256,7 +232,7 @@ async fn export_round_trips() {
             tenant: None,
         }))
         .collect();
-    let current = configurator_api::db::rows::load_for_layers(&e.state.db, &keys)
+    let current = configurator_api::db::rows::load_for_layers(&e.state.owner, &keys)
         .await
         .unwrap();
     let signature = |rows: Vec<configurator_core::overlay::OverlayRow>| {

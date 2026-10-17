@@ -10,8 +10,9 @@ use super::TEST_ISSUER;
 
 /// The audience the API expects (`KEYCLOAK_AUDIENCE` default).
 pub const TEST_AUDIENCE: &str = "strata-configurator";
-/// The realm role that makes a caller super-admin (`SUPER_ADMIN_ROLE` default).
-pub const SUPER_ADMIN: &str = "config-super-admin";
+/// The client role (on the `TEST_AUDIENCE` client) that makes a caller super-admin
+/// (`SUPER_ADMIN_ROLE` default).
+pub const SUPER_ADMIN: &str = "super_admin";
 
 struct KeyPair {
     enc: EncodingKey,
@@ -61,12 +62,13 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// The claims of a valid token for `sub`; tests edit or remove fields before signing.
+/// The claims of a valid token for `sub`, with `roles` as client roles of this app's client
+/// (`resource_access.<TEST_AUDIENCE>.roles`); tests edit or remove fields before signing.
 pub fn claims(sub: &str, roles: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "sub": sub, "preferred_username": username(sub), "exp": now() + 300,
         "iss": TEST_ISSUER, "aud": TEST_AUDIENCE,
-        "realm_access": {"roles": roles}
+        "resource_access": {TEST_AUDIENCE: {"roles": roles}}
     })
 }
 
@@ -114,7 +116,7 @@ pub fn username(sub: &str) -> String {
     format!("{sub}.user")
 }
 
-/// A valid RS256 portal-realm token for `sub` with these realm roles.
+/// A valid RS256 portal-realm token for `sub` with these client roles.
 pub fn token(sub: &str, roles: &[&str]) -> String {
     mint(&KEY, sub, roles)
 }

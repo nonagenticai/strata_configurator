@@ -18,10 +18,8 @@ pub fn routes() -> Router<AppState> {
 
 async fn export(State(st): State<AppState>, caller: Caller) -> Result<Json<Value>, ApiError> {
     require_super_admin(&caller)?;
-    let mut tx = st.db.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await?;
+    // Platform data only: the owner pool, one read-only snapshot.
+    let mut tx = st.snapshot(None).await?;
     let version: i32 = sqlx::query_scalar("SELECT coalesce(max(version), 0) + 1 FROM seed_version")
         .fetch_one(&mut *tx)
         .await?;

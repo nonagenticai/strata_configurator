@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 const ROOT: &str = "root";
 
-/// Super-admin creates a tenant whose first admin is `first_admin`; returns its id.
+/// Super-admin creates a tenant whose first `tenant_admin` is `first_admin`; returns its id.
 async fn create_tenant(app: &Router, name: &str, first_admin: &str) -> Uuid {
     let (s, b) = common::send(
         app,
@@ -29,7 +29,7 @@ async fn create_tenant(app: &Router, name: &str, first_admin: &str) -> Uuid {
     Uuid::parse_str(b["id"].as_str().unwrap()).unwrap()
 }
 
-async fn add_member(
+async fn add_user(
     app: &Router,
     tenant: Uuid,
     as_tok: &str,
@@ -40,7 +40,7 @@ async fn add_member(
         app,
         common::json(
             "POST",
-            &format!("/api/tenants/{tenant}/members"),
+            &format!("/api/tenants/{tenant}/users"),
             Some(as_tok),
             json!({"sub": sub, "role": role}),
         ),
@@ -48,14 +48,37 @@ async fn add_member(
     .await
 }
 
-fn delete(uri: &str, tok: &str) -> Request<Body> {
-    Request::delete(uri)
+fn set_role_req(tenant: Uuid, tok: &str, sub: &str, role: &str) -> Request<Body> {
+    common::json(
+        "PATCH",
+        &format!("/api/tenants/{tenant}/users/{sub}"),
+        Some(tok),
+        json!({"role": role}),
+    )
+}
+
+async fn set_role(
+    app: &Router,
+    tenant: Uuid,
+    tok: &str,
+    sub: &str,
+    role: &str,
+) -> (StatusCode, Value) {
+    common::send(app, set_role_req(tenant, tok, sub, role)).await
+}
+
+fn disable_req(tenant: Uuid, tok: &str, sub: &str) -> Request<Body> {
+    Request::delete(format!("/api/tenants/{tenant}/users/{sub}"))
         .header("authorization", format!("Bearer {tok}"))
         .body(Body::empty())
         .unwrap()
 }
 
-/// A route that only extracts `TenantCtx` (the `X-Tenant-Id` path every tenant-scoped route uses).
+async fn disable(app: &Router, tenant: Uuid, tok: &str, sub: &str) -> (StatusCode, Value) {
+    common::send(app, disable_req(tenant, tok, sub)).await
+}
+
+/// A route that only extracts `TenantCtx` (the tenant resolution every tenant-scoped route uses).
 fn probe(e: &common::TestEnv) -> Router {
     async fn whoami(ctx: TenantCtx) -> Json<Value> {
         Json(json!({"tenant": ctx.tenant, "role": ctx.role, "sub": ctx.caller.sub}))
@@ -68,9 +91,13 @@ fn probe(e: &common::TestEnv) -> Router {
 fn probe_req(tok: &str, tenant_headers: &[&str]) -> Request<Body> {
     let mut b = Request::get("/probe").header("authorization", format!("Bearer {tok}"));
     for h in tenant_headers {
-        b = b.header("x-tenant-id", *h);
+        b = b.header("x-active-tenant-id", *h);
     }
     b.body(Body::empty()).unwrap()
+}
+
+fn code(b: &Value) -> Value {
+    b["error"]["code"].clone()
 }
 
 /// actor, tenant, action, object, before_hash, after_hash
@@ -87,9 +114,32 @@ async fn audit_rows(db: &PgPool) -> Vec<AuditRow> {
     sqlx::query_as(
         "SELECT actor, tenant, action, object, before_hash, after_hash FROM audit_event ORDER BY id",
     )
-        .fetch_all(db)
-        .await
-        .unwrap()
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// actor, tenant, metadata of every `tenant.scope_switch` event, in order.
+async fn scope_switches(db: &PgPool) -> Vec<(String, Option<Uuid>, Option<Value>)> {
+    sqlx::query_as(
+        "SELECT actor, tenant, metadata FROM audit_event \
+         WHERE action = 'tenant.scope_switch' ORDER BY id",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// The active `tenant_admin`s of `tenant`.
+async fn admins(db: &PgPool, tenant: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT sub FROM users \
+         WHERE tenant = $1 AND tenant_role = 'tenant_admin' AND disabled_at IS NULL ORDER BY sub",
+    )
+    .bind(tenant)
+    .fetch_all(db)
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -211,39 +261,94 @@ async fn claim_checks_401() {
     }
 }
 
+/// Only this app's client role makes a super-admin: the realm role of the same name (which other apps
+/// read) and another client's `super_admin` do not.
 #[tokio::test]
-async fn me_lists_memberships() {
+async fn realm_role_super_admin_is_ignored() {
+    let e = common::env().await;
+    let mut realm = keys::claims("mallory", &[]);
+    realm["realm_access"] = json!({"roles": [keys::SUPER_ADMIN]});
+    let mut other_client = keys::claims("mallory", &[]);
+    other_client["resource_access"] = json!({"commonpractice": {"roles": [keys::SUPER_ADMIN]}});
+    for (name, claims) in [("realm role", realm), ("other client", other_client)] {
+        let tok = keys::sign(&claims);
+        let (s, me) = common::send(&e.app, common::get("/api/me", Some(&tok))).await;
+        assert_eq!(s, StatusCode::OK, "{name}: {me}");
+        assert_eq!(me["super_admin"], false, "{name}");
+        let (s, b) = common::send(
+            &e.app,
+            common::json(
+                "POST",
+                "/api/tenants",
+                Some(&tok),
+                json!({"name": "Evil", "first_admin_sub": "mallory"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (s, code(&b)),
+            (StatusCode::FORBIDDEN, json!("forbidden")),
+            "{name}"
+        );
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant")
+        .fetch_one(common::pool(&e))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    // control: the client role on this app's client is the super-admin
+    let (_, me) = common::send(&e.app, common::get("/api/me", Some(&super_admin(ROOT)))).await;
+    assert_eq!(me["super_admin"], true);
+}
+
+#[tokio::test]
+async fn me_returns_home_tenant() {
     let e = common::env().await;
     let a = create_tenant(&e.app, "Acme", "alice").await;
     let b = create_tenant(&e.app, "Beta", "bob").await;
-    create_tenant(&e.app, "Gamma", "carol").await;
-    let (s, _) = add_member(&e.app, b, &token("bob", &[]), "alice", "editor").await;
+    let (s, _) = add_user(&e.app, b, &token("bob", &[]), "carol", "tenant_user").await;
     assert_eq!(s, StatusCode::CREATED);
 
-    let (s, me) = common::send(&e.app, common::get("/api/me", Some(&token("alice", &[])))).await;
-    assert_eq!(s, StatusCode::OK, "{me}");
+    let me = |tok: String| {
+        let app = e.app.clone();
+        async move {
+            let (s, me) = common::send(&app, common::get("/api/me", Some(&tok))).await;
+            assert_eq!(s, StatusCode::OK, "{me}");
+            me
+        }
+    };
     assert_eq!(
-        me,
-        json!({"sub": "alice", "super_admin": false, "memberships": [
-            {"tenant": a, "name": "Acme", "role": "admin"},
-            {"tenant": b, "name": "Beta", "role": "editor"},
-        ]})
+        me(token("alice", &[])).await,
+        json!({"sub": "alice", "super_admin": false,
+               "tenant": {"id": a, "name": "Acme", "role": "tenant_admin"}})
     );
-    // the super-admin role comes from the token; membership is separate
-    let (_, me) = common::send(&e.app, common::get("/api/me", Some(&super_admin(ROOT)))).await;
     assert_eq!(
-        me,
-        json!({"sub": ROOT, "super_admin": true, "memberships": []})
+        me(token("carol", &[])).await,
+        json!({"sub": "carol", "super_admin": false,
+               "tenant": {"id": b, "name": "Beta", "role": "tenant_user"}})
     );
-    // someone with no memberships
-    let (_, me) = common::send(
-        &e.app,
-        common::get("/api/me", Some(&token("dave", &["other-role"]))),
-    )
-    .await;
+    // the super-admin role comes from the token; a workspace is separate
     assert_eq!(
-        me,
-        json!({"sub": "dave", "super_admin": false, "memberships": []})
+        me(super_admin(ROOT)).await,
+        json!({"sub": ROOT, "super_admin": true, "tenant": null})
+    );
+    let ops = create_tenant(&e.app, "Ops", "sa2").await;
+    assert_eq!(
+        me(super_admin("sa2")).await,
+        json!({"sub": "sa2", "super_admin": true,
+               "tenant": {"id": ops, "name": "Ops", "role": "tenant_admin"}})
+    );
+    // someone with no workspace
+    assert_eq!(
+        me(token("dave", &["other-role"])).await,
+        json!({"sub": "dave", "super_admin": false, "tenant": null})
+    );
+    // a disabled user has no workspace either
+    let (s, _) = disable(&e.app, b, &token("bob", &[]), "carol").await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(
+        me(token("carol", &[])).await,
+        json!({"sub": "carol", "super_admin": false, "tenant": null})
     );
 }
 
@@ -253,7 +358,7 @@ async fn only_super_admin_creates_tenants() {
     let body = json!({"name": "Acme", "first_admin_sub": "alice"});
     for tok in [
         token("alice", &[]),
-        token("alice", &["config-admin", "admin"]),
+        token("alice", &["config-admin", "admin", "tenant_admin"]),
     ] {
         let (s, b) = common::send(
             &e.app,
@@ -279,14 +384,15 @@ async fn only_super_admin_creates_tenants() {
     let id = Uuid::parse_str(t["id"].as_str().unwrap()).unwrap();
     assert!(!id.is_nil());
     assert!(t["created_at"].as_str().unwrap().contains('T'), "{t}");
-    // the first admin is a member, as admin
-    let role: String =
-        sqlx::query_scalar("SELECT role::text FROM member WHERE tenant = $1 AND sub = 'alice'")
-            .bind(id)
-            .fetch_one(common::pool(&e))
-            .await
-            .unwrap();
-    assert_eq!(role, "admin");
+    // the first admin is a user of the tenant, as tenant_admin
+    let role: String = sqlx::query_scalar(
+        "SELECT tenant_role::text FROM users WHERE tenant = $1 AND sub = 'alice'",
+    )
+    .bind(id)
+    .fetch_one(common::pool(&e))
+    .await
+    .unwrap();
+    assert_eq!(role, "tenant_admin");
 
     // bad bodies are 400 invalid_body
     for bad in [
@@ -320,27 +426,27 @@ async fn only_super_admin_creates_tenants() {
     assert_eq!(s, StatusCode::CREATED, "{b}");
     assert_eq!(b["name"], "n".repeat(200));
     let tid = Uuid::parse_str(b["id"].as_str().unwrap()).unwrap();
-    let stored: Vec<String> = sqlx::query_scalar("SELECT sub FROM member WHERE tenant = $1")
+    let stored: Vec<String> = sqlx::query_scalar("SELECT sub FROM users WHERE tenant = $1")
         .bind(tid)
         .fetch_all(common::pool(&e))
         .await
         .unwrap();
     assert_eq!(stored, ["trimmed"]);
-    let (s, b) = add_member(
+    let (s, b) = add_user(
         &e.app,
         tid,
         &super_admin(ROOT),
         &format!(" {} ", "s".repeat(255)),
-        "viewer",
+        "tenant_user",
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "{b}");
     assert_eq!(b["sub"], "s".repeat(255));
-    let (s, b) = add_member(&e.app, tid, &super_admin(ROOT), " trimmed ", "viewer").await;
+    let (s, b) = add_user(&e.app, tid, &super_admin(ROOT), " trimmed ", "tenant_user").await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::CONFLICT, json!("member_exists")),
-        "a padded sub is the same member"
+        (s, code(&b)),
+        (StatusCode::CONFLICT, json!("user_exists")),
+        "a padded sub is the same user"
     );
     sqlx::query("DELETE FROM tenant WHERE id = $1")
         .bind(tid)
@@ -348,7 +454,7 @@ async fn only_super_admin_creates_tenants() {
         .await
         .unwrap();
 
-    // listing: the super-admin sees all, others only their own
+    // listing: the super-admin sees all, others only their own (zero or one)
     create_tenant(&e.app, "Beta", "bob").await;
     let names = |v: &Value| -> Vec<String> {
         v["items"]
@@ -381,24 +487,28 @@ async fn only_super_admin_creates_tenants() {
 }
 
 #[tokio::test]
-async fn tenant_header_errors() {
+async fn active_tenant_header_errors() {
     let e = common::env().await;
     let t = create_tenant(&e.app, "Acme", "alice").await;
+    let beta = create_tenant(&e.app, "Beta", "bob").await;
     let tid_s = t.to_string();
+    let beta_s = beta.to_string();
     let other_s = Uuid::new_v4().to_string();
     let braced_s = format!("{{{tid_s}}}");
     let urn_s = format!("urn:uuid:{tid_s}");
     let simple_s = t.simple().to_string();
-    let (tid, other, braced, urn, simple) = (
+    let (tid, beta_h, other, braced, urn, simple) = (
         tid_s.as_str(),
+        beta_s.as_str(),
         other_s.as_str(),
         braced_s.as_str(),
         urn_s.as_str(),
         simple_s.as_str(),
     );
-    let alice = token("alice", &[]);
+    let root = super_admin(ROOT);
     let app = probe(&e);
 
+    // the super-admin (no workspace of their own) names the tenant to act in
     let cases: Vec<(Vec<&str>, StatusCode, &str)> = vec![
         (vec![], StatusCode::BAD_REQUEST, "tenant_required"),
         (
@@ -420,83 +530,203 @@ async fn tenant_header_errors() {
         (vec![simple], StatusCode::BAD_REQUEST, "invalid_tenant"),
         (vec![other], StatusCode::NOT_FOUND, "tenant_not_found"),
     ];
-    for (headers, status, code) in cases {
-        let (s, b) = common::send(&app, probe_req(&alice, &headers)).await;
+    for (headers, status, want) in cases {
+        let (s, b) = common::send(&app, probe_req(&root, &headers)).await;
         assert_eq!(s, status, "{headers:?}: {b}");
-        assert_eq!(b["error"]["code"], code, "{headers:?}");
+        assert_eq!(b["error"]["code"], want, "{headers:?}");
     }
-    // control: one bare uuid of a tenant the caller belongs to
-    let (s, b) = common::send(&app, probe_req(&alice, &[tid])).await;
+    // control: one bare uuid of an existing tenant
+    let (s, b) = common::send(&app, probe_req(&root, &[tid])).await;
     assert_eq!(s, StatusCode::OK, "{b}");
-    assert_eq!(b, json!({"tenant": t, "role": "admin", "sub": "alice"}));
-    // the path form of the member routes applies the same rules
+    assert_eq!(b, json!({"tenant": t, "role": "tenant_admin", "sub": ROOT}));
+
+    // anyone else: the header is ignored (it cannot switch tenant nor probe for tenants); the
+    // tenant always comes from `users`
+    let alice = token("alice", &[]);
+    for headers in [
+        vec![],
+        vec![beta_h],
+        vec![other],
+        vec!["not-a-uuid"],
+        vec![tid, other],
+    ] {
+        let (s, b) = common::send(&app, probe_req(&alice, &headers)).await;
+        assert_eq!(s, StatusCode::OK, "{headers:?}: {b}");
+        assert_eq!(
+            b,
+            json!({"tenant": t, "role": "tenant_admin", "sub": "alice"}),
+            "{headers:?}"
+        );
+    }
+
+    // the path form of the user routes: bad ids are 400; a tenant that is not the caller's is the
+    // same 404 as one that does not exist
     let (s, b) = common::send(
         &e.app,
-        common::get("/api/tenants/not-a-uuid/members", Some(&alice)),
+        common::get("/api/tenants/not-a-uuid/users", Some(&alice)),
     )
     .await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
+        (s, code(&b)),
         (StatusCode::BAD_REQUEST, json!("invalid_tenant"))
     );
+    for id in [other, beta_h] {
+        let (s, b) = common::send(
+            &e.app,
+            common::get(&format!("/api/tenants/{id}/users"), Some(&alice)),
+        )
+        .await;
+        assert_eq!(
+            (s, code(&b)),
+            (StatusCode::NOT_FOUND, json!("tenant_not_found")),
+            "{id}"
+        );
+    }
     let (s, b) = common::send(
         &e.app,
-        common::get(&format!("/api/tenants/{other}/members"), Some(&alice)),
+        common::get(&format!("/api/tenants/{other}/users"), Some(&root)),
     )
     .await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
+        (s, code(&b)),
         (StatusCode::NOT_FOUND, json!("tenant_not_found"))
     );
 }
 
 #[tokio::test]
-async fn non_member_403() {
+async fn no_users_row_403() {
     let e = common::env().await;
     let t = create_tenant(&e.app, "Acme", "alice").await;
     let tid = t.to_string();
     let app = probe(&e);
     let carol = token("carol", &[]);
 
-    let (s, b) = common::send(&app, probe_req(&carol, &[tid.as_str()])).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
-    assert_eq!(b["error"]["code"], "not_a_member");
-    let members = format!("/api/tenants/{tid}/members");
-    let (s, b) = common::send(&e.app, common::get(&members, Some(&carol))).await;
+    // no `users` row: no workspace, whatever header is sent
+    for headers in [vec![], vec![tid.as_str()]] {
+        let (s, b) = common::send(&app, probe_req(&carol, &headers)).await;
+        assert_eq!(
+            (s, code(&b)),
+            (StatusCode::FORBIDDEN, json!("no_workspace")),
+            "{headers:?}"
+        );
+    }
+    let (s, b) = common::send(&e.app, common::get("/api/layers", Some(&carol))).await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::FORBIDDEN, json!("not_a_member"))
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, json!("no_workspace"))
     );
-    let (s, _) = add_member(&e.app, t, &carol, "carol", "admin").await;
+    let users = format!("/api/tenants/{tid}/users");
+    let (s, b) = common::send(&e.app, common::get(&users, Some(&carol))).await;
     assert_eq!(
-        s,
-        StatusCode::FORBIDDEN,
-        "a non-member cannot add themselves"
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, json!("no_workspace"))
     );
-    let (s, _) = common::send(&e.app, delete(&format!("{members}/alice"), &carol)).await;
+    let (s, _) = add_user(&e.app, t, &carol, "carol", "tenant_admin").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "no one adds themselves");
+    let (s, _) = disable(&e.app, t, &carol, "alice").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
-    // a member below admin is in the tenant but cannot manage members
-    let (s, _) = add_member(&e.app, t, &token("alice", &[]), "victor", "approver").await;
+    // a tenant_user is in the tenant but cannot manage users
+    let (s, _) = add_user(&e.app, t, &token("alice", &[]), "victor", "tenant_user").await;
     assert_eq!(s, StatusCode::CREATED);
     let victor = token("victor", &[]);
-    let (s, b) = common::send(&app, probe_req(&victor, &[tid.as_str()])).await;
-    assert_eq!((s, b["role"].clone()), (StatusCode::OK, json!("approver")));
-    let (s, b) = common::send(&e.app, common::get(&members, Some(&victor))).await;
+    let (s, b) = common::send(&app, probe_req(&victor, &[])).await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::FORBIDDEN, json!("forbidden"))
+        (s, b["role"].clone()),
+        (StatusCode::OK, json!("tenant_user"))
     );
-    let (s, _) = add_member(&e.app, t, &victor, "mallory", "viewer").await;
+    let (s, b) = common::send(&e.app, common::get(&users, Some(&victor))).await;
+    assert_eq!((s, code(&b)), (StatusCode::FORBIDDEN, json!("forbidden")));
+    let (s, _) = add_user(&e.app, t, &victor, "mallory", "tenant_user").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    let (s, _) = common::send(&e.app, delete(&format!("{members}/alice"), &victor)).await;
+    let (s, _) = set_role(&e.app, t, &victor, "victor", "tenant_admin").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "no self-promotion");
+    let (s, _) = disable(&e.app, t, &victor, "alice").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM member WHERE tenant = $1")
-        .bind(t)
-        .fetch_one(common::pool(&e))
-        .await
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sub, tenant_role::text FROM users WHERE tenant = $1 AND disabled_at IS NULL \
+         ORDER BY sub",
+    )
+    .bind(t)
+    .fetch_all(common::pool(&e))
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("alice".to_string(), "tenant_admin".to_string()),
+            ("victor".into(), "tenant_user".into())
+        ],
+        "refused writes changed nothing"
+    );
+}
+
+#[tokio::test]
+async fn disabled_user_403() {
+    let e = common::env().await;
+    let t = create_tenant(&e.app, "Acme", "alice").await;
+    let alice = token("alice", &[]);
+    let bob = token("bob", &[]);
+    let app = probe(&e);
+    assert_eq!(
+        add_user(&e.app, t, &alice, "bob", "tenant_admin").await.0,
+        StatusCode::CREATED
+    );
+    let (s, b) = common::send(&app, probe_req(&bob, &[])).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+
+    let (s, b) = disable(&e.app, t, &alice, "bob").await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+    let (s, b) = common::send(&app, probe_req(&bob, &[])).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, json!("no_workspace"))
+    );
+    let (s, b) = common::send(&e.app, common::get("/api/tenants", Some(&bob))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["items"], json!([]));
+    let (s, b) = common::send(
+        &e.app,
+        common::get(&format!("/api/tenants/{t}/users"), Some(&bob)),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, json!("no_workspace"))
+    );
+
+    // the identity stays bound to the tenant: not re-addable, not re-disablable, not re-roled
+    let (s, b) = add_user(&e.app, t, &alice, "bob", "tenant_user").await;
+    assert_eq!((s, code(&b)), (StatusCode::CONFLICT, json!("user_exists")));
+    let (s, b) = disable(&e.app, t, &alice, "bob").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::NOT_FOUND, json!("user_not_found"))
+    );
+    let (s, b) = set_role(&e.app, t, &alice, "bob", "tenant_user").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::NOT_FOUND, json!("user_not_found"))
+    );
+    // the list still shows the disabled user
+    let (_, list) = common::send(
+        &e.app,
+        common::get(&format!("/api/tenants/{t}/users"), Some(&alice)),
+    )
+    .await;
+    let bob_row = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["sub"] == "bob")
+        .cloned()
         .unwrap();
-    assert_eq!(n, 2, "refused writes changed nothing");
+    assert!(
+        bob_row["disabled_at"]
+            .as_str()
+            .is_some_and(|d| d.contains('T')),
+        "{bob_row}"
+    );
 }
 
 #[tokio::test]
@@ -505,42 +735,60 @@ async fn super_admin_acts_in_any_tenant() {
     let t = create_tenant(&e.app, "Acme", "alice").await;
     let tid = t.to_string();
     let root = super_admin(ROOT);
+    let db = common::pool(&e);
 
-    // not a member, yet admin in the tenant
+    // no users row, yet tenant_admin in the tenant; the switch is audited with the request
     let (s, b) = common::send(&probe(&e), probe_req(&root, &[tid.as_str()])).await;
     assert_eq!(s, StatusCode::OK, "{b}");
-    assert_eq!(b["role"], "admin");
-    // ... but still only in tenants that exist
+    assert_eq!(b["role"], "tenant_admin");
+    assert_eq!(
+        scope_switches(db).await,
+        [(
+            ROOT.to_string(),
+            Some(t),
+            Some(json!({"method": "GET", "path": "/probe"}))
+        )]
+    );
+    // ... but only in tenants that exist, and a refused switch is not audited
     let (s, b) = common::send(
         &probe(&e),
         probe_req(&root, &[Uuid::new_v4().to_string().as_str()]),
     )
     .await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
+        (s, code(&b)),
         (StatusCode::NOT_FOUND, json!("tenant_not_found"))
     );
+    assert_eq!(scope_switches(db).await.len(), 1);
 
-    let (s, b) = add_member(&e.app, t, &root, "bob", "editor").await;
+    // the path names the tenant for user management
+    let (s, b) = add_user(&e.app, t, &root, "bob", "tenant_user").await;
     assert_eq!(s, StatusCode::CREATED, "{b}");
     assert_eq!(
-        (b["sub"].clone(), b["role"].clone()),
-        (json!("bob"), json!("editor"))
+        (
+            b["sub"].clone(),
+            b["role"].clone(),
+            b["disabled_at"].clone()
+        ),
+        (json!("bob"), json!("tenant_user"), Value::Null)
     );
-    let (s, b) = add_member(&e.app, t, &root, "bob", "viewer").await;
-    assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::CONFLICT, json!("member_exists"))
-    );
-    let (s, b) = add_member(&e.app, t, &root, "eve", "owner").await;
-    assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::BAD_REQUEST, json!("invalid_body"))
-    );
+    let (s, b) = add_user(&e.app, t, &root, "bob", "tenant_admin").await;
+    assert_eq!((s, code(&b)), (StatusCode::CONFLICT, json!("user_exists")));
+    for bad in ["owner", "editor", "admin"] {
+        let (s, b) = add_user(&e.app, t, &root, "eve", bad).await;
+        assert_eq!(
+            (s, code(&b)),
+            (StatusCode::BAD_REQUEST, json!("invalid_body")),
+            "{bad}"
+        );
+    }
+    let (s, b) = set_role(&e.app, t, &root, "bob", "tenant_admin").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["role"], "tenant_admin");
 
     let (s, b) = common::send(
         &e.app,
-        common::get(&format!("/api/tenants/{tid}/members"), Some(&root)),
+        common::get(&format!("/api/tenants/{tid}/users"), Some(&root)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{b}");
@@ -558,84 +806,125 @@ async fn super_admin_acts_in_any_tenant() {
     assert_eq!(
         got,
         [
-            ("alice".to_string(), "admin".to_string()),
-            ("bob".into(), "editor".into())
+            ("alice".to_string(), "tenant_admin".to_string()),
+            ("bob".into(), "tenant_admin".into())
         ]
     );
-
-    let (s, _) = common::send(
-        &e.app,
-        delete(&format!("/api/tenants/{tid}/members/bob"), &root),
-    )
-    .await;
+    let (s, _) = disable(&e.app, t, &root, "bob").await;
     assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // a super-admin with a workspace of their own: that tenant without the header (not a switch),
+    // another tenant with it (a switch)
+    let ops = create_tenant(&e.app, "Ops", "sa2").await;
+    let sa2 = super_admin("sa2");
+    let ops_s = ops.to_string();
+    for headers in [vec![], vec![ops_s.as_str()]] {
+        let (s, b) = common::send(&probe(&e), probe_req(&sa2, &headers)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["tenant"], json!(ops), "{headers:?}");
+    }
+    assert_eq!(
+        scope_switches(db).await.len(),
+        1,
+        "acting at home is no switch"
+    );
+    let (s, b) = common::send(&probe(&e), probe_req(&sa2, &[tid.as_str()])).await;
+    assert_eq!((s, b["tenant"].clone()), (StatusCode::OK, json!(t)));
+    let switches = scope_switches(db).await;
+    assert_eq!(switches.len(), 2);
+    assert_eq!(switches[1].0, "sa2");
+    assert_eq!(switches[1].1, Some(t));
 }
 
 #[tokio::test]
 async fn last_admin_cannot_be_removed() {
     let e = common::env().await;
+    let db = common::pool(&e);
     let t = create_tenant(&e.app, "Acme", "alice").await;
-    let base = format!("/api/tenants/{t}/members");
     let alice = token("alice", &[]);
     let root = super_admin(ROOT);
 
     for tok in [&alice, &root] {
-        let (s, b) = common::send(&e.app, delete(&format!("{base}/alice"), tok)).await;
-        assert_eq!(s, StatusCode::CONFLICT, "{b}");
-        assert_eq!(b["error"]["code"], "last_admin");
+        let (s, b) = disable(&e.app, t, tok, "alice").await;
+        assert_eq!(
+            (s, code(&b)),
+            (StatusCode::CONFLICT, json!("last_admin")),
+            "{b}"
+        );
+        let (s, b) = set_role(&e.app, t, tok, "alice", "tenant_user").await;
+        assert_eq!(
+            (s, code(&b)),
+            (StatusCode::CONFLICT, json!("last_admin")),
+            "{b}"
+        );
     }
-    let (s, b) = common::send(&e.app, delete(&format!("{base}/nobody"), &alice)).await;
+    // a no-op "demotion" to the same role is fine
+    let (s, b) = set_role(&e.app, t, &alice, "alice", "tenant_admin").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let (s, b) = disable(&e.app, t, &alice, "nobody").await;
     assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::NOT_FOUND, json!("member_not_found"))
+        (s, code(&b)),
+        (StatusCode::NOT_FOUND, json!("user_not_found"))
     );
 
-    // with a second admin, the first may go; then the second is the last
+    // with a second admin, the first may be demoted; then the second is the last
     assert_eq!(
-        add_member(&e.app, t, &alice, "bob", "admin").await.0,
+        add_user(&e.app, t, &alice, "bob", "tenant_admin").await.0,
         StatusCode::CREATED
     );
     assert_eq!(
-        add_member(&e.app, t, &alice, "vic", "viewer").await.0,
+        add_user(&e.app, t, &alice, "vic", "tenant_user").await.0,
         StatusCode::CREATED
     );
-    let (s, _) = common::send(&e.app, delete(&format!("{base}/alice"), &alice)).await;
+    let (s, _) = set_role(&e.app, t, &alice, "alice", "tenant_user").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, b) = set_role(&e.app, t, &root, "bob", "tenant_user").await;
+    assert_eq!((s, code(&b)), (StatusCode::CONFLICT, json!("last_admin")));
+    let (s, b) = disable(&e.app, t, &root, "bob").await;
+    assert_eq!((s, code(&b)), (StatusCode::CONFLICT, json!("last_admin")));
+    // a tenant_user can always be disabled
+    let (s, _) = disable(&e.app, t, &root, "vic").await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (s, b) = common::send(&e.app, delete(&format!("{base}/bob"), &root)).await;
-    assert_eq!(
-        (s, b["error"]["code"].clone()),
-        (StatusCode::CONFLICT, json!("last_admin"))
-    );
-    // a non-admin can always be removed
-    let (s, _) = common::send(&e.app, delete(&format!("{base}/vic"), &root)).await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(admins(db, t).await, ["bob"]);
 
-    // race: two admins removed at once → exactly one succeeds, an admin remains
-    assert_eq!(
-        add_member(&e.app, t, &root, "cy", "admin").await.0,
-        StatusCode::CREATED
-    );
-    for _ in 0..5 {
-        let r1 = e.app.clone().oneshot(delete(&format!("{base}/bob"), &root));
-        let r2 = e.app.clone().oneshot(delete(&format!("{base}/cy"), &root));
+    // race: two admins disabled at once → exactly one succeeds, an admin remains
+    let mut keep = "bob".to_string();
+    for i in 0..5 {
+        let newcomer = format!("n{i}");
+        assert_eq!(
+            add_user(&e.app, t, &root, &newcomer, "tenant_admin")
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        let r1 = e.app.clone().oneshot(disable_req(t, &root, &keep));
+        let r2 = e.app.clone().oneshot(disable_req(t, &root, &newcomer));
         let (r1, r2) = tokio::join!(r1, r2);
         let mut got = [r1.unwrap().status(), r2.unwrap().status()];
         got.sort();
         assert_eq!(got, [StatusCode::NO_CONTENT, StatusCode::CONFLICT]);
-        let admins: Vec<String> =
-            sqlx::query_scalar("SELECT sub FROM member WHERE tenant = $1 AND role = 'admin'")
-                .bind(t)
-                .fetch_all(common::pool(&e))
-                .await
-                .unwrap();
-        assert_eq!(admins.len(), 1, "{admins:?}");
-        // put the removed one back for the next round
-        let gone = if admins[0] == "bob" { "cy" } else { "bob" };
-        assert_eq!(
-            add_member(&e.app, t, &root, gone, "admin").await.0,
-            StatusCode::CREATED
-        );
+        let left = admins(db, t).await;
+        assert_eq!(left.len(), 1, "{left:?}");
+        keep = left[0].clone();
     }
+    // race: two admins demoted at once → exactly one succeeds
+    assert_eq!(
+        add_user(&e.app, t, &root, "m", "tenant_admin").await.0,
+        StatusCode::CREATED
+    );
+    let r1 = e
+        .app
+        .clone()
+        .oneshot(set_role_req(t, &root, &keep, "tenant_user"));
+    let r2 = e
+        .app
+        .clone()
+        .oneshot(set_role_req(t, &root, "m", "tenant_user"));
+    let (r1, r2) = tokio::join!(r1, r2);
+    let mut got = [r1.unwrap().status(), r2.unwrap().status()];
+    got.sort();
+    assert_eq!(got, [StatusCode::OK, StatusCode::CONFLICT]);
+    assert_eq!(admins(db, t).await.len(), 1);
 }
 
 #[tokio::test]
@@ -661,29 +950,26 @@ async fn writes_are_audited() {
 
     let alice = token("alice", &[]);
     assert_eq!(
-        add_member(&e.app, t, &alice, "bob", "editor").await.0,
+        add_user(&e.app, t, &alice, "bob", "tenant_user").await.0,
         StatusCode::CREATED
     );
     // refused writes record nothing
     assert_eq!(
-        add_member(&e.app, t, &alice, "bob", "editor").await.0,
+        add_user(&e.app, t, &alice, "bob", "tenant_user").await.0,
         StatusCode::CONFLICT
     );
     assert_eq!(
-        common::send(
-            &e.app,
-            delete(&format!("/api/tenants/{t}/members/alice"), &alice)
-        )
-        .await
-        .0,
+        disable(&e.app, t, &alice, "alice").await.0,
         StatusCode::CONFLICT
     );
-    let (s, _) = common::send(
-        &e.app,
-        delete(&format!("/api/tenants/{t}/members/bob"), &alice),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(
+        set_role(&e.app, t, &alice, "bob", "tenant_admin").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        disable(&e.app, t, &alice, "bob").await.0,
+        StatusCode::NO_CONTENT
+    );
 
     let rows = audit_rows(db).await;
     let summary: Vec<_> = rows
@@ -698,34 +984,93 @@ async fn writes_are_audited() {
             )
         })
         .collect();
-    let bob = format!("member:{t}:bob");
+    let bob = format!("user:{t}:bob");
+    let ev = |a: &str, act: &str, obj: &str, b: bool, af: bool| {
+        (a.to_string(), act.to_string(), obj.to_string(), b, af)
+    };
     assert_eq!(
         summary,
         [
-            (
-                ROOT.to_string(),
-                "tenant.create".to_string(),
-                format!("tenant:{t}"),
-                false,
-                true
-            ),
-            (
-                "alice".to_string(),
-                "member.add".to_string(),
-                bob.clone(),
-                false,
-                true
-            ),
-            (
-                "alice".to_string(),
-                "member.remove".to_string(),
-                bob,
-                true,
-                false
-            ),
+            ev(ROOT, "tenant.create", &format!("tenant:{t}"), false, true),
+            ev("alice", "user.add", &bob, false, true),
+            ev("alice", "user.role", &bob, true, true),
+            ev("alice", "user.disable", &bob, true, false),
         ]
     );
-    // add's after and remove's before hash the same member state
+    // each event's before hashes the state the previous one left
     assert_eq!(rows[1].5, rows[2].4);
+    assert_eq!(rows[2].5, rows[3].4);
+    assert_ne!(rows[2].4, rows[2].5, "the role change changed the state");
     assert!(rows.iter().all(|r| r.1 == Some(t)));
+}
+
+/// One tenant per identity: a `sub` with a `users` row anywhere (even disabled) cannot be added to
+/// another tenant, nor made another tenant's first admin.
+#[tokio::test]
+async fn user_in_one_tenant_only_409() {
+    let e = common::env().await;
+    let a = create_tenant(&e.app, "Acme", "alice").await;
+    let b = create_tenant(&e.app, "Beta", "bob").await;
+    let root = super_admin(ROOT);
+
+    let (s, body) = add_user(&e.app, b, &token("bob", &[]), "alice", "tenant_user").await;
+    assert_eq!(
+        (s, code(&body)),
+        (StatusCode::CONFLICT, json!("user_exists")),
+        "{body}"
+    );
+    let (s, body) = add_user(&e.app, b, &root, "alice", "tenant_admin").await;
+    assert_eq!(
+        (s, code(&body)),
+        (StatusCode::CONFLICT, json!("user_exists")),
+        "{body}"
+    );
+    let (s, body) = common::send(
+        &e.app,
+        common::json(
+            "POST",
+            "/api/tenants",
+            Some(&root),
+            json!({"name": "Gamma", "first_admin_sub": "alice"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&body)),
+        (StatusCode::CONFLICT, json!("user_exists")),
+        "{body}"
+    );
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM tenant ORDER BY name")
+        .fetch_all(common::pool(&e))
+        .await
+        .unwrap();
+    assert_eq!(
+        names,
+        ["Acme", "Beta"],
+        "the refused create left no tenant behind"
+    );
+
+    // a disabled user stays bound to their tenant
+    assert_eq!(
+        add_user(&e.app, a, &token("alice", &[]), "carol", "tenant_user")
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        disable(&e.app, a, &token("alice", &[]), "carol").await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (s, body) = add_user(&e.app, b, &root, "carol", "tenant_user").await;
+    assert_eq!(
+        (s, code(&body)),
+        (StatusCode::CONFLICT, json!("user_exists"))
+    );
+    let home: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT tenant, sub FROM users WHERE sub IN ('alice', 'carol') ORDER BY sub",
+    )
+    .fetch_all(common::pool(&e))
+    .await
+    .unwrap();
+    assert_eq!(home, [(a, "alice".to_string()), (a, "carol".to_string())]);
 }

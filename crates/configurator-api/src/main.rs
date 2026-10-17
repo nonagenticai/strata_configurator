@@ -13,12 +13,15 @@ async fn main() -> Result<()> {
         .init();
     let cfg = Config::from_env()?;
     let bind = format!("0.0.0.0:{}", cfg.port);
+    // The owner migrates and seeds; requests run as the non-bypass app role, under RLS.
+    let owner = db::connect(cfg.owner_database_url()).await?;
+    db::migrate(&owner).await?;
     let pool = db::connect(&cfg.database_url).await?;
-    db::migrate(&pool).await?;
-    let state = AppState::new(cfg, pool);
+    db::assert_runtime_role(&pool).await?;
+    let state = AppState::new(cfg, pool, owner);
 
     let bundles = seeder::embedded()?;
-    match seeder::apply(&state.db, &bundles).await {
+    match seeder::apply(&state.owner, &bundles).await {
         Ok(applied) => tracing::info!(?applied, "seeds up to date"),
         // Serve anyway: `/ready` reports the conflict and the key it is about.
         Err(SeedError::Conflict { version, key }) => {

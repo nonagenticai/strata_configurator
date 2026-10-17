@@ -11,7 +11,7 @@ pub enum ApiError {
     Unauthorized,
     #[error("this needs the {0} role")]
     Forbidden(&'static str),
-    /// 403 with its own code, e.g. `not_a_member`.
+    /// 403 with its own code, e.g. `no_workspace`.
     #[error("{1}")]
     Denied(&'static str, String),
     #[error("{0} not found")]

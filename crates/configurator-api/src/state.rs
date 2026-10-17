@@ -1,6 +1,7 @@
 use std::sync::{Arc, PoisonError, RwLock};
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::auth::Verifier;
 use crate::config::Config;
@@ -21,14 +22,18 @@ pub enum SeedStatus {
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
+    /// The runtime pool: the non-bypass app role, under RLS. Tenant work goes through
+    /// [`db::tenant_tx`] (or [`AppState::tx`]) so `app.current_tenant` is set.
     pub db: PgPool,
+    /// The owner pool (bypasses RLS): migrations, the seeder and super-admin platform work only.
+    pub owner: PgPool,
     pub seed: Arc<RwLock<SeedStatus>>,
     /// Bearer-token verifier: Keycloak's JWKS in production; tests swap in a static key.
     pub auth: Arc<Verifier>,
 }
 
 impl AppState {
-    pub fn new(cfg: Config, db: PgPool) -> Self {
+    pub fn new(cfg: Config, db: PgPool, owner: PgPool) -> Self {
         // Same client shape as care-bus: a short timeout, so a hung Keycloak cannot hang requests.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
@@ -43,6 +48,7 @@ impl AppState {
         Self {
             cfg: Arc::new(cfg),
             db,
+            owner,
             seed: Arc::new(RwLock::new(SeedStatus::Ready)),
             auth,
         }
@@ -54,10 +60,44 @@ impl AppState {
         self
     }
 
-    /// A state whose pool connects on first use (routes that never touch the DB work without one).
+    /// A state whose pools connect on first use (routes that never touch the DB work without one).
     pub fn lazy(cfg: Config) -> anyhow::Result<Self> {
         let pool = db::connect_lazy(&cfg.database_url)?;
-        Ok(Self::new(cfg, pool))
+        let owner = db::connect_lazy(cfg.owner_database_url())?;
+        Ok(Self::new(cfg, pool, owner))
+    }
+
+    /// A transaction over the data of `tenant`: for a tenant, the runtime pool with
+    /// `app.current_tenant` set (RLS applies); for `None` (platform data), the owner pool. Callers
+    /// authorise first: platform writes need the super-admin, and only the super-admin acts with no
+    /// tenant.
+    pub async fn tx(
+        &self,
+        tenant: Option<Uuid>,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        match tenant {
+            Some(t) => db::tenant_tx(&self.db, t).await,
+            None => self.owner.begin().await,
+        }
+    }
+
+    /// [`AppState::tx`] as one consistent read-only snapshot (`REPEATABLE READ, READ ONLY`). The
+    /// isolation level must be set before any other statement, so the tenant is set after it.
+    pub async fn snapshot(
+        &self,
+        tenant: Option<Uuid>,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        let mut tx = match tenant {
+            Some(_) => self.db.begin().await?,
+            None => self.owner.begin().await?,
+        };
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        if let Some(t) = tenant {
+            db::set_tenant(&mut tx, t).await?;
+        }
+        Ok(tx)
     }
 
     pub fn seed_status(&self) -> SeedStatus {

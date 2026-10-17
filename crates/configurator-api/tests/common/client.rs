@@ -19,8 +19,10 @@ pub async fn request(
         .method(method)
         .uri(uri)
         .header("authorization", format!("Bearer {auth}"));
+    // `X-Active-Tenant-Id` only means something for the super-admin; everyone else's tenant comes
+    // from `users`.
     if let Some(id) = tenant {
-        req = req.header("x-tenant-id", id.to_string());
+        req = req.header("x-active-tenant-id", id.to_string());
     }
     super::send(
         app,
@@ -47,21 +49,25 @@ pub async fn tenant(app: &Router, name: &str) -> Uuid {
     Uuid::parse_str(b["id"].as_str().unwrap()).unwrap()
 }
 
+/// `sub` (no client roles) in their own tenant: no header, the tenant comes from `users`.
 pub async fn member(
     app: &Router,
     method: &str,
     uri: &str,
     sub: &str,
-    tenant: Uuid,
     body: Value,
 ) -> (StatusCode, Value) {
-    request(app, method, uri, &token(sub, &[]), Some(tenant), body).await
+    request(app, method, uri, &token(sub, &[]), None, body).await
 }
 
 pub async fn seeded() -> super::TestEnv {
     let e = super::env().await;
-    configurator_api::seeder::apply(&e.state.db, &configurator_api::seeder::embedded().unwrap())
-        .await
-        .unwrap();
+    // Seeds are platform data: the owner writes them, as `main` does.
+    configurator_api::seeder::apply(
+        &e.state.owner,
+        &configurator_api::seeder::embedded().unwrap(),
+    )
+    .await
+    .unwrap();
     e
 }

@@ -48,7 +48,7 @@ async fn rule_with_unknown_value_rejected() {
     assert_eq!(b["error"]["code"], "invalid_condition");
     assert!(b["error"]["message"].as_str().unwrap().contains("missing"));
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM layer WHERE rule = 'bad'")
-        .fetch_one(&e.state.db)
+        .fetch_one(&e.state.owner)
         .await
         .unwrap();
     assert_eq!(count, 0);
@@ -74,14 +74,13 @@ async fn rule_creates_profile_layer() {
 #[tokio::test]
 async fn tenant_dimension_value_invisible_to_other_tenant() {
     let e = seeded().await;
-    let a = tenant(&e.app, "alice").await;
-    let b = tenant(&e.app, "bob").await;
+    tenant(&e.app, "alice").await;
+    tenant(&e.app, "bob").await;
     let (s, body) = member(
         &e.app,
         "POST",
         "/api/dimensions/department/values",
         "alice",
-        a,
         json!({"key":"private", "label":"Private"}),
     )
     .await;
@@ -91,7 +90,6 @@ async fn tenant_dimension_value_invisible_to_other_tenant() {
         "GET",
         "/api/dimensions/department/values",
         "alice",
-        a,
         Value::Null,
     )
     .await;
@@ -100,7 +98,6 @@ async fn tenant_dimension_value_invisible_to_other_tenant() {
         "GET",
         "/api/dimensions/department/values",
         "bob",
-        b,
         Value::Null,
     )
     .await;
@@ -166,13 +163,12 @@ async fn seeded_electricity_template_listed() {
 async fn profile_visibility_permissions_and_audit() {
     let e = seeded().await;
     let a = tenant(&e.app, "alice").await;
-    let b = tenant(&e.app, "bob").await;
+    tenant(&e.app, "bob").await;
     let (_, p) = member(
         &e.app,
         "POST",
         "/api/profiles",
         "alice",
-        a,
         json!({"name":"Private", "values":{}}),
     )
     .await;
@@ -183,7 +179,6 @@ async fn profile_visibility_permissions_and_audit() {
             method,
             &uri,
             "bob",
-            b,
             json!({"name":"stolen", "values":{}}),
         )
         .await;
@@ -194,7 +189,6 @@ async fn profile_visibility_permissions_and_audit() {
         "PUT",
         &uri,
         "alice",
-        a,
         json!({"name":"Updated", "values":{}}),
     )
     .await;
@@ -204,7 +198,6 @@ async fn profile_visibility_permissions_and_audit() {
         "POST",
         "/api/axes",
         "alice",
-        a,
         json!({"key":"no", "cardinality":"one"}),
     )
     .await;
@@ -213,11 +206,11 @@ async fn profile_visibility_permissions_and_audit() {
         "SELECT count(*) FROM audit_event WHERE tenant = $1 AND action LIKE 'profile.%'",
     )
     .bind(a)
-    .fetch_one(&e.state.db)
+    .fetch_one(&e.state.owner)
     .await
     .unwrap();
     assert_eq!(count, 2);
-    let (_, list) = member(&e.app, "GET", "/api/profiles", "alice", a, Value::Null).await;
+    let (_, list) = member(&e.app, "GET", "/api/profiles", "alice", Value::Null).await;
     let template = list["items"]
         .as_array()
         .unwrap()
@@ -229,7 +222,6 @@ async fn profile_visibility_permissions_and_audit() {
         "PUT",
         &format!("/api/profiles/{}", template["id"].as_str().unwrap()),
         "alice",
-        a,
         json!({"name":"no", "values":{}}),
     )
     .await;

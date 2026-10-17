@@ -1,8 +1,10 @@
-//! `tenant` and `member` queries. Writes take the caller's transaction so the audit event shares it.
+//! `tenant` queries. Writes take the caller's transaction so the audit event shares it. `tenant` is
+//! outside RLS: identity and tenancy are resolved before a tenant is known.
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::users;
 use crate::page::TimeCursor;
 use crate::tenancy::Role;
 
@@ -15,68 +17,6 @@ pub struct Tenant {
     /// `created_at` in microseconds since the epoch: the paging cursor, not part of the body.
     #[serde(skip)]
     pub ts_us: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Membership {
-    pub tenant: Uuid,
-    pub name: String,
-    pub role: Role,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Member {
-    pub sub: String,
-    pub role: Role,
-    /// RFC 3339.
-    pub created_at: String,
-}
-
-fn role(s: &str) -> Result<Role, sqlx::Error> {
-    Role::parse(s).ok_or_else(|| sqlx::Error::Decode(format!("unknown member_role {s:?}").into()))
-}
-
-/// `None` when the tenant does not exist; `Some(None)` when it exists and `sub` is not a member.
-pub async fn role_in(
-    db: &PgPool,
-    tenant: Uuid,
-    sub: &str,
-) -> Result<Option<Option<Role>>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT m.role::text FROM tenant t \
-         LEFT JOIN member m ON m.tenant = t.id AND m.sub = $2 \
-         WHERE t.id = $1",
-    )
-    .bind(tenant)
-    .bind(sub)
-    .fetch_optional(db)
-    .await?;
-    match row {
-        None => Ok(None),
-        Some((None,)) => Ok(Some(None)),
-        Some((Some(r),)) => Ok(Some(Some(role(&r)?))),
-    }
-}
-
-/// Every tenant `sub` belongs to, by name.
-pub async fn memberships(db: &PgPool, sub: &str) -> Result<Vec<Membership>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
-        "SELECT t.id, t.name, m.role::text FROM member m \
-         JOIN tenant t ON t.id = m.tenant \
-         WHERE m.sub = $1 ORDER BY t.name, t.id",
-    )
-    .bind(sub)
-    .fetch_all(db)
-    .await?;
-    rows.into_iter()
-        .map(|(tenant, name, r)| -> Result<Membership, sqlx::Error> {
-            Ok(Membership {
-                tenant,
-                name,
-                role: role(&r)?,
-            })
-        })
-        .collect()
 }
 
 fn tenants(rows: Vec<(Uuid, String, String, i64)>) -> Vec<Tenant> {
@@ -117,7 +57,7 @@ pub async fn list_all(
     Ok(tenants(rows))
 }
 
-/// The tenants `sub` is a member of, one page.
+/// The tenant `sub` belongs to (an active `users` row), as a page of zero or one.
 pub async fn list_for(
     db: &PgPool,
     sub: &str,
@@ -129,7 +69,7 @@ pub async fn list_for(
         "SELECT id, name, to_jsonb(created_at) #>> '{}', \
                 (extract(epoch FROM created_at) * 1000000)::bigint \
          FROM tenant \
-         WHERE id IN (SELECT tenant FROM member WHERE sub = $4) \
+         WHERE id IN (SELECT tenant FROM users WHERE sub = $4 AND disabled_at IS NULL) \
            AND ($1::bigint IS NULL \
                 OR (created_at, id) < (timestamptz 'epoch' + $1::bigint * interval '1 microsecond', $2::uuid)) \
          ORDER BY created_at DESC, id DESC LIMIT $3",
@@ -143,12 +83,14 @@ pub async fn list_for(
     Ok(tenants(rows))
 }
 
-/// Insert a tenant and its first `admin` member.
+/// Insert a tenant with a freshly minted id (the configurator defines tenant ids) and its first
+/// `tenant_admin`. `None` when `first_admin_sub` already belongs to a tenant (one tenant per identity);
+/// the caller then drops the transaction, so the tenant is not created either.
 pub async fn create(
     tx: &mut PgConnection,
     name: &str,
     first_admin_sub: &str,
-) -> Result<Tenant, sqlx::Error> {
+) -> Result<Option<Tenant>, sqlx::Error> {
     let (id, name, created_at, ts_us) = sqlx::query_as::<_, (Uuid, String, String, i64)>(
         "INSERT INTO tenant (id, name) VALUES ($1, $2) \
          RETURNING id, name, to_jsonb(created_at) #>> '{}', \
@@ -158,99 +100,24 @@ pub async fn create(
     .bind(name)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO member (tenant, sub, role) VALUES ($1, $2, 'admin')")
-        .bind(id)
-        .bind(first_admin_sub)
-        .execute(&mut *tx)
-        .await?;
-    Ok(Tenant {
+    if users::add(&mut *tx, id, first_admin_sub, Role::TenantAdmin)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(Tenant {
         id,
         name,
         created_at,
         ts_us,
-    })
+    }))
 }
 
-fn members(rows: Vec<(String, String, String)>) -> Result<Vec<Member>, sqlx::Error> {
-    rows.into_iter()
-        .map(|(sub, r, created_at)| -> Result<Member, sqlx::Error> {
-            Ok(Member {
-                sub,
-                role: role(&r)?,
-                created_at,
-            })
-        })
-        .collect()
-}
-
-pub async fn list_members(db: &PgPool, tenant: Uuid) -> Result<Vec<Member>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT sub, role::text, to_jsonb(created_at) #>> '{}' FROM member \
-         WHERE tenant = $1 ORDER BY sub",
-    )
-    .bind(tenant)
-    .fetch_all(db)
-    .await?;
-    members(rows)
-}
-
-/// `None` when `sub` is already a member (nothing is written).
-pub async fn add_member(
-    tx: &mut PgConnection,
-    tenant: Uuid,
-    sub: &str,
-    r: Role,
-) -> Result<Option<Member>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, String)>(
-        "INSERT INTO member (tenant, sub, role) VALUES ($1, $2, $3::member_role) \
-         ON CONFLICT (tenant, sub) DO NOTHING \
-         RETURNING sub, role::text, to_jsonb(created_at) #>> '{}'",
-    )
-    .bind(tenant)
-    .bind(sub)
-    .bind(r.as_str())
-    .fetch_all(&mut *tx)
-    .await?;
-    Ok(members(rows)?.into_iter().next())
-}
-
-/// Lock the tenant's admin rows and return their subjects. Two concurrent removals of different
-/// admins serialise here, so the second sees the first's delete and cannot remove the last admin.
-pub async fn lock_admins(tx: &mut PgConnection, tenant: Uuid) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT sub FROM member WHERE tenant = $1 AND role = 'admin' ORDER BY sub FOR UPDATE",
-    )
-    .bind(tenant)
-    .fetch_all(&mut *tx)
-    .await
-}
-
-/// The member's row, locked; `None` when `sub` is not a member.
-pub async fn lock_member(
-    tx: &mut PgConnection,
-    tenant: Uuid,
-    sub: &str,
-) -> Result<Option<Member>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT sub, role::text, to_jsonb(created_at) #>> '{}' FROM member \
-         WHERE tenant = $1 AND sub = $2 FOR UPDATE",
-    )
-    .bind(tenant)
-    .bind(sub)
-    .fetch_all(&mut *tx)
-    .await?;
-    Ok(members(rows)?.into_iter().next())
-}
-
-pub async fn remove_member(
-    tx: &mut PgConnection,
-    tenant: Uuid,
-    sub: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM member WHERE tenant = $1 AND sub = $2")
-        .bind(tenant)
-        .bind(sub)
-        .execute(&mut *tx)
-        .await?;
-    Ok(())
+/// `true` when the tenant exists.
+pub async fn exists(db: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM tenant WHERE id = $1)")
+        .bind(id)
+        .fetch_one(db)
+        .await
 }

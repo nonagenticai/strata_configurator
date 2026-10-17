@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 const ROOT: &str = "root";
 
-/// A caller: a bearer token and the `X-Tenant-Id` it sends (if any).
+/// A caller: a bearer token and the `X-Active-Tenant-Id` it sends (if any; only the super-admin's
+/// counts).
 #[derive(Clone)]
 struct Who {
     tok: String,
@@ -22,7 +23,7 @@ struct Who {
 }
 
 impl Who {
-    /// The super-admin without `X-Tenant-Id` (platform view).
+    /// The super-admin without `X-Active-Tenant-Id` and without a workspace (platform view).
     fn root() -> Who {
         Who {
             tok: super_admin(ROOT),
@@ -30,10 +31,18 @@ impl Who {
         }
     }
 
-    /// `sub` (no realm roles) acting in `tenant`.
-    fn member(sub: &str, tenant: Uuid) -> Who {
+    /// `sub` (no client roles), acting in their own tenant (from `users`; no header).
+    fn member(sub: &str) -> Who {
         Who {
             tok: token(sub, &[]),
+            tenant: None,
+        }
+    }
+
+    /// The super-admin acting in `tenant` through `X-Active-Tenant-Id`.
+    fn root_in(tenant: Uuid) -> Who {
+        Who {
+            tok: super_admin(ROOT),
             tenant: Some(tenant),
         }
     }
@@ -44,7 +53,7 @@ impl Who {
             .uri(uri)
             .header("authorization", format!("Bearer {}", self.tok));
         if let Some(t) = self.tenant {
-            b = b.header("x-tenant-id", t.to_string());
+            b = b.header("x-active-tenant-id", t.to_string());
         }
         match body {
             Some(v) => b
@@ -74,7 +83,7 @@ impl Who {
     }
 }
 
-/// Super-admin creates a tenant whose first admin is `admin`; `members` are `(sub, role)`.
+/// Super-admin creates a tenant whose first `tenant_admin` is `admin`; `members` are `(sub, role)`.
 async fn tenant(app: &Router, name: &str, admin: &str, members: &[(&str, &str)]) -> Uuid {
     let (s, b) = Who::root()
         .send(
@@ -91,7 +100,7 @@ async fn tenant(app: &Router, name: &str, admin: &str, members: &[(&str, &str)])
             .send(
                 app,
                 "POST",
-                &format!("/api/tenants/{id}/members"),
+                &format!("/api/tenants/{id}/users"),
                 json!({"sub": sub, "role": role}),
             )
             .await;
@@ -175,10 +184,10 @@ fn code(b: &Value) -> &str {
 }
 
 #[tokio::test]
-async fn editor_writes_own_tenant_layer() {
+async fn tenant_admin_writes_own_tenant_layer() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[("ed", "editor")]).await;
-    let ed = Who::member("ed", a);
+    let a = tenant(&e.app, "Acme", "alice", &[("ed", "tenant_admin")]).await;
+    let ed = Who::member("ed");
 
     let (s, b) = ed
         .send(&e.app, "POST", "/api/layers", json!({"scope": "tenant"}))
@@ -188,7 +197,7 @@ async fn editor_writes_own_tenant_layer() {
     assert_eq!(
         b["tenant"],
         a.to_string(),
-        "the tenant comes from X-Tenant-Id"
+        "the tenant comes from the caller's users row"
     );
     let l = Uuid::parse_str(b["id"].as_str().unwrap()).unwrap();
     let (s, b) = ed
@@ -224,7 +233,7 @@ async fn editor_writes_own_tenant_layer() {
         .await
         .into_iter()
         .filter(|(_, t, _)| *t == Some(a))
-        .filter(|(_, _, act)| !act.starts_with("member") && !act.starts_with("tenant"))
+        .filter(|(_, _, act)| !act.starts_with("user") && !act.starts_with("tenant"))
         .collect();
     assert_eq!(
         events,
@@ -237,11 +246,11 @@ async fn editor_writes_own_tenant_layer() {
 }
 
 #[tokio::test]
-async fn viewer_cannot_write_403() {
+async fn tenant_user_cannot_write_403() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[("vic", "viewer")]).await;
-    let alice = Who::member("alice", a);
-    let vic = Who::member("vic", a);
+    tenant(&e.app, "Acme", "alice", &[("vic", "tenant_user")]).await;
+    let alice = Who::member("alice");
+    let vic = Who::member("vic");
     let l = layer(&e.app, &alice, json!({"scope": "tenant"})).await;
     add(&e.app, &alice, l, entity("Order", "Order")).await;
     let before = row_count(common::pool(&e)).await;
@@ -283,12 +292,12 @@ async fn viewer_cannot_write_403() {
 #[tokio::test]
 async fn tenant_cannot_write_platform_layer_403() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[]).await;
+    tenant(&e.app, "Acme", "alice", &[]).await;
     let root = Who::root();
     let base = layer(&e.app, &root, json!({"scope": "base"})).await;
     add(&e.app, &root, base, entity("Order", "Order")).await;
-    // the tenant's admin, the strongest tenant role
-    let alice = Who::member("alice", a);
+    // the tenant's tenant_admin, the strongest tenant role
+    let alice = Who::member("alice");
 
     let (s, b) = alice.get(&e.app, "/api/layers").await;
     assert_eq!(s, StatusCode::OK, "{b}");
@@ -329,14 +338,9 @@ async fn tenant_cannot_write_platform_layer_403() {
         let (s, b) = alice.send(&e.app, "POST", "/api/layers", body).await;
         assert_eq!((s, code(&b)), (StatusCode::FORBIDDEN, "forbidden"), "{b}");
     }
-    // a non-super-admin must name a tenant
-    let (s, b) = Who {
-        tok: token("alice", &[]),
-        tenant: None,
-    }
-    .get(&e.app, "/api/layers")
-    .await;
-    assert_eq!((s, code(&b)), (StatusCode::BAD_REQUEST, "tenant_required"));
+    // someone without a workspace sees nothing, platform layers included
+    let (s, b) = Who::member("nobody").get(&e.app, "/api/layers").await;
+    assert_eq!((s, code(&b)), (StatusCode::FORBIDDEN, "no_workspace"));
     let (s, b) = Who::root().get(&e.app, &rows_uri(base)).await;
     assert_eq!(items(&b).len(), 1, "{s} {b}");
     assert_eq!(items(&b)[0]["rev"], 1, "the platform row is untouched");
@@ -409,11 +413,8 @@ async fn super_admin_writes_base() {
         (json!(2), json!("patch"))
     );
 
-    // with X-Tenant-Id the super-admin acts as that tenant's admin
-    let as_a = Who {
-        tok: super_admin(ROOT),
-        tenant: Some(a),
-    };
+    // with X-Active-Tenant-Id the super-admin acts as that tenant's tenant_admin
+    let as_a = Who::root_in(a);
     let ta = layer(&e.app, &as_a, json!({"scope": "tenant"})).await;
     let (_, platform) = root.get(&e.app, "/api/layers").await;
     assert!(
@@ -570,8 +571,8 @@ async fn invalid_fields_400_lists_all() {
 #[tokio::test]
 async fn revision_history_kept() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[]).await;
-    let alice = Who::member("alice", a);
+    tenant(&e.app, "Acme", "alice", &[]).await;
+    let alice = Who::member("alice");
     let l = layer(&e.app, &alice, json!({"scope": "tenant"})).await;
     let order = row_uri(l, "entity", "Order");
 
@@ -646,9 +647,9 @@ async fn revision_history_kept() {
 #[tokio::test]
 async fn concurrent_put_one_wins() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[("ed", "editor")]).await;
-    let alice = Who::member("alice", a);
-    let ed = Who::member("ed", a);
+    tenant(&e.app, "Acme", "alice", &[("ed", "tenant_admin")]).await;
+    let alice = Who::member("alice");
+    let ed = Who::member("ed");
     let l = layer(&e.app, &alice, json!({"scope": "tenant"})).await;
     let order = row_uri(l, "entity", "Order");
     add(&e.app, &alice, l, entity("Order", "Order")).await;
@@ -736,12 +737,12 @@ async fn concurrent_put_one_wins() {
 #[tokio::test]
 async fn other_tenants_layer_is_404() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[]).await;
+    tenant(&e.app, "Acme", "alice", &[]).await;
     let b_t = tenant(&e.app, "Beta", "bob", &[]).await;
-    let bob = Who::member("bob", b_t);
+    let bob = Who::member("bob");
     let lb = layer(&e.app, &bob, json!({"scope": "tenant"})).await;
     add(&e.app, &bob, lb, entity("Order", "Bob's order")).await;
-    let alice = Who::member("alice", a);
+    let alice = Who::member("alice");
     let order = row_uri(lb, "entity", "Order");
 
     let probes: Vec<(&str, String, Option<Value>)> = vec![
@@ -771,18 +772,18 @@ async fn other_tenants_layer_is_404() {
         !ids(&list).contains(&lb.to_string()),
         "B's layer is not listed for A"
     );
-    // naming B's tenant without membership is a 403 on the header, before the layer is looked at
-    let (s, b) = Who::member("alice", b_t)
-        .get(&e.app, &format!("/api/layers/{lb}"))
-        .await;
-    assert_eq!((s, code(&b)), (StatusCode::FORBIDDEN, "not_a_member"));
+    // naming B's tenant in the header changes nothing for a non-super-admin: still acting in A
+    let (s, b) = Who {
+        tok: token("alice", &[]),
+        tenant: Some(b_t),
+    }
+    .get(&e.app, &format!("/api/layers/{lb}"))
+    .await;
+    assert_eq!((s, code(&b)), (StatusCode::NOT_FOUND, "layer_not_found"));
     // the super-admin's platform view holds no tenant layer; in B it sees B's
     let (s, _) = Who::root().get(&e.app, &format!("/api/layers/{lb}")).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-    let in_b = Who {
-        tok: super_admin(ROOT),
-        tenant: Some(b_t),
-    };
+    let in_b = Who::root_in(b_t);
     let (s, _) = in_b.get(&e.app, &format!("/api/layers/{lb}")).await;
     assert_eq!(s, StatusCode::OK);
 
@@ -801,8 +802,8 @@ async fn other_tenants_layer_is_404() {
 #[tokio::test]
 async fn retire_then_re_add() {
     let e = common::env().await;
-    let a = tenant(&e.app, "Acme", "alice", &[]).await;
-    let alice = Who::member("alice", a);
+    tenant(&e.app, "Acme", "alice", &[]).await;
+    let alice = Who::member("alice");
     let l = layer(&e.app, &alice, json!({"scope": "tenant"})).await;
     let order = row_uri(l, "entity", "Order");
     add(&e.app, &alice, l, entity("Order", "Order")).await;
@@ -990,12 +991,12 @@ async fn made_base(e: &common::TestEnv) -> String {
 async fn load_for_layers_returns_current_rows_of_exactly_those_layers() {
     let e = common::env().await;
     let a = tenant(&e.app, "Acme", "alice", &[]).await;
-    let b_t = tenant(&e.app, "Beta", "bob", &[]).await;
+    tenant(&e.app, "Beta", "bob", &[]).await;
     let root = Who::root();
-    let alice = Who::member("alice", a);
+    let alice = Who::member("alice");
     let base = layer(&e.app, &root, json!({"scope": "base"})).await;
     let la = layer(&e.app, &alice, json!({"scope": "tenant"})).await;
-    let lb = layer(&e.app, &Who::member("bob", b_t), json!({"scope": "tenant"})).await;
+    let lb = layer(&e.app, &Who::member("bob"), json!({"scope": "tenant"})).await;
     add(&e.app, &root, base, entity("Order", "Order")).await;
     add(&e.app, &root, base, entity("Customer", "Customer")).await;
     let (s, _) = root
@@ -1023,7 +1024,7 @@ async fn load_for_layers_returns_current_rows_of_exactly_those_layers() {
     .await;
     add(
         &e.app,
-        &Who::member("bob", b_t),
+        &Who::member("bob"),
         lb,
         entity("Order", "Beta order"),
     )
