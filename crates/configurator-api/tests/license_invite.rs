@@ -33,6 +33,8 @@ struct Mock {
     introspected: Vec<String>,
     /// The licence create answers 503 while set.
     issue_down: bool,
+    /// The token mint answers 503 while set (after the licence was created).
+    mint_down: bool,
     /// (tenant header, holder sub) of every licence created.
     issued: Vec<(String, String)>,
     revoked: Vec<String>,
@@ -169,9 +171,12 @@ async fn create_licence(
     Json(json!({"license_id": "lic-1", "subject_id": "subject-1"})).into_response()
 }
 
-async fn mint(h: HeaderMap, Path(id): Path<String>) -> Response {
+async fn mint(State(m): State<Shared>, h: HeaderMap, Path(id): Path<String>) -> Response {
     if !authed(&h) || id != "lic-1" {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if lock(&m).mint_down {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     Json(json!({"token": format!("tok-{}", tenant_header(&h))})).into_response()
 }
@@ -529,6 +534,38 @@ async fn failed_issuance_fails_the_create() {
 }
 
 #[tokio::test]
+async fn a_failed_mint_revokes_the_created_licence() {
+    let up = upstream().await;
+    lock(&up.mock).mint_down = true;
+    let e = common::env_with(&up.licensing()).await;
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_GATEWAY, &json!("licences_unavailable"))
+    );
+    {
+        let g = lock(&up.mock);
+        assert_eq!(g.issued.len(), 1, "the licence was created: {:?}", g.issued);
+        assert_eq!(
+            g.revoked,
+            ["lic-1"],
+            "the licence whose token could not be minted is revoked, once"
+        );
+    }
+    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant")
+        .fetch_one(common::pool(&e))
+        .await
+        .unwrap();
+    assert_eq!(tenants, 0, "the tenant was not created");
+}
+
+#[tokio::test]
 async fn an_active_licence_passes_and_is_cached() {
     let (up, e, t) = licensed().await;
     for _ in 0..3 {
@@ -609,6 +646,42 @@ async fn an_expired_licence_is_402() {
         (s, code(&b)),
         (StatusCode::PAYMENT_REQUIRED, &json!("license_expired"))
     );
+
+    // the shape licences sends (Python isoformat of a timestamptz, with microseconds), in a fresh
+    // environment so the answer above is not reused from the cache
+    let (up, e, t) = licensed().await;
+    up.set_introspection(json!({
+        "active": true, "tenant_id": t, "app": {"key": "strata-configurator"},
+        "expires_at": "2026-01-01T00:00:00.123456+00:00"
+    }));
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::PAYMENT_REQUIRED, &json!("license_expired"))
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_expiry_is_402_and_not_cached() {
+    let (up, e, t) = licensed().await;
+    up.set_introspection(json!({
+        "active": true, "tenant_id": t, "app": {"key": "strata-configurator"},
+        "expires_at": "not-a-timestamp"
+    }));
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::PAYMENT_REQUIRED, &json!("license_unreadable")),
+        "a present but unparseable expiry is not \"no expiry\""
+    );
+    // that answer was not cached: once licences sends a readable expiry, the request passes
+    up.set_introspection(json!({
+        "active": true, "tenant_id": t, "app": {"key": "strata-configurator"},
+        "expires_at": "2999-01-01T00:00:00+00:00"
+    }));
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(lock(&up.mock).introspected.len(), 2, "introspected again");
 }
 
 #[tokio::test]

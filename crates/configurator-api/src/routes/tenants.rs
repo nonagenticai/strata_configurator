@@ -11,6 +11,7 @@ use axum::routing::{get, patch};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::audit;
@@ -159,8 +160,9 @@ fn last_admin() -> ApiError {
 /// With licence issuance configured, the licence is issued for the new id, held by the first admin,
 /// BEFORE the transaction, and stored in it. As in commonpractice (`tenant-service.ts` `createTenant`),
 /// a failed issuance fails the create: 502 `licences_unavailable`, nothing is created, and the failure
-/// is audited as `license.issue_failed`. A licence issued for a create that then does not commit is
-/// revoked again.
+/// is audited as `license.issue_failed`. A licence issued for a create that fails before its commit is
+/// revoked again; when the commit itself fails it may still have landed, so the licence is kept and
+/// the pair logged for reconciliation by hand (revoking could leave a live tenant unlicensed).
 async fn create(
     State(st): State<AppState>,
     caller: Caller,
@@ -212,7 +214,7 @@ async fn create(
         }
     };
 
-    let created = insert_tenant(
+    let staged = insert_tenant(
         &st,
         &caller.sub,
         id,
@@ -221,24 +223,44 @@ async fn create(
         licence.as_ref(),
     )
     .await;
-    if !matches!(created, Ok(Some(_)))
-        && let (Some(la), Some(l)) = (st.licenses_admin.as_deref(), &licence)
-    {
-        // The tenant was not created: give back the licence minted for it.
-        if let Err(e) = la.revoke(id, &l.license_id).await {
-            tracing::error!(tenant = %id, license_id = %l.license_id, error = %e,
-                "could not revoke the licence of a tenant that was not created; revoke it by hand");
+    let (t, tx) = match staged {
+        Ok(Some(staged)) => staged,
+        Ok(None) => {
+            give_back(&st, id, licence.as_ref()).await;
+            kept_identity(&first_admin_sub, invited);
+            return Err(user_exists(&first_admin_sub));
         }
-    }
-    let Some(t) = created? else {
-        kept_identity(&first_admin_sub, invited);
-        return Err(user_exists(&first_admin_sub));
+        Err(e) => {
+            give_back(&st, id, licence.as_ref()).await;
+            return Err(e);
+        }
     };
+    if let Err(e) = tx.commit().await {
+        // The commit may have landed even though it reported an error: revoking here could leave a
+        // live tenant without its licence, so keep it and leave the pair for a person to reconcile.
+        if let Some(l) = &licence {
+            tracing::error!(tenant = %id, license_id = %l.license_id, error = %e,
+                "tenant create commit failed and may have landed; licence NOT revoked, reconcile by hand");
+        }
+        return Err(ApiError::from(e));
+    }
     Ok((StatusCode::CREATED, Json(json!(t))))
 }
 
-/// The tenant, its first admin, its licence (when one was issued) and their audit events, in one
-/// owner transaction. `None` when the first admin already belongs to a tenant.
+/// Revoke the licence issued for tenant `id`, whose create failed before its commit (best effort; a
+/// failed revoke is logged for cleanup by hand).
+async fn give_back(st: &AppState, id: Uuid, licence: Option<&Issued>) {
+    if let (Some(la), Some(l)) = (st.licenses_admin.as_deref(), licence)
+        && let Err(e) = la.revoke(id, &l.license_id).await
+    {
+        tracing::error!(tenant = %id, license_id = %l.license_id, error = %e,
+            "could not revoke the licence of a tenant that was not created; revoke it by hand");
+    }
+}
+
+/// The tenant, its first admin, its licence (when one was issued) and their audit events, staged in
+/// one owner transaction that the caller commits (so it can tell a commit failure, which may have
+/// landed, from a failure before it). `None` when the first admin already belongs to a tenant.
 async fn insert_tenant(
     st: &AppState,
     actor: &str,
@@ -246,7 +268,7 @@ async fn insert_tenant(
     name: &str,
     first_admin_sub: &str,
     licence: Option<&Issued>,
-) -> Result<Option<tenants::Tenant>, ApiError> {
+) -> Result<Option<(tenants::Tenant, Transaction<'static, Postgres>)>, ApiError> {
     let mut tx = st.owner.begin().await?;
     let Some(t) = tenants::create(&mut tx, id, name, first_admin_sub).await? else {
         return Ok(None);
@@ -277,8 +299,7 @@ async fn insert_tenant(
         )
         .await?;
     }
-    tx.commit().await?;
-    Ok(Some(t))
+    Ok(Some((t, tx)))
 }
 
 #[derive(Deserialize)]

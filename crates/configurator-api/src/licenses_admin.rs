@@ -242,31 +242,49 @@ impl LicensesAdmin {
             .license_id
             .or(l.id)
             .ok_or_else(|| UpstreamError::new(None, "licences create licence: no license_id"))?;
+        // From here the licence exists: a failure must not leave it live without a tenant to hold it.
         // Never substitute the Keycloak `sub`: they are different identifiers.
-        let subject_id = l
-            .subject_id
-            .ok_or_else(|| UpstreamError::new(None, "licences create licence: no subject_id"))?;
+        let Some(subject_id) = l.subject_id else {
+            let err = UpstreamError::new(None, "licences create licence: no subject_id");
+            return Err(self.abandon(tenant, &license_id, err).await);
+        };
+        let token = match self.mint(tenant, &license_id).await {
+            Ok(t) => t,
+            Err(err) => return Err(self.abandon(tenant, &license_id, err).await),
+        };
+        Ok(Issued {
+            license_id,
+            subject_id,
+            token,
+        })
+    }
 
+    /// Mint `license_id`'s opaque token.
+    async fn mint(&self, tenant: Uuid, license_id: &str) -> Result<String, UpstreamError> {
         let what = "licences mint token";
         let resp = self
             .send(
                 self.http
-                    .post(self.url(&format!("licenses/{}/tokens", encode(&license_id))))
+                    .post(self.url(&format!("licenses/{}/tokens", encode(license_id))))
                     .json(&json!({})),
                 Some(tenant),
                 what,
             )
             .await?;
         let t: WireToken = Self::ok_json(resp, what).await?;
-        let token = t
-            .token
+        t.token
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| UpstreamError::new(None, "licences mint token: no token"))?;
-        Ok(Issued {
-            license_id,
-            subject_id,
-            token,
-        })
+            .ok_or_else(|| UpstreamError::new(None, "licences mint token: no token"))
+    }
+
+    /// Issuance failed after `license_id` was created: revoke it (best effort; a failed revoke is
+    /// logged for manual cleanup) and hand back `err`, the failure that stopped the issuance.
+    async fn abandon(&self, tenant: Uuid, license_id: &str, err: UpstreamError) -> UpstreamError {
+        if let Err(e) = self.revoke(tenant, license_id).await {
+            tracing::error!(%tenant, %license_id, error = %e,
+                "could not revoke a licence whose issuance failed; revoke it by hand");
+        }
+        err
     }
 
     /// Revoke a licence by id. Licences answers 200 `{"revoked": false}` for an unknown licence or a
