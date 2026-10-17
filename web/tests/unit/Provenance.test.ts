@@ -14,7 +14,7 @@ it('renders origins in layer order with op labels and row links', () => {
 	expect(links.map((l) => l.textContent?.trim())).toEqual([
 		'base add',
 		'industry/retail patch',
-		'tenant/tenant patch',
+		'tenant patch',
 	]);
 	expect(links[1]?.getAttribute('href')).toBe('/layers?row=two');
 });

@@ -54,6 +54,35 @@ async fn counts(pool: &PgPool) -> Vec<(&'static str, i64)> {
 }
 
 #[tokio::test]
+async fn migration_upgrade_preserves_existing_seed_data() {
+    let pool = common::empty_pool().await;
+    let first = sqlx::migrate::Migrator::with_migrations(
+        configurator_api::db::MIGRATOR
+            .iter()
+            .take(1)
+            .cloned()
+            .collect(),
+    );
+    first.run(&pool).await.unwrap();
+    seeder::apply(&pool, &seeder::embedded().unwrap())
+        .await
+        .unwrap();
+    let before = counts(&pool).await;
+    configurator_api::db::migrate(&pool).await.unwrap();
+    assert_eq!(counts(&pool).await, before);
+    let indexed: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.member_sub_idx') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(indexed);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM _sqlx_migrations").await,
+        configurator_api::db::MIGRATOR.iter().count() as i64
+    );
+}
+
+#[tokio::test]
 async fn migrations_apply_on_empty_db() {
     let pool = common::empty_pool().await;
     configurator_api::db::migrate(&pool)

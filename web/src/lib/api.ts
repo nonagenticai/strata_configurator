@@ -104,7 +104,15 @@ export async function all<T>(
 	return items;
 }
 export function layerLabel(l: Layer): string {
-	return [l.scope, l.industry, l.department, l.job, l.rule, l.dimension?.join('='), l.tenant ? 'tenant' : '']
+	return [
+		l.scope,
+		l.industry,
+		l.department,
+		l.job,
+		l.rule,
+		l.dimension?.join('='),
+		l.tenant && l.scope !== 'tenant' ? 'tenant' : '',
+	]
 		.filter(Boolean)
 		.join('/');
 }
