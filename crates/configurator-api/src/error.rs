@@ -26,6 +26,12 @@ pub enum ApiError {
     MethodNotAllowed,
     #[error("{1}")]
     Unavailable(&'static str, String),
+    /// 402 with its own code: licence gate 2 denied the tenant (e.g. `license_inactive`).
+    #[error("{1}")]
+    PaymentRequired(&'static str, String),
+    /// 502 with its own code: an upstream this request needed failed (e.g. `keycloak_admin_failed`).
+    #[error("{1}")]
+    BadGateway(&'static str, String),
     /// An error that lists every item at fault: `{"error":{"code","message"},"errors":[…]}`
     /// (e.g. 400 `invalid_fields` with each field error).
     #[error("{message}")]
@@ -52,6 +58,8 @@ impl ApiError {
             ApiError::Conflict(c, _) => (StatusCode::CONFLICT, *c),
             ApiError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             ApiError::Unavailable(c, _) => (StatusCode::SERVICE_UNAVAILABLE, *c),
+            ApiError::PaymentRequired(c, _) => (StatusCode::PAYMENT_REQUIRED, *c),
+            ApiError::BadGateway(c, _) => (StatusCode::BAD_GATEWAY, *c),
             ApiError::Detailed { status, code, .. } => (*status, *code),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }

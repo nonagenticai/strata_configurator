@@ -6,6 +6,9 @@ use uuid::Uuid;
 use crate::auth::Verifier;
 use crate::config::Config;
 use crate::db;
+use crate::keycloak_admin::KeycloakAdmin;
+use crate::license::LicenseGate;
+use crate::licenses_admin::LicensesAdmin;
 
 /// Whether the seed versions applied cleanly at startup (spec section 4.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +33,12 @@ pub struct AppState {
     pub seed: Arc<RwLock<SeedStatus>>,
     /// Bearer-token verifier: Keycloak's JWKS in production; tests swap in a static key.
     pub auth: Arc<Verifier>,
+    /// The portal-realm admin SA that invites people by email; `None` when not configured.
+    pub keycloak_admin: Option<Arc<KeycloakAdmin>>,
+    /// Licence gate 2 (a no-op unless `LICENSE_GATE_2_ENABLED`).
+    pub license: Arc<LicenseGate>,
+    /// The `secure-apps` SA that issues tenant licences; `None` when not configured.
+    pub licenses_admin: Option<Arc<LicensesAdmin>>,
 }
 
 impl AppState {
@@ -39,6 +48,26 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(8))
             .build()
             .unwrap_or_default();
+        let keycloak_admin = cfg
+            .keycloak_admin
+            .as_ref()
+            .map(|k| Arc::new(KeycloakAdmin::new(k, http.clone())));
+        let license = Arc::new(LicenseGate::new(cfg.license_gate.clone(), http.clone()));
+        // Licences record the realm the holder signs in with: the last segment of the issuer.
+        let realm = cfg
+            .keycloak_issuer
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        let licenses_admin = cfg.licenses_admin.as_ref().map(|l| {
+            Arc::new(LicensesAdmin::new(
+                l,
+                &cfg.license_gate.app_key,
+                realm,
+                http.clone(),
+            ))
+        });
         let auth = Arc::new(Verifier::jwks(
             &cfg.keycloak_issuer,
             &cfg.keycloak_audience,
@@ -51,6 +80,9 @@ impl AppState {
             owner,
             seed: Arc::new(RwLock::new(SeedStatus::Ready)),
             auth,
+            keycloak_admin,
+            license,
+            licenses_admin,
         }
     }
 

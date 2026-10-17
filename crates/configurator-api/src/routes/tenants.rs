@@ -1,4 +1,9 @@
 //! Tenants and their users (spec sections 10.1 and 10.2, rev 3). One tenant per identity.
+//!
+//! People are named by `sub`, or by email to invite them (W1.1): the email resolves to the portal-realm
+//! identity through the `strata-configurator-admin` SA (found, else created and sent Keycloak's action
+//! email), whose id is the `sub`. Keycloak is called before any transaction opens (no network inside a
+//! transaction). A tenant created while licence issuance is configured gets its licence first (W2.2).
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -6,11 +11,13 @@ use axum::routing::{get, patch};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::audit;
 use crate::auth::{Caller, require_super_admin};
-use crate::db::{tenants, users};
+use crate::db::{licenses, tenants, users};
 use crate::error::ApiError;
+use crate::licenses_admin::{Issued, registry_name};
 use crate::page::{self, Paged, TimeCursor};
 use crate::state::AppState;
 use crate::tenancy::{self, Role, TenantCtx};
@@ -49,12 +56,78 @@ fn clean(field: &'static str, v: &str, max: usize) -> Result<String, ApiError> {
 
 const MAX_NAME: usize = 200;
 const MAX_SUB: usize = 255;
+const MAX_EMAIL: usize = 254;
+
+/// `v` as an email address: [`clean`], then one `@` with a non-empty local part and a dotted domain,
+/// and no whitespace. Keycloak checks the rest.
+fn email_address(field: &'static str, v: &str) -> Result<String, ApiError> {
+    let e = clean(field, v, MAX_EMAIL)?;
+    let ok = !e.chars().any(char::is_whitespace)
+        && e.matches('@').count() == 1
+        && e.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        });
+    if !ok {
+        return Err(ApiError::BadRequest(
+            "invalid_body",
+            format!("{field} must be an email address"),
+        ));
+    }
+    Ok(e)
+}
+
+/// The person a body names, by exactly one of `sub` (as given) or `email` (400 `invalid_body`
+/// otherwise). An email is resolved in Keycloak: the existing identity (no email sent), else a new one
+/// that is sent the action email; 503 `invite_unavailable` when the admin SA is not configured, 502
+/// `keycloak_admin_failed` when Keycloak fails. Returns the `sub` and whether this call created it.
+async fn subject(
+    st: &AppState,
+    (sub_field, sub): (&'static str, Option<String>),
+    (email_field, email): (&'static str, Option<String>),
+) -> Result<(String, bool), ApiError> {
+    match (sub, email) {
+        (Some(s), None) => Ok((clean(sub_field, &s, MAX_SUB)?, false)),
+        (None, Some(e)) => {
+            let e = email_address(email_field, &e)?;
+            let Some(kc) = st.keycloak_admin.as_deref() else {
+                return Err(ApiError::Unavailable(
+                    "invite_unavailable",
+                    "inviting by email is not configured here; give a sub".into(),
+                ));
+            };
+            let invited = kc.find_or_invite(&e).await.map_err(|err| {
+                tracing::error!(error = %err, "keycloak invite failed");
+                ApiError::BadGateway(
+                    "keycloak_admin_failed",
+                    "the identity provider did not complete the invite".into(),
+                )
+            })?;
+            Ok((clean(sub_field, &invited.sub, MAX_SUB)?, invited.created))
+        }
+        _ => Err(ApiError::BadRequest(
+            "invalid_body",
+            format!("give exactly one of {sub_field} and {email_field}"),
+        )),
+    }
+}
+
+/// The DB insert after a new identity was invited failed: the identity stays (it is shared with every
+/// app in the portal realm and may be wanted elsewhere), so say so.
+fn kept_identity(sub: &str, created: bool) {
+    if created {
+        tracing::warn!(%sub, "invited keycloak identity kept although the user was not added");
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewTenant {
     name: String,
-    first_admin_sub: String,
+    first_admin_sub: Option<String>,
+    first_admin_email: Option<String>,
 }
 
 fn user_exists(sub: &str) -> ApiError {
@@ -78,9 +151,16 @@ fn last_admin() -> ApiError {
     )
 }
 
-/// Super-admin only: mint the tenant id, create the tenant and its first `tenant_admin` in one
-/// transaction (owner pool: platform work), audited. 409 `user_exists` when `first_admin_sub` already
-/// belongs to a tenant; then nothing is created. Audit events name the caller by token `sub`.
+/// Super-admin only: mint the tenant id, create the tenant and its first `tenant_admin` (by
+/// `first_admin_sub`, or invited by `first_admin_email`) in one transaction (owner pool: platform work),
+/// audited. 409 `user_exists` when the first admin already belongs to a tenant; then nothing is
+/// created. Audit events name the caller by token `sub`.
+///
+/// With licence issuance configured, the licence is issued for the new id, held by the first admin,
+/// BEFORE the transaction, and stored in it. As in commonpractice (`tenant-service.ts` `createTenant`),
+/// a failed issuance fails the create: 502 `licences_unavailable`, nothing is created, and the failure
+/// is audited as `license.issue_failed`. A licence issued for a create that then does not commit is
+/// revoked again.
 async fn create(
     State(st): State<AppState>,
     caller: Caller,
@@ -89,17 +169,92 @@ async fn create(
     require_super_admin(&caller)?;
     let Json(b) = body?;
     let name = clean("name", &b.name, MAX_NAME)?;
-    let first_admin_sub = clean("first_admin_sub", &b.first_admin_sub, MAX_SUB)?;
-    let mut tx = st.owner.begin().await?;
-    let Some(t) = tenants::create(&mut tx, &name, &first_admin_sub).await? else {
+    let (first_admin_sub, invited) = subject(
+        &st,
+        ("first_admin_sub", b.first_admin_sub),
+        ("first_admin_email", b.first_admin_email),
+    )
+    .await?;
+    let id = Uuid::new_v4();
+
+    let licence = match st.licenses_admin.as_deref() {
+        None => None,
+        Some(la) => {
+            // Refuse a taken identity before a licence is minted for a tenant that would not exist.
+            if users::exists(&st.db, &first_admin_sub).await? {
+                kept_identity(&first_admin_sub, invited);
+                return Err(user_exists(&first_admin_sub));
+            }
+            match la
+                .issue(id, &registry_name(&name, id), &first_admin_sub)
+                .await
+            {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    tracing::error!(tenant = %id, error = %e, "licence issuance failed; tenant not created");
+                    let attempted = json!({"tenant": id, "holder_sub": first_admin_sub});
+                    audit::record(
+                        &mut *st.owner.acquire().await?,
+                        &caller.sub,
+                        Some(id),
+                        "license.issue_failed",
+                        &format!("tenant:{id}"),
+                        None,
+                        Some(&attempted),
+                    )
+                    .await?;
+                    return Err(ApiError::BadGateway(
+                        "licences_unavailable",
+                        "licensing the new tenant failed, so it was not created".into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let created = insert_tenant(
+        &st,
+        &caller.sub,
+        id,
+        &name,
+        &first_admin_sub,
+        licence.as_ref(),
+    )
+    .await;
+    if !matches!(created, Ok(Some(_)))
+        && let (Some(la), Some(l)) = (st.licenses_admin.as_deref(), &licence)
+    {
+        // The tenant was not created: give back the licence minted for it.
+        if let Err(e) = la.revoke(id, &l.license_id).await {
+            tracing::error!(tenant = %id, license_id = %l.license_id, error = %e,
+                "could not revoke the licence of a tenant that was not created; revoke it by hand");
+        }
+    }
+    let Some(t) = created? else {
+        kept_identity(&first_admin_sub, invited);
         return Err(user_exists(&first_admin_sub));
     };
-    // W1.1: invite `first_admin_sub` in Keycloak through the strata-configurator-admin SA (needs the
-    // gitops SA first).
+    Ok((StatusCode::CREATED, Json(json!(t))))
+}
+
+/// The tenant, its first admin, its licence (when one was issued) and their audit events, in one
+/// owner transaction. `None` when the first admin already belongs to a tenant.
+async fn insert_tenant(
+    st: &AppState,
+    actor: &str,
+    id: Uuid,
+    name: &str,
+    first_admin_sub: &str,
+    licence: Option<&Issued>,
+) -> Result<Option<tenants::Tenant>, ApiError> {
+    let mut tx = st.owner.begin().await?;
+    let Some(t) = tenants::create(&mut tx, id, name, first_admin_sub).await? else {
+        return Ok(None);
+    };
     let after = json!({"tenant": t, "first_admin_sub": first_admin_sub});
     audit::record(
         &mut tx,
-        &caller.sub,
+        actor,
         Some(t.id),
         "tenant.create",
         &format!("tenant:{}", t.id),
@@ -107,8 +262,23 @@ async fn create(
         Some(&after),
     )
     .await?;
+    if let Some(l) = licence {
+        licenses::store(&mut tx, t.id, l, first_admin_sub).await?;
+        let after = json!({"tenant": t.id, "license_id": l.license_id, "subject_id": l.subject_id,
+                           "holder_sub": first_admin_sub});
+        audit::record(
+            &mut tx,
+            actor,
+            Some(t.id),
+            "license.issue",
+            &format!("license:{}", l.license_id),
+            None,
+            Some(&after),
+        )
+        .await?;
+    }
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(json!(t))))
+    Ok(Some(t))
 }
 
 #[derive(Deserialize)]
@@ -155,12 +325,14 @@ async fn list_users(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewUser {
-    sub: String,
+    sub: Option<String>,
+    email: Option<String>,
     role: Role,
 }
 
-/// Add a user; 409 `user_exists` when `sub` already belongs to a tenant, this one or another (one
-/// tenant per identity; roles are changed with PATCH).
+/// Add a user by `sub`, or invite one by `email` (see [`subject`]); 409 `user_exists` when the person
+/// already belongs to a tenant, this one or another (one tenant per identity; roles are changed with
+/// PATCH). An identity invited for an add that then fails is kept (logged), never deleted.
 async fn add_user(
     State(st): State<AppState>,
     caller: Caller,
@@ -169,13 +341,12 @@ async fn add_user(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let ctx = admin_of(&st, caller, &id).await?;
     let Json(b) = body?;
-    let sub = clean("sub", &b.sub, MAX_SUB)?;
+    let (sub, invited) = subject(&st, ("sub", b.sub), ("email", b.email)).await?;
     let mut tx = st.db.begin().await?;
     let Some(u) = users::add(&mut tx, ctx.tenant, &sub, b.role).await? else {
+        kept_identity(&sub, invited);
         return Err(user_exists(&sub));
     };
-    // W1.1: invite `sub` in Keycloak through the strata-configurator-admin SA (needs the gitops SA
-    // first).
     let after = json!({"tenant": ctx.tenant, "sub": u.sub, "role": u.role});
     audit::record(
         &mut tx,
@@ -234,7 +405,8 @@ async fn change_role(
 }
 
 /// Disable an active user (the row stays, so the identity stays bound to this tenant); 409
-/// `last_admin` when that would leave no active `tenant_admin`.
+/// `last_admin` when that would leave no active `tenant_admin`. The Keycloak identity is NOT disabled:
+/// the portal realm is shared, and the same person may use other apps.
 async fn disable_user(
     State(st): State<AppState>,
     caller: Caller,

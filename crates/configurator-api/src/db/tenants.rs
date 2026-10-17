@@ -83,11 +83,13 @@ pub async fn list_for(
     Ok(tenants(rows))
 }
 
-/// Insert a tenant with a freshly minted id (the configurator defines tenant ids) and its first
-/// `tenant_admin`. `None` when `first_admin_sub` already belongs to a tenant (one tenant per identity);
-/// the caller then drops the transaction, so the tenant is not created either.
+/// Insert the tenant `id` (minted by the caller with `Uuid::new_v4`: the configurator defines tenant
+/// ids, and the licence is issued for the id before it is inserted) and its first `tenant_admin`.
+/// `None` when `first_admin_sub` already belongs to a tenant (one tenant per identity); the caller then
+/// drops the transaction, so the tenant is not created either.
 pub async fn create(
     tx: &mut PgConnection,
+    id: Uuid,
     name: &str,
     first_admin_sub: &str,
 ) -> Result<Option<Tenant>, sqlx::Error> {
@@ -96,7 +98,7 @@ pub async fn create(
          RETURNING id, name, to_jsonb(created_at) #>> '{}', \
                    (extract(epoch FROM created_at) * 1000000)::bigint",
     )
-    .bind(Uuid::new_v4())
+    .bind(id)
     .bind(name)
     .fetch_one(&mut *tx)
     .await?;

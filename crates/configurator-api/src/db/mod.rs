@@ -102,6 +102,7 @@ pub async fn tenant_tx(
 pub mod axes;
 pub mod dimensions;
 pub mod layers;
+pub mod licenses;
 pub mod profiles;
 pub mod rows;
 pub mod tenants;

@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod compile;
 pub mod health;
 pub mod layers;
+pub mod license;
 pub mod me;
 pub mod platform;
 pub mod tenants;
@@ -18,6 +19,7 @@ pub fn router(state: AppState) -> Router {
         .merge(compile::routes())
         .merge(platform::routes())
         .merge(me::routes())
+        .merge(license::routes())
         .merge(tenants::routes())
         .merge(layers::routes())
         .fallback(error::fallback)

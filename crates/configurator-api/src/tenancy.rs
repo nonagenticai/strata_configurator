@@ -2,6 +2,10 @@
 //! authenticates; the tenant and tenant role of a person come from this service's `users` table, one
 //! tenant per identity. Only the super-admin can act elsewhere, by naming a tenant in
 //! `X-Active-Tenant-Id`; every such switch is audited.
+//!
+//! Licence gate 2 ([`license::check`]) runs here, where a caller's tenant is resolved, rather than as
+//! a router layer: a path cannot tell tenant work from platform work, the tenant is only known here,
+//! and the super-admin (platform staff, never a seat) is exempt (plan 2026-10-17 W2.1).
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
@@ -12,6 +16,7 @@ use crate::audit;
 use crate::auth::Caller;
 use crate::db::{tenants, users};
 use crate::error::ApiError;
+use crate::license;
 use crate::state::AppState;
 
 /// The super-admin's tenant switch. Ignored for everyone else.
@@ -130,7 +135,8 @@ pub fn active_tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiErro
 /// Who the request acts as.
 ///
 /// - Anyone but the super-admin: their own tenant and role from `users`; no row, or a disabled one, is
-///   403 `no_workspace`. `X-Active-Tenant-Id` is ignored, so it cannot be used to probe tenants.
+///   403 `no_workspace`. `X-Active-Tenant-Id` is ignored, so it cannot be used to probe tenants. Then
+///   licence gate 2 (402/403 `license_*` when it is enabled and the tenant is not licensed).
 /// - The super-admin: the header's tenant (400 `invalid_tenant` when malformed, 404 `tenant_not_found`
 ///   when unknown) as `tenant_admin`, audited as `tenant.scope_switch` unless it is their own tenant;
 ///   without the header their own tenant if they have one, else the platform view.
@@ -139,6 +145,7 @@ pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acti
         let (tenant, role) = users::home(&st.db, &caller.sub)
             .await?
             .ok_or_else(no_workspace)?;
+        license::check(st, tenant).await?;
         return Ok(Acting::Tenant(TenantCtx {
             caller,
             tenant,
@@ -194,6 +201,7 @@ pub async fn in_tenant(st: &AppState, caller: Caller, tenant: Uuid) -> Result<Te
     if home != tenant {
         return Err(tenant_not_found(tenant));
     }
+    license::check(st, tenant).await?;
     Ok(TenantCtx {
         caller,
         tenant,

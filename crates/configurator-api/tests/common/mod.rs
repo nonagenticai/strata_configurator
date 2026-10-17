@@ -229,12 +229,26 @@ pub async fn enable_app_role(owner: &PgPool, owner_url: &str) -> String {
 }
 
 pub fn test_config(database_url: String, migrate_database_url: String) -> Config {
-    Config::from_lookup(|k| match k {
-        "DATABASE_URL" => Some(database_url.clone()),
-        "MIGRATE_DATABASE_URL" => Some(migrate_database_url.clone()),
-        "KEYCLOAK_ISSUER" => Some(TEST_ISSUER.into()),
-        "KEYCLOAK_JWKS_URL" => Some("https://issuer.test/certs".into()),
-        _ => None,
+    test_config_with(database_url, migrate_database_url, &[])
+}
+
+/// [`test_config`] plus `extra` settings (e.g. the admin SAs and licence gate pointed at a local mock).
+pub fn test_config_with(
+    database_url: String,
+    migrate_database_url: String,
+    extra: &[(&str, String)],
+) -> Config {
+    Config::from_lookup(|k| {
+        if let Some((_, v)) = extra.iter().find(|(key, _)| *key == k) {
+            return Some(v.clone());
+        }
+        match k {
+            "DATABASE_URL" => Some(database_url.clone()),
+            "MIGRATE_DATABASE_URL" => Some(migrate_database_url.clone()),
+            "KEYCLOAK_ISSUER" => Some(TEST_ISSUER.into()),
+            "KEYCLOAK_JWKS_URL" => Some("https://issuer.test/certs".into()),
+            _ => None,
+        }
     })
     .expect("test config")
 }
@@ -242,6 +256,11 @@ pub fn test_config(database_url: String, migrate_database_url: String) -> Config
 /// A migrated fresh database (no seeds) and the router over it. As in production, requests run as
 /// `configurator_app` (under RLS) and the owner pool is the superuser that migrated.
 pub async fn env() -> TestEnv {
+    env_with(&[]).await
+}
+
+/// [`env`] with `extra` settings.
+pub async fn env_with(extra: &[(&str, String)]) -> TestEnv {
     let owner_url = database().await;
     let owner = db::connect(&owner_url)
         .await
@@ -254,7 +273,7 @@ pub async fn env() -> TestEnv {
     db::assert_runtime_role(&runtime)
         .await
         .expect("the runtime pool is under RLS");
-    let cfg = test_config(app_url, owner_url);
+    let cfg = test_config_with(app_url, owner_url, extra);
     let verifier = Verifier::static_key(
         &cfg.keycloak_issuer,
         &cfg.keycloak_audience,

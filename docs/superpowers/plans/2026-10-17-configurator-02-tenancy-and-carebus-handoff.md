@@ -102,6 +102,7 @@ Each workstream is one PR per repo (PR discipline). Rust is verified in CI only 
    - `TenantCtx` comes from `users` by `sub`; for `super_admin` it comes from `X-Active-Tenant-Id` (bare non-nil uuid, audited switch);
    - replace `member` with `users(sub pk, tenant_id, tenant_role tenant_admin|tenant_user)`, one tenant per user; the user routes become invite (creates the Keycloak identity through the admin SA), change role, and disable. Tenant creation (super-admin, or early-access approval) mints the tenant uuid: the configurator defines tenant ids (§3);
    - migration `0003`, forward-only, since pre-prod.
+   - **Landed (API, dark):** invite by `email` on `POST /api/tenants` (`first_admin_email`) and `POST /api/tenants/{id}/users` via the `strata-configurator-admin` SA (`src/keycloak_admin.rs`, `KEYCLOAK_ADMIN_*`); find-or-create, action email only for a new identity, no realm roles or attributes written. Still needed: the gitops realm patch that creates the SA, and its secret.
 3. RLS:
    - add a non-bypass role `configurator_app` (DB owner ≠ runtime role);
    - add `SET LOCAL app.current_tenant` per request transaction;
@@ -130,6 +131,7 @@ Each workstream is one PR per repo (PR discipline). Rust is verified in CI only 
    - Turnstile and Telegram are optional and dark by default.
 4. Metering: build the table and outbox scaffold only when phase 3 brings LLM calls. Record that here so the next session does not build it early.
 5. Rollout order, as in commonpractice: backfill licences, smoke-test introspect, then flip `LICENSE_GATE_2_ENABLED`.
+6. **Landed (API, dark):** gate 2 (`src/license.rs`, applied in `tenancy.rs` for non-super-admin callers, `GET /api/license/status`) and issuance on tenant create (`src/licenses_admin.rs`, token in owner-only `tenant_license`, migration 0004; a failed issuance fails the create with 502 `licences_unavailable`, as commonpractice does). Not yet: revoke on offboarding, token encryption at rest, the tenant-level licence fallback, the gitops SA/secret/NetworkPolicy, early access, W6 seeds.
 
 ### W3 — care-bus: multi-tenant, multi-job, base vs refinement (care-bus-agents; its own plan file in that repo)
 1. Fix the `aud`/`iss` defect now: `set_required_spec_claims(&["exp","iss","aud","sub"])` plus tests for missing and wrong aud/iss. This is independent and small; it can go first as its own commit in care-bus's W3 PR, or as a separate PR if the owner wants it shipped sooner.

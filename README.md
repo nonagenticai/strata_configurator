@@ -10,6 +10,12 @@ The application is served at `https://configurator.internal`. `/api/*`, `/health
 
 Required API environment variables: `DATABASE_URL`, `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL`. Optional: `PORT` (8097), `KEYCLOAK_AUDIENCE` (`strata-configurator`), `SUPER_ADMIN_ROLE` (`config-super-admin`). Migrations and embedded seed versions apply at startup; existing versions are never re-applied over curated data.
 
+Optional, all dark by default (unset = off):
+- Invites by email (W1.1), on only when all four are set: `KEYCLOAK_ADMIN_TOKEN_URL`, `KEYCLOAK_ADMIN_CLIENT_ID` (`strata-configurator-admin`), `KEYCLOAK_ADMIN_CLIENT_SECRET`, `KEYCLOAK_ADMIN_API_URL` (`…/admin/realms/portal`). Without them, an `email` in `POST /api/tenants` or `POST /api/tenants/{id}/users` is 503 `invite_unavailable`.
+- Licence gate 2 (W2.1): `LICENSE_GATE_2_ENABLED` (`false`), `LICENSE_INTROSPECT_URL` (`http://licenses.licenses.svc.cluster.local:8544/license/introspect`), `LICENSE_APP_KEY` (`strata-configurator`), `LICENSE_CACHE_TTL_SEC` (`300`).
+- Licence issuance on tenant create (W2.2), on only when all four are set: `LICENSES_ADMIN_TOKEN_URL`, `LICENSES_ADMIN_CLIENT_ID` (`strata-configurator-licenses-admin`), `LICENSES_ADMIN_CLIENT_SECRET`, `LICENSES_ADMIN_URL`; plus `LICENSE_PLAN_CODE` (`standard`).
+A service account with only some of its four settings is a startup error.
+
 Web runtime configuration: `PUBLIC_KEYCLOAK_URL`, `PUBLIC_KEYCLOAK_REALM`, `PUBLIC_KEYCLOAK_CLIENT_ID` (defaults: `https://auth.nonagentic.ai`, `portal`, `strata-configurator`). API calls use the same origin and fresh bearer tokens.
 
 Rust builds/tests run in CI only. Local web checks:

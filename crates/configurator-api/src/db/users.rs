@@ -62,6 +62,14 @@ pub async fn home(db: &PgPool, sub: &str) -> Result<Option<(Uuid, Role)>, sqlx::
         .transpose()
 }
 
+/// `true` when `sub` has a row, active or disabled, in any tenant (so it cannot be added anywhere).
+pub async fn exists(db: &PgPool, sub: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM users WHERE sub = $1)")
+        .bind(sub)
+        .fetch_one(db)
+        .await
+}
+
 /// `home` with the tenant's name.
 pub async fn home_tenant(db: &PgPool, sub: &str) -> Result<Option<Home>, sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid, String, String)>(
