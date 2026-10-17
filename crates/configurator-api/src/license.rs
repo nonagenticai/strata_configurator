@@ -113,7 +113,7 @@ impl LicenseGate {
             .await
             .map_err(|e| UpstreamError::transport(what, &e))?;
         if !resp.status().is_success() {
-            return Err(UpstreamError::status(what, resp.status()));
+            return Err(UpstreamError::status(what, resp.status()).into());
         }
         let v: Introspection = resp
             .json()
