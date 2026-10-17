@@ -1,6 +1,7 @@
 //! Integration test harness, copied from care-bus `crates/carebus-api/tests/common/mod.rs` @ 3b88445
 //! (never a dependency on it): ONE Postgres 18 container per test binary, a fresh database per test.
 #![allow(dead_code)]
+pub mod carebus_mock;
 pub mod client;
 pub mod keys;
 

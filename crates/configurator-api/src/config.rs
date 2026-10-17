@@ -26,6 +26,31 @@ pub struct Config {
     pub license_token_key: Option<TokenKey>,
     /// Early-access self-signup (W2.3); off by default.
     pub signup: SignupConfig,
+    /// The care-bus release-writer SA (W4); `None` (push and drift answer 503
+    /// `carebus_unconfigured`) unless all four `CAREBUS_*` settings are set.
+    pub carebus: Option<CarebusConfig>,
+}
+
+/// Client credentials for portal-realm client `strata-configurator-release-writer`, which holds
+/// `care-bus/release-writer`, and the care-bus API it calls.
+#[derive(Clone)]
+pub struct CarebusConfig {
+    /// e.g. `http://carebus-api.care-bus.svc.cluster.local:8095`, without a trailing slash.
+    pub api_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+impl std::fmt::Debug for CarebusConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarebusConfig")
+            .field("api_url", &self.api_url)
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Early-access self-signup (W2.3), after commonpractice `config.ts` `signupIntakeConfig`,
@@ -184,6 +209,7 @@ impl std::fmt::Debug for Config {
             .field("licenses_admin", &self.licenses_admin)
             .field("license_token_key", &self.license_token_key)
             .field("signup", &self.signup)
+            .field("carebus", &self.carebus)
             .finish_non_exhaustive()
     }
 }
@@ -327,7 +353,25 @@ impl Config {
             public_url: trimmed("CONFIGURATOR_PUBLIC_URL")
                 .map(|u| u.trim_end_matches('/').to_string()),
         };
+        let carebus = group(
+            &get,
+            [
+                "CAREBUS_API_URL",
+                "CAREBUS_TOKEN_URL",
+                "CAREBUS_CLIENT_ID",
+                "CAREBUS_CLIENT_SECRET",
+            ],
+        )?
+        .map(
+            |[api_url, token_url, client_id, client_secret]| CarebusConfig {
+                api_url: api_url.trim().trim_end_matches('/').to_string(),
+                token_url,
+                client_id,
+                client_secret,
+            },
+        );
         Ok(Self {
+            carebus,
             signup,
             database_url: req("DATABASE_URL")?,
             migrate_database_url: get("MIGRATE_DATABASE_URL").filter(|v| !v.trim().is_empty()),
@@ -652,6 +696,39 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn partial_carebus_config_fails_startup() {
+        const CAREBUS: [(&str, &str); 4] = [
+            ("CAREBUS_API_URL", "http://carebus.test:8095/"),
+            (
+                "CAREBUS_TOKEN_URL",
+                "https://auth.test/realms/portal/protocol/openid-connect/token",
+            ),
+            ("CAREBUS_CLIENT_ID", "strata-configurator-release-writer"),
+            ("CAREBUS_CLIENT_SECRET", "release-writer-secret"),
+        ];
+        assert!(Config::from_lookup(base).unwrap().carebus.is_none());
+        let c = Config::from_lookup(with(&CAREBUS)).unwrap();
+        let cb = c.carebus.as_ref().unwrap();
+        assert_eq!(cb.api_url, "http://carebus.test:8095");
+        assert_eq!(cb.client_id, "strata-configurator-release-writer");
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("release-writer-secret"), "{shown}");
+        for (missing, _) in CAREBUS {
+            let err = Config::from_lookup(|k| {
+                CAREBUS
+                    .iter()
+                    .filter(|(key, _)| *key != missing)
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string())
+                    .or_else(|| base(k))
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(missing), "{err}");
         }
     }
 }
