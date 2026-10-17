@@ -94,7 +94,7 @@ async fn list_axes(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<Axis>>, ApiError> {
     let Query(q) = q?;
-    let rows = axes::load(&mut st.tx(who.tenant()).await?).await?;
+    let rows = axes::load(&mut *st.tx(who.tenant()).await?).await?;
     Ok(Json(key_page(rows, &q, |a| a.key.clone())?))
 }
 
@@ -105,7 +105,7 @@ async fn list_axis_values(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<AxisValue>>, ApiError> {
     let Query(q) = q?;
-    let axis = axes::load(&mut st.tx(who.tenant()).await?)
+    let axis = axes::load(&mut *st.tx(who.tenant()).await?)
         .await?
         .into_iter()
         .find(|a| a.key == key)
@@ -311,7 +311,7 @@ async fn list_dimensions(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Paged<dimensions::Dimension>>, ApiError> {
     let Query(q) = q?;
-    let rows = dimensions::load(&mut st.tx(who.tenant()).await?).await?;
+    let rows = dimensions::load(&mut *st.tx(who.tenant()).await?).await?;
     Ok(Json(key_page(rows, &q, |d| d.key.clone())?))
 }
 
@@ -428,7 +428,7 @@ async fn list_profiles(
         .map(Uuid::parse_str)
         .transpose()
         .map_err(|_| ApiError::BadRequest("invalid_cursor", "expected profile cursor".into()))?;
-    let rows = profiles::load(&mut st.tx(who.tenant()).await?, who.tenant())
+    let rows = profiles::load(&mut *st.tx(who.tenant()).await?, who.tenant())
         .await?
         .into_iter()
         .filter(|r| before.is_none_or(|b| r.id < b))
@@ -444,7 +444,7 @@ async fn visible_profile(
 ) -> Result<profiles::SavedProfile, ApiError> {
     let missing = || ApiError::Missing("profile_not_found", "profile does not exist".into());
     let id = Uuid::parse_str(id).map_err(|_| missing())?;
-    profiles::get(&mut st.tx(who.tenant()).await?, who.tenant(), id)
+    profiles::get(&mut *st.tx(who.tenant()).await?, who.tenant(), id)
         .await?
         .ok_or_else(missing)
 }

@@ -52,8 +52,11 @@ $$;
 
 GRANT USAGE ON SCHEMA public TO configurator_app;
 GRANT SELECT, INSERT, UPDATE, DELETE
-    ON tenant, users, layer, overlay_row, dimension_value, profile, audit_event
+    ON tenant, layer, overlay_row, dimension_value, profile
     TO configurator_app;
+-- Users are disabled, never deleted; the audit trail is append-only.
+GRANT SELECT, INSERT, UPDATE ON users TO configurator_app;
+GRANT SELECT, INSERT ON audit_event TO configurator_app;
 -- Platform tables: the runtime reads them; only the owner writes them.
 GRANT SELECT ON axis, axis_value, axis_rule, dimension, seed_version TO configurator_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO configurator_app;

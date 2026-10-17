@@ -135,9 +135,14 @@ async fn tenant_layer_of_other_tenant_never_applied() {
     let (s, out) = member(&e.app, "POST", &format!("/api/layers/{}/rows", l["id"].as_str().unwrap()), "alice", json!({"kind":"entity", "key":"Customer", "op":"patch", "fields":{"label":"Private label"}})).await;
     assert_eq!(s, StatusCode::CREATED, "{out}");
     let (_, own) = member(&e.app, "POST", "/api/compile", "alice", json!({})).await;
-    let (_, other) = member(&e.app, "POST", "/api/compile", "bob", json!({})).await;
+    let (s, other) = member(&e.app, "POST", "/api/compile", "bob", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{other}");
     assert_eq!(own["entities"]["Customer"]["label"], "Private label");
-    assert_ne!(other["entities"]["Customer"]["label"], "Private label");
+    let label = other["entities"]["Customer"]["label"].as_str();
+    assert!(
+        label.is_some_and(|l| l != "Private label"),
+        "bob compiles the Customer entity without alice's label: {label:?}"
+    );
     let (s, _) = member(&e.app, "POST", "/api/compile", "bob", json!({"tenant":a})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
