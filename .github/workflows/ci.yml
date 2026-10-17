@@ -12,6 +12,7 @@ jobs:
     with:
       image_name: strata-configurator-api
       cargo_package: configurator-api
+      deploy_namespace: strata-configurator
       test_command: 'cargo test --workspace --locked'
       prepull_images: |
         registry.internal:5000/library/postgres:18-alpine
@@ -25,6 +26,7 @@ jobs:
     uses: nonagenticai/gitops-production/.github/workflows/ts-service.yml@main
     with:
       image_name: strata-configurator-web
+      deploy_namespace: strata-configurator
       working_directory: web
       cache_dependency_path: web/package-lock.json
       docker_build: true

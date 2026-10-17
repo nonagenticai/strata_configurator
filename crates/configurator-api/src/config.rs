@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub port: u16,
@@ -10,6 +10,17 @@ pub struct Config {
     pub super_admin_role: String,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"[redacted]")
+            .field("port", &self.port)
+            .field("keycloak_issuer", &self.keycloak_issuer)
+            .field("keycloak_audience", &self.keycloak_audience)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -17,7 +28,11 @@ impl Config {
 
     /// `from_env` over any lookup, so tests never touch the process environment.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let req = |k: &str| get(k).with_context(|| format!("{k} is not set"));
+        let req = |k: &str| {
+            get(k)
+                .filter(|v| !v.trim().is_empty())
+                .with_context(|| format!("{k} is not set"))
+        };
         let opt = |k: &str, d: &str| get(k).filter(|v| !v.is_empty()).unwrap_or_else(|| d.into());
         let port = match get("PORT").filter(|v| !v.is_empty()) {
             Some(p) => p.parse().with_context(|| "PORT is not a valid port")?,
@@ -62,5 +77,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("DATABASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn blank_required_settings_rejected_and_debug_redacts_credentials() {
+        for key in ["DATABASE_URL", "KEYCLOAK_ISSUER", "KEYCLOAK_JWKS_URL"] {
+            assert!(
+                Config::from_lookup(|k| if k == key { Some("  ".into()) } else { base(k) })
+                    .is_err()
+            );
+        }
+        let c = Config::from_lookup(|k| {
+            if k == "DATABASE_URL" {
+                Some("postgres://user:private-password@db/app".into())
+            } else {
+                base(k)
+            }
+        })
+        .unwrap();
+        assert!(!format!("{c:?}").contains("private-password"));
     }
 }

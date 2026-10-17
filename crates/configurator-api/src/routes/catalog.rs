@@ -129,6 +129,12 @@ async fn create_axis(
     if let Some(label) = &b.label {
         nonempty("invalid_axis", label)?;
     }
+    if b.description
+        .as_deref()
+        .is_some_and(|s| s.trim().is_empty())
+    {
+        return Err(invalid_axis("description must not be blank"));
+    }
     let a = Axis {
         key: b.key,
         cardinality: b.cardinality,
@@ -170,6 +176,12 @@ async fn create_axis_value(
 ) -> Result<(StatusCode, Json<AxisValue>), ApiError> {
     require_super_admin(who.caller())?;
     let Json(mut v) = b?;
+    if v.description
+        .as_deref()
+        .is_some_and(|s| s.trim().is_empty())
+    {
+        return Err(invalid_axis("description must not be blank"));
+    }
     nonempty("invalid_axis", &v.key)?;
     if v.label.is_none() {
         v.label = Some(v.key.rsplit('.').next().unwrap_or(&v.key).to_owned());
