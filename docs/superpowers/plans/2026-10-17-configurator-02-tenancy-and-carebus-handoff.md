@@ -101,6 +101,7 @@ Consistency notes against earlier rulings in memory:
 Each workstream is one PR per repo (PR discipline). Rust is verified in CI only (no local cargo).
 
 ### W0 — waypoint fix (gitops-production, first, small)
+> **Superseded (owner, 2026-10-17): ambient mesh, NO waypoint.** The waypoint was removed again; the callers allow-list is a namespace-wide L4 AuthorizationPolicy enforced by ztunnel (no `targetRefs`), and the namespace is back to PSA `restricted`. Do not add a waypoint or Service-targeted policies to this app (or to care-bus work you drive).
 1. `clusters/strato/services/strata-configurator/namespace.yaml`: change `pod-security.kubernetes.io/enforce` from `restricted` to `baseline`, and keep `warn: restricted`. This matches care-bus, strata-rag, enterprise-mcp and commonpractice. Rejected alternative: keep `restricted` and add a Gateway `spec.infrastructure.parametersRef` ConfigMap that patches `seccompProfile: RuntimeDefault` into the waypoint deployment. No other namespace does this, and per the cluster rule a one-off pattern would have to land in the archetype first.
 2. Before pushing, check that no open gitops PR touches that file. Run gitops-production's local validators, open the PR, merge it, and reconcile Flux.
 3. Verify live:
@@ -194,6 +195,7 @@ Exit (live): push release 1 for a test tenant's `customer_care_agent` job; care-
 4. Apply seeds and migrations in the licences deploy, then check that `POST /license/introspect` for a newly issued `strata-configurator` licence returns `active` with `app.key == strata-configurator`.
 
 ### W5 — strata_rag / strata_ingest: shared multi-app dependencies (cell pattern, as w2v)
+> **Owned by the strata_rag and strata_ingest sessions (owner, 2026-10-17).** The owner shared this plan with them; they already set up their own licensing and billing. This workstream builds nothing in those repos. It only consumes their contract. Before W6, run `gh pr list -R nonagenticai/licenses` and read what they registered, so the work isn't duplicated or doesn't collide with theirs.
 These services are shared by many apps (w2v, merqi, configurator/care-bus, …). Owner, 2026-10-17: they use **the same implementation w2v is building** (not finished), i.e. the way apps *should* use worker_management.
 
 The reference pattern (plan `~/.claude/plans/w2v-cell-architecture-template.md` rev 5, implemented in w2v_orchestrator):
