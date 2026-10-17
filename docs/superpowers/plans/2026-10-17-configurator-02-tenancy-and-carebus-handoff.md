@@ -38,7 +38,7 @@ care-bus-agents on `origin/main` (checked 2026-10-17):
 1. **Copy commonpractice's setup** for strata_configurator and care-bus. This covers patterns only; no code is shared:
    - **Overlay + tombstones.** Base rows carry no tenant. Tenant rows override, extend or hide them, and the effective view is compiled at read time (commonpractice `ontology-service.ts` `compileEffective`, `hidden` tombstones).
    - **Postgres RLS.** A non-bypass app role, the `app.current_tenant` GUC, a policy on every `tenant_id` table, and a CI anti-drift test that every such table has RLS and a policy (commonpractice `migrations/0028_rls.sql`, `0029`, `0032`, `0057`).
-   - **Keycloak tenant claim.** Realm roles `super_admin`, `tenant_admin` and `member`. One tenant per identity, carried as the `tenant_id` claim. A super-admin switches tenant with `X-Active-Tenant-Id`; each switch is audited and one tenant is active at a time (commonpractice `SPEC-PHASE4-admin-tenant-isolation.md` §3, `middleware/admin-guards.ts`). **This replaces the configurator's own `member` table and its viewer/editor/approver/admin roles.**
+   - **Keycloak tenant claim.** Roles are per-app client roles (see §3: `super_admin`/`tenant_admin`/`tenant_user` per app, never shared realm roles). One tenant per identity, carried as the `tenant_id` claim. A super-admin switches tenant with `X-Active-Tenant-Id`; each switch is audited and one tenant is active at a time (commonpractice `SPEC-PHASE4-admin-tenant-isolation.md` §3, `middleware/admin-guards.ts`). **This replaces the configurator's own `member` table and its viewer/editor/approver/admin roles.**
    - **Deployment shape.** Namespace `enforce: baseline` + `warn: restricted`, ambient mesh.
    - **Billing / metering.** Use a local usage ledger plus a `metering_outbox` in the same transaction. A drainer XADDs to the Redis stream `billing:costs`, and billing-service prices the events (commonpractice `host/metering-emit.ts`, `host/metering-outbox-drainer.ts`, migration `0090`).
    - **Licensing.** An in-app "gate 2": introspect the tenant's licence at `licenses.licenses.svc.cluster.local:8544/license/introspect`. It is fail-closed and cached for 300 s. Issue a licence on onboarding and revoke it on offboarding through a `secure-apps` client-credentials service account (commonpractice `middleware/license-gate.ts`, `services/license-client.ts`, `services/licenses-admin.ts`).
@@ -56,14 +56,21 @@ Consistency notes against earlier rulings in memory:
 
 | Spec rev 2 | Becomes (rev 3) |
 |---|---|
-| §10.2: tenant roles viewer < editor < approver < admin in the configurator DB, `X-Tenant-Id` header, super-admin = Keycloak role `config-super-admin` | Keycloak `tenant_id` claim plus realm roles. `X-Active-Tenant-Id` is for super-admin switching only. The `member` table is dropped. Approval (spec §8) is done by `tenant_admin` |
+| §10.2: tenant roles viewer < editor < approver < admin in the configurator DB, `X-Tenant-Id` header, super-admin = Keycloak role `config-super-admin` | Keycloak `tenant_id` claim plus per-app client roles (§3). `X-Active-Tenant-Id` is for super-admin switching only. The `member` table is dropped. Approval (spec §8) is done by `tenant_admin` |
 | §10.4: isolation by query predicates | Postgres RLS on every tenant table, plus a CI anti-drift test |
 | §2 / overview: "care-bus has no tenants"; P0 = tenant column + `X-Tenant-Id` | P0 = tenant **and job** scope with RLS, using the Keycloak claim. Base and refinement are separate layers in care-bus |
 | §11 P4: service account with care-admin write | A client-credentials SA with a dedicated **release-writer** role, valid only for the release endpoint, with `aud`/`iss` required |
 | §12: phases 2b/4/6 | Reordered in §5 below |
 | (absent) | Licensing gate 2, metering outbox, early-access signup |
 
-**Open design point (Q2): role names.** commonpractice uses the realm roles `super_admin` / `tenant_admin` / `member` in the shared `portal` realm. If the configurator and care-bus read the **same** realm roles, a commonpractice tenant_admin automatically becomes a configurator and care-bus tenant_admin. Licences gate this anyway (no licence for app X → 402), but authorization would ride on billing. Recommendation: use **client roles** on each app's own Keycloak client (`resource_access.<client>.roles`: `super_admin`, `tenant_admin`, `member`), with the shared `tenant_id` user attribute. The same tenant uuid is then valid across configurator, care-bus, rag, ingest, licences and billing. That uuid sharing is what makes "configure at the top, provision down" work.
+**Roles (owner, 2026-10-17, answer to Q2).** Every app has its **own Keycloak client roles**. No role overlaps between commonpractice, w2v, conveyor, merqi, strata_configurator and care-bus-agents. The configurator and the agents (care-bus) each get their **own dedicated `tenant_admin` and `tenant_user` roles**. This prepares a future separation between the *configuration* organisation and the *run* organisation: a person can administer a tenant's configuration without administering its running agents, and the reverse.
+- Configurator client `strata-configurator`: `super_admin`, `tenant_admin`, `tenant_user` (read-only; this replaces the earlier viewer role). Approving a release (spec §8) needs `tenant_admin`.
+- care-bus client (its own, e.g. `care-bus`): `tenant_admin`, `tenant_user` (plus a platform `super_admin` if that session needs one), and the client-credentials `release-writer` role that the configurator's SA uses.
+- Read roles from `resource_access.<client>.roles`, never from `realm_access`.
+
+**Tenant id (owner, answer to Q3).** **The configurator defines the tenant id.** It creates the tenant uuid and shares it with the agents (care-bus) through provision-down: tenant creation and release pushes. care-bus never mints tenant ids.
+- How the configurator stamps that uuid onto the user's `tenant_id` attribute in Keycloak is an open design item. Check how commonpractice onboarding does it before choosing; its portal SA is documented as "never writes roles or `tenant_id`", so it may be the approval flow or a separate admin path.
+- **strata_rag / strata_ingest are different.** They are shared by many apps, so they do **not** adopt the claim model. They follow the multi-app **cell pattern** that w2v is building and merqi should follow (W5).
 
 ## 4. Workstreams
 
@@ -81,13 +88,13 @@ Each workstream is one PR per repo (PR discipline). Rust is verified in CI only 
 ### W1 — configurator: commonpractice identity, tenancy and RLS (strata_configurator)
 0. **Spec rev 3** (doc commit): fold in §2 and §3.
 1. Keycloak, via a gitops realm-patch job modelled on `realm-patch-job-strata-configurator.yaml`:
-   - client roles `super_admin`, `tenant_admin` and `member` on client `strata-configurator` (pending Q2);
+   - client roles `super_admin`, `tenant_admin` and `tenant_user` on client `strata-configurator` (§3);
    - a `tenant_id` protocol mapper from the user attribute;
    - the owner user gets `super_admin`.
 2. API auth:
    - read `tenant_id` and the roles from the token;
    - `TenantCtx` comes from the claim; for `super_admin` it comes from `X-Active-Tenant-Id` (bare non-nil uuid, audited switch);
-   - drop the `member` table and the `/api/tenants/{id}/members` routes. Tenant creation stays super-admin only, and a tenant's id is the platform tenant uuid (Q3);
+   - drop the `member` table and the `/api/tenants/{id}/members` routes. Tenant creation (super-admin, or early-access approval) mints the tenant uuid: the configurator defines tenant ids (§3);
    - migration `0003`, forward-only, since pre-prod.
 3. RLS:
    - add a non-bypass role `configurator_app` (DB owner ≠ runtime role);
@@ -146,24 +153,94 @@ Needs W1 and W3.5 live.
 
 Exit (live): push release 1 for a test tenant's `customer_care_agent` job; care-bus answers a return request with it; a tenant refinement survives release 2; a removed base object shows as a conflict.
 
-### W5 — strata_rag / strata_ingest
-Both already know tenants. W5 adopts the claim and RLS model when they are next touched; there is no work this session. The overview's P7/P8 items (ingest metadata, classify stage) are unchanged.
+### W5 — strata_rag / strata_ingest: shared multi-app dependencies (cell pattern, as w2v)
+These services are shared by many apps (w2v, merqi, configurator/care-bus, …). Owner, 2026-10-17: they use **the same implementation w2v is building** (not finished), i.e. the way apps *should* use worker_management.
+
+The reference pattern (plan `~/.claude/plans/w2v-cell-architecture-template.md` rev 5, implemented in w2v_orchestrator):
+- **Provision down.** The top app owns the tenant and PUTs each dependency's config subtree to that dependency's tenant-config API.
+- **Manifest and slots.** `GET /api/provider-requirements` returns a manifest, so the top GUI is generated from what each dependency needs. `PUT /api/tenant/connections` writes slots in bulk, all-or-nothing, with `expected_version`, and reports per slot whether it was created, updated, deleted or unchanged. `PUT /api/tenant/connections/{slot}` runs policy and SSRF checks, then a live test, then stores an immutable version. Keys are write-only.
+- **Resolution.** A tenant slot wins, else the deployment default. A tenant slot that fails is an error and never falls back to a platform key.
+- **Run pinning.** A run pins its slot versions for its lifetime.
+- **Auth: tenant-x-app licence.** The caller presents the end tenant's own minted licence for that app, via `POST {licenses}/internal/tenants/{t}/bundle-token?app=<app>`, cached per (tenant, app) and failing loud (see `w2v_common/auth/bundle_tokens.py`). There are no shared service-account tokens and no `X-Effective-Tenant-Id` delegation. This follows the owner ruling of 2026-10-15: "no app-to-app licences, only tenant-x-app licences".
+
+**Known blocker (same as w2v and WM).** worker_management's tenant_licence mode was reverted to delegation (gitops#4720). WM checks the human actor against the licences service, but members exist only in the app, so the check returns `unknown_subject`. The fix needs `actor_sub` on the licence mint, and that is licences-owner work. merqi has not adopted the pattern either: it uses shared tokens or delegation, has no provision-down and keeps providers in env.
+
+What strata_rag and strata_ingest already have:
+- `GET/PUT /api/tenant/providers` (rag: embed, rerank, chat; ingest: ocr, vision, transcribe), with keys write-only and AES-GCM sealed, an SSRF guard, a live probe, and `source` reported as tenant, default or unconfigured.
+- Tenant scope via static env tokens: rag uses `<tenant>:<token>` plus `X-Tenant-Id`, ingest uses a token→tenant map.
+
+What is missing:
+- the provider-requirements manifest;
+- the bulk connections PUT with versions and `expected_version`, and per-slot test and DELETE;
+- tenant-x-app licence auth instead of static `STRATA_API_TOKENS` / `STRATA_INGEST_API_TOKENS`;
+- tenant register and revoke;
+- run pinning;
+- per-tenant usage metering with actor and project attribution.
+
+W5 = bring rag and ingest to this pattern, **after** w2v's version stabilises (so they copy the finished contract) and after the licences `actor_sub` fix. Then the configurator (or care-bus, per job) provisions rag/ingest slots down for its tenants. The overview's P7/P8 items (ingest metadata, classify stage) are unchanged.
 
 ## 5. Order
 
 1. W0, today: small, and it unblocks enforced authz.
-2. W1.0 (spec rev 3), then W1 and the W3.1 auth fix in parallel, in different repos.
+2. W1.0 (spec rev 3), then W1 ∥ W2. care-bus W3 waits for the owner's other care-bus session (brief in §8); its aud/iss fix is item 2 of that brief.
 3. W3 (plan written in care-bus-agents first, from its `origin/main`) ∥ W2.
 4. W4 once W1 and W3.5 are live.
 5. Phase 3 (conversation/funnel; LLM = the care-bus tenant-provided commercial provider, or local pgx vllm / mlx_api, per the owner note on main `7076f27`), then metering for the configurator.
 
-## 6. Questions for the owner
+## 6. Questions
 
-- **Q1.** Is "early-access readiness" commonpractice's early-access self-signup (intake → approval → tenant + licence + default plan), or something else?
-- **Q2.** Role scoping: client roles per app (recommended) or the shared `portal` realm roles that commonpractice uses?
-- **Q3.** Is the configurator's tenant uuid the platform tenant uuid (the same `tenant_id` attribute as commonpractice, licences and billing)? Recommended: yes.
+Answered by the owner on 2026-10-17:
+- **Q1. Early access: yes, copy commonpractice exactly.** The configurator must be able to do early-access self-signup with the same setup commonpractice uses: intake client, approval queue, super-admin approval, tenant + licence + default plan. It is switched on when testing is done.
+- **Q2. Roles: per-app client roles**, with no overlap between apps, and dedicated `tenant_admin`/`tenant_user` roles for the configurator and separately for the agents. See §3.
+- **Q3. Tenant id: defined by the configurator**, shared with the agents. rag and ingest follow the w2v cell pattern (§4 W5).
+- **care-bus (W3) is not touched in this session.** The owner has another session making final care-bus changes. Hand that session the brief in §8. The further care-bus design (W3 as a plan in care-bus-agents) comes after that session finishes.
+
+Still open:
 - **Q4.** Licences: who registers the app keys `strata-configurator` and `care-bus` and their plans in licences.internal, and which default plan does an early-access tenant get (commonpractice uses `local-llm`)?
-- **Q5.** Should the care-bus `aud`/`iss` fix ship immediately as its own small PR, or ride in the W3 PR?
+- **Q5.** How does the configurator put a new tenant uuid onto the signing-up user's Keycloak `tenant_id` attribute? Check commonpractice's onboarding first.
+- **Q6.** The licences `actor_sub` fix (it blocks the tenant_licence mode for WM, w2v and, later, rag/ingest): who owns it, and when?
+
+## 8. Brief for the care-bus-agents session (owner relays)
+
+The text to paste is kept in §8.1 so it lives alongside the plan.
+
+### 8.1 Paste this
+```
+Context: strata_configurator (repo nonagenticai/strata_configurator, phase 1 live at
+configurator.internal) will become the system that DEFINES tenants and pushes a versioned
+BASE configuration per (tenant, job) into care-bus. care-bus will become multi-tenant AND
+multi-job, and its admin UI will refine that base per job (backend connectors, knowledge
+areas). The design for that comes after your session. It is in strata_configurator
+docs/superpowers/plans/2026-10-17-configurator-02-tenancy-and-carebus-handoff.md §4 W3
+(branch docs/next-session-plan). Please keep your final changes compatible with it.
+
+1. Don't build in the opposite direction. No new single-tenant assumptions (no more global
+   CAREBUS_TENANT_ID uses, no new unscoped config tables, no hardcoded areas/request types
+   in domain.rs), and no tenant concept invented inside care-bus. Tenant ids will come from
+   the configurator via the Keycloak `tenant_id` claim plus pushed releases.
+2. Auth defect, verified on origin/main: crates/carebus-api/src/auth.rs ~115-118 sets
+   issuer and audience but never calls `set_required_spec_claims`. In jsonwebtoken 9 a token
+   WITHOUT `aud` or `iss` therefore passes (any portal-realm token from another client).
+   Fix: `v.set_required_spec_claims(&["exp","iss","aud","sub"])` plus HTTP tests for an
+   expired token, missing or wrong aud, missing or wrong iss, missing sub, HS256 and
+   alg=none, all 401. strata_configurator fixed the same copied code in commit c3be65e
+   (tests/auth.rs `claim_checks_401`), so copy that. If it doesn't fit your session, say
+   so and it goes into W3.
+3. Roles (owner decision): care-bus gets its OWN Keycloak client roles, `tenant_admin` and
+   `tenant_user`, read from resource_access.<care-bus client>.roles. They do not overlap
+   with commonpractice/w2v/merqi or with the configurator's roles. If you touch role
+   handling, move toward this. The current care-admin / care-viewer realm roles will be
+   replaced in W3.
+4. Please end your session with a short note listing:
+   (a) the final origin/main SHA;
+   (b) every config table and every admin route you added or changed;
+   (c) what still reads CAREBUS_TENANT_ID;
+   (d) whether you changed connectors, knowledge stores/sources, procedures or
+       model-routes schemas.
+   I will design W3 (multi-tenant/multi-job, base vs refinement, release endpoint with a
+   release-writer client-credentials role, RLS, licence gate 2, metering outbox) from that
+   state.
+```
 
 ## 7. Where things are
 
