@@ -193,7 +193,7 @@ async fn private_profile_and_dimension_never_compile_for_other_tenant() {
         "/api/compile",
         "bob",
         b,
-        json!({"departments":["private"]}),
+        json!({"industry":"retail", "departments":["private"]}),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{out}");
@@ -203,7 +203,7 @@ async fn private_profile_and_dimension_never_compile_for_other_tenant() {
         "/api/compile",
         "alice",
         a,
-        json!({"departments":["private"]}),
+        json!({"industry":"retail", "departments":["private"]}),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{out}");
