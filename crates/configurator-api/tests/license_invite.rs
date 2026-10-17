@@ -1241,13 +1241,14 @@ async fn offboarding_an_archived_tenant_is_the_same_answer_without_licences() {
         ),
         (&json!(true), &Value::Null, &json!(0))
     );
-    let g = lock(&up.mock);
+    let seen = {
+        let g = lock(&up.mock);
+        (g.revoked.len(), g.grants)
+    };
     assert_eq!(
-        (g.revoked.len(), g.grants),
-        calls,
+        seen, calls,
         "licences not called again (no revoke, no token grant)"
     );
-    drop(g);
     assert_eq!(
         audited(&e, "tenant.offboard").await,
         1,
