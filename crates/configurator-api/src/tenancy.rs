@@ -4,8 +4,11 @@
 //! `X-Active-Tenant-Id`; every such switch is audited.
 //!
 //! Licence gate 2 ([`license::check`]) runs here, where a caller's tenant is resolved, rather than as
-//! a router layer: a path cannot tell tenant work from platform work, the tenant is only known here,
-//! and the super-admin (platform staff, never a seat) is exempt (plan 2026-10-17 W2.1).
+//! a router layer: a path cannot tell tenant work from platform work, and the tenant is only known
+//! here. As in commonpractice (`licenseCallerTenant`, and `requireSuperAdmin` as the only exemption),
+//! a super-admin acting in a tenant is judged against THAT tenant's licence, so they see what the
+//! tenant would; the super-admin in the platform view (no tenant in scope) is not gated, and neither
+//! are the routes that only take a [`Caller`] (tenant list and create, the signup queue).
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
@@ -139,7 +142,9 @@ pub fn active_tenant_header(headers: &HeaderMap) -> Result<Option<Uuid>, ApiErro
 ///   licence gate 2 (402/403 `license_*` when it is enabled and the tenant is not licensed).
 /// - The super-admin: the header's tenant (400 `invalid_tenant` when malformed, 404 `tenant_not_found`
 ///   when unknown) as `tenant_admin`, audited as `tenant.scope_switch` unless it is their own tenant;
-///   without the header their own tenant if they have one, else the platform view.
+///   without the header their own tenant if they have one, else the platform view. Licence gate 2
+///   applies to that tenant exactly as to its members (the platform view is not gated); a switch it
+///   refuses is not audited, since no work happened in the tenant.
 pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acting, ApiError> {
     if !caller.super_admin {
         let (tenant, role) = users::home(&st.db, &caller.sub)
@@ -154,25 +159,28 @@ pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acti
     }
     let header = active_tenant_header(&parts.headers)?;
     let home = users::home(&st.db, &caller.sub).await?.map(|(t, _)| t);
-    let tenant = match (header, home) {
-        (Some(t), Some(h)) if t == h => t,
+    let (tenant, switched) = match (header, home) {
+        (Some(t), Some(h)) if t == h => (t, false),
         (Some(t), _) => {
             if !tenants::exists(&st.db, t).await? {
                 return Err(tenant_not_found(t));
             }
-            audit::scope_switch(
-                &mut *st.db.acquire().await?,
-                &caller.sub,
-                t,
-                parts.method.as_str(),
-                parts.uri.path(),
-            )
-            .await?;
-            t
+            (t, true)
         }
-        (None, Some(h)) => h,
+        (None, Some(h)) => (h, false),
         (None, None) => return Ok(Acting::Platform(caller)),
     };
+    license::check(st, tenant).await?;
+    if switched {
+        audit::scope_switch(
+            &mut *st.db.acquire().await?,
+            &caller.sub,
+            tenant,
+            parts.method.as_str(),
+            parts.uri.path(),
+        )
+        .await?;
+    }
     Ok(Acting::Tenant(TenantCtx {
         caller,
         tenant,
@@ -184,10 +192,29 @@ pub async fn acting(st: &AppState, caller: Caller, parts: &Parts) -> Result<Acti
 /// active scope. The super-admin is `tenant_admin` in any tenant that exists (404 `tenant_not_found`
 /// otherwise); anyone else must belong to it, and a tenant that is not theirs is the same 404 as one
 /// that does not exist (no workspace at all is 403 `no_workspace`).
-pub async fn in_tenant(st: &AppState, caller: Caller, tenant: Uuid) -> Result<TenantCtx, ApiError> {
+///
+/// Licence gate 2 for the super-admin is commonpractice's (`licenseCallerTenant` behind
+/// `requireTenantAdmin`): it judges the scope they act in, `X-Active-Tenant-Id` when it is a valid
+/// tenant id, else their own tenant, and does not gate the platform console (neither). `headers` is
+/// read for that only.
+pub async fn in_tenant(
+    st: &AppState,
+    caller: Caller,
+    headers: &HeaderMap,
+    tenant: Uuid,
+) -> Result<TenantCtx, ApiError> {
     if caller.super_admin {
         if !tenants::exists(&st.db, tenant).await? {
             return Err(tenant_not_found(tenant));
+        }
+        // A malformed header is no scope switch here (as commonpractice), not a 400: this route's
+        // tenant comes from its path.
+        let scope = match active_tenant_header(headers).ok().flatten() {
+            Some(t) => Some(t),
+            None => users::home(&st.db, &caller.sub).await?.map(|(t, _)| t),
+        };
+        if let Some(t) = scope {
+            license::check(st, t).await?;
         }
         return Ok(TenantCtx {
             caller,

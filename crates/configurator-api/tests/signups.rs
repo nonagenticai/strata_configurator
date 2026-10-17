@@ -229,6 +229,7 @@ impl Upstream {
             ),
             ("LICENSES_ADMIN_CLIENT_SECRET", "lic-secret".into()),
             ("LICENSES_ADMIN_URL", self.url.clone()),
+            ("LICENSE_TOKEN_ENC_KEY", common::TEST_TOKEN_KEY.into()),
         ]
     }
 
@@ -839,12 +840,18 @@ async fn approve_creates_the_tenant_invites_the_requester_and_issues_the_licence
             .unwrap();
     assert_eq!(user, (tenant, "tenant_admin".to_string()));
     assert_eq!(issued, [(tenant.to_string(), created[0].clone())]);
-    let token: String = sqlx::query_scalar("SELECT token FROM tenant_license WHERE tenant = $1")
-        .bind(tenant)
-        .fetch_one(common::pool(&e))
-        .await
-        .unwrap();
-    assert_eq!(token, format!("tok-{tenant}"));
+    let sealed: String =
+        sqlx::query_scalar("SELECT token_encrypted FROM tenant_license WHERE tenant = $1")
+            .bind(tenant)
+            .fetch_one(common::pool(&e))
+            .await
+            .unwrap();
+    assert!(sealed.starts_with("v1:"), "stored sealed: {sealed}");
+    let cipher = e.state.token_cipher.as_deref().unwrap();
+    assert_eq!(
+        cipher.open(tenant, &sealed).unwrap(),
+        format!("tok-{tenant}")
+    );
     assert_eq!(
         status_of(&e, id).await,
         ("approved".into(), Some(tenant), Some("root".into()))

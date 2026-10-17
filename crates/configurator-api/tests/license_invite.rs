@@ -1,5 +1,6 @@
-//! W1.1 invites by email and W2 licence gate 2 + issuance, against a local mock of Keycloak's token
-//! and admin endpoints and the licences service (an axum server on 127.0.0.1:0 in the test).
+//! W1.1 invites by email and W2 licence gate 2, issuance, revoke on offboarding and the token at rest,
+//! against a local mock of Keycloak's token and admin endpoints and the licences service (an axum
+//! server on 127.0.0.1:0 in the test).
 mod common;
 
 use std::collections::HashMap;
@@ -12,6 +13,8 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use common::client::{member, request, root};
 use common::keys::super_admin;
+use configurator_api::license_token::{TokenCipher, TokenKey};
+use configurator_api::offboarding::revoke_tenant_license;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -38,6 +41,11 @@ struct Mock {
     /// (tenant header, holder sub) of every licence created.
     issued: Vec<(String, String)>,
     revoked: Vec<String>,
+    /// The revoke answers 503 while set.
+    revoke_down: bool,
+    /// The revoke answers 200 `{"revoked": false}` (licences' answer for an unknown licence or a
+    /// tenant mismatch) while set.
+    revoke_noop: bool,
 }
 
 type Shared = Arc<Mutex<Mock>>;
@@ -185,8 +193,14 @@ async fn revoke(State(m): State<Shared>, h: HeaderMap, Json(b): Json<Value>) -> 
     if !authed(&h) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    lock(&m)
-        .revoked
+    let mut g = lock(&m);
+    if g.revoke_down {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if g.revoke_noop {
+        return Json(json!({"revoked": false})).into_response();
+    }
+    g.revoked
         .push(b["license_id"].as_str().unwrap_or_default().into());
     Json(json!({"revoked": true})).into_response()
 }
@@ -253,6 +267,7 @@ impl Upstream {
             ),
             ("LICENSES_ADMIN_CLIENT_SECRET", "lic-secret".into()),
             ("LICENSES_ADMIN_URL", self.url.clone()),
+            ("LICENSE_TOKEN_ENC_KEY", common::TEST_TOKEN_KEY.into()),
         ]
     }
 
@@ -301,6 +316,15 @@ async fn audited(e: &common::TestEnv, action: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = $1")
         .bind(action)
         .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+/// The stored (sealed) licence token of `t`, read as the owner.
+async fn stored_token(e: &common::TestEnv, t: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT token_encrypted FROM tenant_license WHERE tenant = $1")
+        .bind(t)
+        .fetch_optional(common::pool(e))
         .await
         .unwrap()
 }
@@ -494,15 +518,17 @@ async fn tenant_create_issues_and_stores_the_licence() {
         [(t.to_string(), "alice".to_string())],
         "issued for the new tenant, held by its first admin"
     );
-    let token: String = sqlx::query_scalar("SELECT token FROM tenant_license WHERE tenant = $1")
-        .bind(t)
-        .fetch_one(common::pool(&e))
-        .await
-        .unwrap();
-    assert_eq!(token, format!("tok-{t}"));
+    let sealed = stored_token(&e, t).await.expect("a licence row");
+    assert!(sealed.starts_with("v1:"), "stored sealed: {sealed}");
+    assert!(
+        !sealed.contains(&format!("tok-{t}")),
+        "the token is not stored in clear"
+    );
+    let cipher = e.state.token_cipher.as_deref().unwrap();
+    assert_eq!(cipher.open(t, &sealed).unwrap(), format!("tok-{t}"));
     assert_eq!(audited(&e, "license.issue").await, 1);
     // the runtime role cannot read licence tokens at all
-    let denied = sqlx::query("SELECT token FROM tenant_license")
+    let denied = sqlx::query("SELECT token_encrypted FROM tenant_license")
         .fetch_all(&e.state.db)
         .await;
     assert!(denied.is_err(), "configurator_app read tenant_license");
@@ -718,35 +744,251 @@ async fn a_tenant_without_a_licence_is_402_license_required() {
     );
 }
 
+/// `GET uri` as the super-admin `root`, with `X-Active-Tenant-Id: tenant` when given.
+async fn as_root(e: &common::TestEnv, uri: &str, tenant: Option<Uuid>) -> (StatusCode, Value) {
+    request(
+        &e.app,
+        "GET",
+        uri,
+        &super_admin("root"),
+        tenant,
+        Value::Null,
+    )
+    .await
+}
+
 #[tokio::test]
-async fn the_super_admin_is_exempt() {
+async fn a_super_admin_acting_in_a_tenant_is_gated_like_its_members() {
     let (up, e, t) = licensed().await;
+    up.set_introspection(
+        json!({"active": false, "tenant_id": t, "app": {"key": "strata-configurator"}}),
+    );
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    let refused = (StatusCode::PAYMENT_REQUIRED, json!("license_inactive"));
+    assert_eq!((s, code(&b).clone()), refused, "control: the member");
+    // the super-admin switched into that tenant sees the same refusal
+    let (s, b) = as_root(&e, "/api/layers", Some(t)).await;
+    assert_eq!((s, code(&b).clone()), refused, "{b}");
+    // on a route whose path names the tenant too, judged by the scope acted in
+    let (s, b) = as_root(&e, &format!("/api/tenants/{t}/users"), Some(t)).await;
+    assert_eq!((s, code(&b).clone()), refused, "{b}");
+    // a refused switch did no work in the tenant, so it is not audited as one
+    assert_eq!(audited(&e, "tenant.scope_switch").await, 0);
+
+    // an active licence lets the switch through, and it is audited
+    let (up, e, t) = licensed().await;
+    let (s, b) = as_root(&e, "/api/layers", Some(t)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(audited(&e, "tenant.scope_switch").await, 1);
+    assert_eq!(
+        lock(&up.mock).introspected,
+        [format!("tok-{t}")],
+        "the super-admin's request was gated"
+    );
+}
+
+#[tokio::test]
+async fn the_super_admin_without_a_tenant_in_scope_is_not_gated() {
+    let (up, e, t) = licensed().await;
+    // every gate check would now be 402
     lock(&up.mock).introspect_down = true;
-    let root_token = super_admin("root");
-    let (s, b) = request(
+    let (s, b) = as_root(&e, "/api/tenants", None).await;
+    assert_eq!(s, StatusCode::OK, "tenant list: {b}");
+    let (s, b) = as_root(&e, "/api/layers", None).await;
+    assert_eq!(s, StatusCode::OK, "platform view: {b}");
+    let (s, b) = as_root(&e, &format!("/api/tenants/{t}/users"), None).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "platform console on a tenant's users: {b}"
+    );
+    let (s, b) = root(
         &e.app,
-        "GET",
-        "/api/layers",
-        &root_token,
-        Some(t),
-        Value::Null,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Beta", "first_admin_sub": "bob"}),
     )
     .await;
+    assert_eq!(s, StatusCode::CREATED, "tenant create: {b}");
+    let seen = lock(&up.mock).introspected.clone();
+    assert!(seen.is_empty(), "nothing was gated: {seen:?}");
+    // control: the same moment, a member is refused
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::PAYMENT_REQUIRED, &json!("license_unavailable"))
+    );
+}
+
+#[tokio::test]
+async fn with_gate_2_off_the_super_admin_is_unchanged() {
+    let up = upstream().await;
+    let e = common::env().await;
+    let t = tenant(&e).await;
+    let (s, b) = as_root(&e, "/api/layers", Some(t)).await;
     assert_eq!(s, StatusCode::OK, "{b}");
-    let (s, b) = request(
-        &e.app,
-        "GET",
-        &format!("/api/tenants/{t}/users"),
-        &root_token,
-        None,
-        Value::Null,
+    let (s, b) = as_root(&e, &format!("/api/tenants/{t}/users"), Some(t)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(audited(&e, "tenant.scope_switch").await, 1);
+    assert!(lock(&up.mock).introspected.is_empty());
+}
+
+// ---- licence token at rest ----
+
+#[tokio::test]
+async fn a_token_that_will_not_decrypt_is_402_license_unreadable() {
+    let (up, e, t) = licensed().await;
+    // the row sealed under another key, as after a rotated LICENSE_TOKEN_ENC_KEY
+    let other = TokenKey::from_base64("//////////////////////////////////////////8=").unwrap();
+    let sealed = TokenCipher::new(&other)
+        .seal(t, &format!("tok-{t}"))
+        .unwrap();
+    sqlx::query("UPDATE tenant_license SET token_encrypted = $2 WHERE tenant = $1")
+        .bind(t)
+        .bind(sealed)
+        .execute(common::pool(&e))
+        .await
+        .unwrap();
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::PAYMENT_REQUIRED, &json!("license_unreadable")),
+        "an unreadable token is an operator fault, never a pass and never \"unavailable\""
+    );
+    assert!(
+        lock(&up.mock).introspected.is_empty(),
+        "nothing readable to introspect"
+    );
+    // a token in clear is refused by the schema itself
+    let clear =
+        sqlx::query("UPDATE tenant_license SET token_encrypted = 'tok-clear' WHERE tenant = $1")
+            .bind(t)
+            .execute(common::pool(&e))
+            .await;
+    assert!(clear.is_err(), "a plaintext token was stored");
+}
+
+#[tokio::test]
+async fn the_encryption_migration_refuses_a_plaintext_token() {
+    let pool = common::empty_pool().await;
+    // every migration before 0006, then a row as 0004 stored it: the token in clear
+    let before = sqlx::migrate::Migrator::with_migrations(
+        configurator_api::db::MIGRATOR
+            .iter()
+            .filter(|m| m.version < 6)
+            .cloned()
+            .collect(),
+    );
+    before.run(&pool).await.unwrap();
+    let t = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenant (id, name) VALUES ($1, 'Legacy')")
+        .bind(t)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_license (tenant, license_id, subject_id, holder_sub, token) \
+         VALUES ($1, 'lic-0', 'subject-0', 'alice', 'tok-clear')",
     )
-    .await;
-    assert_eq!(s, StatusCode::OK, "{b}");
-    // control: the same moment, a member of that tenant is denied
-    let (s, _) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
-    assert_eq!(s, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(lock(&up.mock).introspected.len(), 1, "only alice was gated");
+    .bind(t)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = configurator_api::db::migrate(&pool).await.unwrap_err();
+    assert!(err.to_string().contains("plaintext"), "{err}");
+    // once that licence is dealt with (revoked, row deleted), the migration applies
+    sqlx::query("DELETE FROM tenant_license")
+        .execute(&pool)
+        .await
+        .unwrap();
+    configurator_api::db::migrate(&pool).await.unwrap();
+}
+
+// ---- revoke on offboarding ----
+
+#[tokio::test]
+async fn offboarding_revokes_the_licence_and_forgets_it() {
+    let (up, e, t) = licensed().await;
+    let revoked = revoke_tenant_license(&e.state, "root", t).await.unwrap();
+    assert_eq!(revoked.as_deref(), Some("lic-1"));
+    assert_eq!(lock(&up.mock).revoked, ["lic-1"], "revoked by id, once");
+    assert_eq!(stored_token(&e, t).await, None, "the row is gone");
+    assert_eq!(audited(&e, "license.revoke").await, 1);
+    // the tenant is now unlicensed
+    let (s, b) = member(&e.app, "GET", "/api/layers", "alice", Value::Null).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::PAYMENT_REQUIRED, &json!("license_required"))
+    );
+    // a second offboard has nothing left to revoke
+    assert_eq!(
+        revoke_tenant_license(&e.state, "root", t).await.unwrap(),
+        None
+    );
+    assert_eq!(lock(&up.mock).revoked.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_revoke_fails_loud_and_keeps_the_licence() {
+    for (down, noop) in [(true, false), (false, true)] {
+        let (up, e, t) = licensed().await;
+        {
+            let mut g = lock(&up.mock);
+            g.revoke_down = down;
+            g.revoke_noop = noop;
+        }
+        let err = revoke_tenant_license(&e.state, "root", t)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::BAD_GATEWAY, "license_provisioning_failed"),
+            "down={down} noop={noop}"
+        );
+        assert!(
+            stored_token(&e, t).await.is_some(),
+            "the row is kept, so the offboard can be retried"
+        );
+        assert_eq!(audited(&e, "license.revoke_failed").await, 1);
+        assert_eq!(audited(&e, "license.revoke").await, 0);
+
+        // once licences answers, the retry revokes
+        {
+            let mut g = lock(&up.mock);
+            g.revoke_down = false;
+            g.revoke_noop = false;
+        }
+        let revoked = revoke_tenant_license(&e.state, "root", t).await.unwrap();
+        assert_eq!(revoked.as_deref(), Some("lic-1"));
+        assert_eq!(stored_token(&e, t).await, None);
+    }
+}
+
+#[tokio::test]
+async fn revoke_is_a_no_op_without_issuance_or_a_licence() {
+    // issuance off (gate on): nothing to call
+    let up = upstream().await;
+    let mut cfg = up.licensing();
+    cfg.retain(|(k, _)| !k.starts_with("LICENSES_ADMIN_"));
+    let e = common::env_with(&cfg).await;
+    let t = tenant(&e).await;
+    assert_eq!(
+        revoke_tenant_license(&e.state, "root", t).await.unwrap(),
+        None
+    );
+    // issuance on, a tenant without a licence row
+    let (_, e2, _) = licensed().await;
+    assert_eq!(
+        revoke_tenant_license(&e2.state, "root", Uuid::new_v4())
+            .await
+            .unwrap(),
+        None
+    );
+    let g = lock(&up.mock);
+    assert!(
+        g.revoked.is_empty() && g.grants == 0,
+        "licences never called"
+    );
 }
 
 #[tokio::test]

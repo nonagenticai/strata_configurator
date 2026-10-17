@@ -326,3 +326,6 @@ pub fn json(method: &str, uri: &str, token: Option<&str>, body: Value) -> Reques
 }
 
 pub const TEST_ISSUER: &str = "https://issuer.test/realms/portal";
+
+/// A `LICENSE_TOKEN_ENC_KEY` for tests (base64 of the 32 bytes 0..=31); issuance and gate 2 need one.
+pub const TEST_TOKEN_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";

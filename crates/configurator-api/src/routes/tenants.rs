@@ -6,7 +6,7 @@
 //! transaction). A tenant created while licence issuance is configured gets its licence first (W2.2).
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, patch};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -351,7 +351,16 @@ async fn insert_tenant(
     )
     .await?;
     if let Some(l) = licence {
-        licenses::store(&mut tx, t.id, l, first_admin_sub).await?;
+        // Config refuses to start issuance without the key, so a missing cipher is unreachable.
+        let cipher = st.token_cipher.as_deref().ok_or_else(|| {
+            ApiError::Internal(anyhow::anyhow!(
+                "a licence was issued but LICENSE_TOKEN_ENC_KEY is not configured"
+            ))
+        })?;
+        let sealed = cipher
+            .seal(t.id, &l.token)
+            .map_err(|e| ApiError::Internal(anyhow::Error::from(e)))?;
+        licenses::store(&mut tx, t.id, l, first_admin_sub, &sealed).await?;
         let after = json!({"tenant": t.id, "license_id": l.license_id, "subject_id": l.subject_id,
                            "holder_sub": first_admin_sub});
         audit::record(
@@ -416,8 +425,13 @@ async fn list(
 }
 
 /// The path's tenant, for a caller who must be its `tenant_admin` (or the super-admin).
-async fn admin_of(st: &AppState, caller: Caller, id: &str) -> Result<TenantCtx, ApiError> {
-    let ctx = tenancy::in_tenant(st, caller, tenancy::parse_tenant_id(id)?).await?;
+async fn admin_of(
+    st: &AppState,
+    caller: Caller,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<TenantCtx, ApiError> {
+    let ctx = tenancy::in_tenant(st, caller, headers, tenancy::parse_tenant_id(id)?).await?;
     ctx.require(Role::TenantAdmin)?;
     Ok(ctx)
 }
@@ -425,9 +439,10 @@ async fn admin_of(st: &AppState, caller: Caller, id: &str) -> Result<TenantCtx, 
 async fn list_users(
     State(st): State<AppState>,
     caller: Caller,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = admin_of(&st, caller, &id).await?;
+    let ctx = admin_of(&st, caller, &headers, &id).await?;
     Ok(paged(users::list(&st.db, ctx.tenant).await?))
 }
 
@@ -445,10 +460,11 @@ struct NewUser {
 async fn add_user(
     State(st): State<AppState>,
     caller: Caller,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Json<NewUser>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let ctx = admin_of(&st, caller, &id).await?;
+    let ctx = admin_of(&st, caller, &headers, &id).await?;
     let Json(b) = body?;
     let (sub, invited) = subject(&st, ("sub", b.sub), ("email", b.email)).await?;
     let mut tx = st.db.begin().await?;
@@ -481,10 +497,11 @@ struct RoleChange {
 async fn change_role(
     State(st): State<AppState>,
     caller: Caller,
+    headers: HeaderMap,
     Path((id, sub)): Path<(String, String)>,
     body: Result<Json<RoleChange>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = admin_of(&st, caller, &id).await?;
+    let ctx = admin_of(&st, caller, &headers, &id).await?;
     let Json(b) = body?;
     let mut tx = st.db.begin().await?;
     // Admin rows first, then the target: every demotion and disable takes the locks in the same order.
@@ -519,9 +536,10 @@ async fn change_role(
 async fn disable_user(
     State(st): State<AppState>,
     caller: Caller,
+    headers: HeaderMap,
     Path((id, sub)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let ctx = admin_of(&st, caller, &id).await?;
+    let ctx = admin_of(&st, caller, &headers, &id).await?;
     let mut tx = st.db.begin().await?;
     let admins = users::lock_admins(&mut tx, ctx.tenant).await?;
     let Some(u) = users::lock_active(&mut tx, ctx.tenant, &sub).await? else {
