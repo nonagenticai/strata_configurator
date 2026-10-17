@@ -259,15 +259,18 @@ impl LicensesAdmin {
         })
     }
 
-    /// Mint `license_id`'s opaque token: a registered PERPETUAL (`long_lived`) `api` token. Licences
-    /// gives a mint without `expires_days` a bounded default (365 days), which would fail gate 2 for
-    /// every tenant a year after onboarding while its licence is still active. A long-lived mint
-    /// needs the SA's `license-admin` realm role (else 403 `long_lived_requires_license_admin`); a
-    /// refusal keeps licences' `detail.error` in the error, and still fails the issuance.
+    /// Mint `license_id`'s opaque token: a registered PERPETUAL (`long_lived`) `internal` token.
+    /// Licences gives a mint without `expires_days` a bounded default (365 days), which would fail
+    /// gate 2 for every tenant a year after onboarding while its licence is still active. Licences
+    /// refuses a long-lived `api` token outside LONG_LIVED_API_TENANTS (422
+    /// `long_lived_not_permitted`) but registers `internal` ones; the token is only used server-side
+    /// for gate 2's `/license/introspect`, which never reads the token type. A long-lived mint needs
+    /// the SA's `license-admin` realm role (else 403 `long_lived_requires_license_admin`); a refusal
+    /// keeps licences' `detail.error` in the error, and still fails the issuance.
     async fn mint(&self, tenant: Uuid, license_id: &str) -> Result<String, UpstreamError> {
         let what = "licences mint token";
         let path = format!(
-            "licenses/{}/tokens?long_lived=true&long_lived_owner={}&long_lived_reason={}",
+            "licenses/{}/tokens?token_type=internal&long_lived=true&long_lived_owner={}&long_lived_reason={}",
             encode(license_id),
             encode(MINT_OWNER),
             encode(MINT_REASON),

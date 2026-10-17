@@ -546,6 +546,7 @@ async fn tenant_create_issues_and_stores_the_licence() {
     assert_eq!(cipher.open(t, &sealed).unwrap(), format!("tok-{t}"));
     assert_eq!(audited(&e, "license.issue").await, 1);
     let want: HashMap<String, String> = [
+        ("token_type", "internal"),
         ("long_lived", "true"),
         ("long_lived_owner", "strata-configurator"),
         (
@@ -559,7 +560,7 @@ async fn tenant_create_issues_and_stores_the_licence() {
     assert_eq!(
         lock(&up.mock).minted,
         [want],
-        "one registered perpetual api token: no expires_days, no token_type"
+        "one registered perpetual internal token, no expires_days"
     );
     // the runtime role cannot read licence tokens at all
     let denied = sqlx::query("SELECT token_encrypted FROM tenant_license")
