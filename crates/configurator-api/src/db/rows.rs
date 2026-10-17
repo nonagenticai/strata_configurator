@@ -234,6 +234,14 @@ pub async fn load_for_layers(
     pool: &PgPool,
     layers: &[LayerKey],
 ) -> Result<Vec<OverlayRow>, sqlx::Error> {
+    load_for_layers_conn(&mut *pool.acquire().await?, layers).await
+}
+
+/// Load within a caller's snapshot, keeping compilation/export consistent during edits.
+pub async fn load_for_layers_conn(
+    conn: &mut PgConnection,
+    layers: &[LayerKey],
+) -> Result<Vec<OverlayRow>, sqlx::Error> {
     let mut out = Vec::new();
     for l in layers {
         let (dim_key, dim_value) = match &l.dimension {
@@ -261,7 +269,7 @@ pub async fn load_for_layers(
         .bind(dim_key)
         .bind(dim_value)
         .bind(l.tenant)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for (id, kind, key, op, fields) in ts {
             out.push(OverlayRow {
