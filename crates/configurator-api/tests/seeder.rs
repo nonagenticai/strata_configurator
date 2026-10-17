@@ -209,8 +209,10 @@ async fn seed_v1_applies_once() {
         .find(|b| b.version == 1)
         .expect("v1 embedded");
     let (rules, rows) = to_rows(v1);
+    // v1 alone: v2 (job content) is covered by `v2_applies_after_v1`.
+    let only_v1 = std::slice::from_ref(v1);
 
-    let applied = seeder::apply(&pool, &bundles).await.expect("v1 applies");
+    let applied = seeder::apply(&pool, only_v1).await.expect("v1 applies");
     assert_eq!(applied, vec![1]);
 
     let after = counts(&pool).await;
@@ -290,8 +292,78 @@ async fn seed_v1_applies_once() {
         .unwrap();
     assert_eq!(sha, seeder::bundle_sha256(v1));
 
-    let again = seeder::apply(&pool, &bundles).await.expect("re-apply");
+    let again = seeder::apply(&pool, only_v1).await.expect("re-apply");
     assert!(again.is_empty(), "v1 applied twice: {again:?}");
+    assert_eq!(counts(&pool).await, after, "second apply changed rows");
+}
+
+#[tokio::test]
+async fn v2_applies_after_v1() {
+    let pool = common::migrated_pool().await;
+    let bundles = seeder::embedded().expect("embedded seeds parse");
+    let v1 = bundles
+        .iter()
+        .find(|b| b.version == 1)
+        .expect("v1 embedded");
+    let v2 = bundles
+        .iter()
+        .find(|b| b.version == 2)
+        .expect("v2 embedded");
+    // A database seeded before W4 holds v1 only; the next start adds v2 on top.
+    let applied = seeder::apply(&pool, std::slice::from_ref(v1))
+        .await
+        .expect("v1 applies");
+    assert_eq!(applied, vec![1]);
+    let applied = seeder::apply(&pool, &bundles).await.expect("v2 applies");
+    assert_eq!(applied, vec![2]);
+
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM seed_version ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, vec![1, 2]);
+    let (_, v1_rows) = to_rows(v1);
+    let (_, v2_rows) = to_rows(v2);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM overlay_row").await,
+        (v1_rows.len() + v2_rows.len()) as i64
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM overlay_row WHERE author = 'seed:v2' AND rev = 1 AND is_current"
+        )
+        .await,
+        v2_rows.len() as i64
+    );
+    for (kind, want) in [
+        ("context_space", 5_i64),
+        ("procedure", 6),
+        ("connector_slot", 1),
+        ("knowledge_store", 2),
+        ("job", 1),
+    ] {
+        let got: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM overlay_row r JOIN layer l ON l.id = r.layer_id \
+             WHERE r.kind = $1 AND r.author = 'seed:v2' \
+               AND l.scope = 'job' AND l.job = 'customer_care_agent' AND l.dimension_key IS NULL",
+        )
+        .bind(kind)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(got, want, "{kind}");
+    }
+    let sha: String = sqlx::query_scalar("SELECT sha256 FROM seed_version WHERE version = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sha, seeder::bundle_sha256(v2));
+
+    let after = counts(&pool).await;
+    let again = seeder::apply(&pool, &bundles).await.expect("re-apply");
+    assert!(again.is_empty(), "applied twice: {again:?}");
     assert_eq!(counts(&pool).await, after, "second apply changed rows");
 }
 

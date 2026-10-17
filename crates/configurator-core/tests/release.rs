@@ -2,8 +2,32 @@
 //! (`crates/carebus-api/tests/fixtures/release-bundle-v1.json` on care-bus-agents
 //! `feat/w3-multitenant`, copied byte for byte).
 
+use configurator_core::canonical::canonical_json;
+use configurator_core::compile::{EffectiveConfig, Selection, compile};
 use configurator_core::release::{HashError, ReleaseBodyV1, SCHEMA_V1, bundle_hash, release_body};
+use configurator_core::seed;
+use serde::Serialize;
 use serde_json::{Value, json};
+
+const V1: &[(&str, &str)] = &[
+    ("axes.toml", include_str!("../../../seed/v1/axes.toml")),
+    (
+        "dimensions.toml",
+        include_str!("../../../seed/v1/dimensions.toml"),
+    ),
+    ("base.toml", include_str!("../../../seed/v1/base.toml")),
+    ("retail.toml", include_str!("../../../seed/v1/retail.toml")),
+    (
+        "electricity.toml",
+        include_str!("../../../seed/v1/electricity.toml"),
+    ),
+    ("jobs.toml", include_str!("../../../seed/v1/jobs.toml")),
+];
+
+const V2: &[(&str, &str)] = &[(
+    "customer_care_agent.toml",
+    include_str!("../../../seed/v2/customer_care_agent.toml"),
+)];
 
 const FIXTURE: &str = include_str!("fixtures/carebus-release-bundle-v1.json");
 const GOLDEN_HASH: &str = "sha256:79c5b940a6a1b0f3015bd5b818e22ac7c284a72efef6c69c1e276612e8aaa492";
@@ -85,4 +109,71 @@ fn release_body_embeds_its_hash() {
     // The body itself parses back as a v1 release body.
     let again: ReleaseBodyV1 = serde_json::from_value(out).expect("parses back");
     assert_eq!(again.bundle, body.bundle);
+}
+
+fn retail_customer_care() -> Selection {
+    Selection {
+        industry: Some("retail".into()),
+        departments: ["faq", "logistics", "order-support", "payments"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        job: Some("customer_care_agent".into()),
+        ..Selection::default()
+    }
+}
+
+/// Seed v1 + v2 compiled for `sel`, with `v1_only` leaving v2 out.
+fn compile_seeds(sel: &Selection, v1_only: bool) -> EffectiveConfig {
+    let v1 = seed::parse(1, V1).unwrap_or_else(|e| panic!("seed v1: {e}"));
+    let (rules, mut rows) = seed::to_rows(&v1);
+    if !v1_only {
+        let v2 = seed::parse(2, V2).unwrap_or_else(|e| panic!("seed v2: {e}"));
+        rows.extend(seed::to_rows(&v2).1);
+    }
+    compile(sel, &v1.known(), &rules, &rows).unwrap_or_else(|e| panic!("compile: {e:#?}"))
+}
+
+fn canon<T: Serialize>(v: &T) -> String {
+    canonical_json(&serde_json::to_value(v).expect("serialises"))
+}
+
+#[test]
+fn seed_v2_job_content_equals_fixture_sections() {
+    let cfg = compile_seeds(&retail_customer_care(), false);
+    let jc = &cfg.job_content;
+    let want = typed().bundle;
+
+    let mut spaces: Vec<_> = jc.context_spaces.values().cloned().collect();
+    let mut want_spaces = want.context_spaces.clone();
+    spaces.sort_by(|a, b| a.key.cmp(&b.key));
+    want_spaces.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(spaces.len(), 5);
+    assert_eq!(canon(&spaces), canon(&want_spaces));
+
+    let mut procedures: Vec<_> = jc.procedures.values().cloned().collect();
+    let mut want_procedures = want.procedures.clone();
+    procedures.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    want_procedures.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    assert_eq!(procedures.len(), 6);
+    assert_eq!(canon(&procedures), canon(&want_procedures));
+
+    let connectors: Vec<_> = jc.connectors.values().cloned().collect();
+    assert_eq!(canon(&connectors), canon(&want.connectors));
+
+    let mut stores: Vec<_> = jc.knowledge_stores.values().cloned().collect();
+    let mut want_stores = want.knowledge_stores.clone();
+    stores.sort_by(|a, b| a.key.cmp(&b.key));
+    want_stores.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(canon(&stores), canon(&want_stores));
+
+    let job = cfg.job.as_ref().expect("job compiled");
+    assert_eq!(job.preamble, want.job_settings.preamble);
+    assert_eq!(job.actor_label, want.job_settings.actor);
+    // The stance stays seed v1's.
+    let v1_job = compile_seeds(&retail_customer_care(), true)
+        .job
+        .expect("v1 job");
+    assert_eq!(job.stance, v1_job.stance);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
