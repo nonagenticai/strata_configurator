@@ -60,6 +60,7 @@
 		</nav>
 		{#if session.superAdmin}<div class="nav-label">PLATFORM</div>
 			<nav aria-label="Platform navigation">
+				<a href="/tenants" class:active={page.url.pathname === '/tenants'}><span>▣</span> Tenants</a>
 				<a href="/signups" class:active={page.url.pathname === '/signups'}><span>✉</span> Signups</a>
 			</nav>{/if}
 		<div class="sidebar-note">
@@ -76,7 +77,9 @@
 						? 'Layers'
 						: page.url.pathname === '/signups'
 							? 'Signups'
-							: 'Compile'}</strong
+							: page.url.pathname === '/tenants'
+								? 'Tenants'
+								: 'Compile'}</strong
 				></span
 			>
 			<div class="account">

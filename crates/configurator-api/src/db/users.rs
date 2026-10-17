@@ -180,3 +180,15 @@ pub async fn disable(tx: &mut PgConnection, tenant: Uuid, sub: &str) -> Result<U
     .await?;
     user(row)
 }
+
+/// Disable every active user of `tenant` (its offboarding); disabled users keep their original
+/// `disabled_at`. The rows stay: users are never deleted. Returns how many this call disabled.
+pub async fn disable_all(tx: &mut PgConnection, tenant: Uuid) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE users SET disabled_at = now() WHERE tenant = $1 AND disabled_at IS NULL",
+    )
+    .bind(tenant)
+    .execute(tx)
+    .await?;
+    Ok(r.rows_affected())
+}
