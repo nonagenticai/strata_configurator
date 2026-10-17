@@ -683,9 +683,15 @@ async fn concurrent_put_one_wins() {
     );
 
     // concurrent POSTs of one new object: one 201, one 409 `row_exists`
+    let customer_rows = rows_uri(l);
     let (r1, r2) = tokio::join!(
-        alice.send(&e.app, "POST", &rows_uri(l), entity("Customer", "Customer")),
-        ed.send(&e.app, "POST", &rows_uri(l), entity("Customer", "Client")),
+        alice.send(
+            &e.app,
+            "POST",
+            &customer_rows,
+            entity("Customer", "Customer")
+        ),
+        ed.send(&e.app, "POST", &customer_rows, entity("Customer", "Client")),
     );
     let mut got = [r1.0.as_u16(), r2.0.as_u16()];
     got.sort();
