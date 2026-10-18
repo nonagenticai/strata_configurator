@@ -111,7 +111,7 @@ async fn record(st: &AppState, actor: &str, tenant: &Tenant, action: &str, metad
 /// Provision `tenant` and its first admin into care-bus: `put_tenant(active)`, then
 /// `put_user(first_admin_sub, tenant_admin)`. Best effort, never an error: a failure is audited as
 /// `carebus.provision_failed` (`{step, status, code}`) and leaves `carebus_provisioned_at` NULL; success
-/// sets it. With `CAREBUS_PROVISION_ENABLED` off nothing is called (`carebus.provision_skipped`).
+/// sets it. With `CAREBUS_PROVISION_ENABLED` off nothing is called and nothing is audited.
 pub async fn tenant_created(
     st: &AppState,
     actor: &str,
@@ -120,8 +120,8 @@ pub async fn tenant_created(
 ) -> CarebusProvision {
     let client = match st.carebus.as_deref() {
         Some(c) if st.cfg.carebus_provision_enabled => c,
+        // Off: no call and no audit event (the flag is the record; every create would log one).
         _ => {
-            record(st, actor, tenant, "carebus.provision_skipped", &json!({})).await;
             return CarebusProvision {
                 ok: false,
                 skipped: true,

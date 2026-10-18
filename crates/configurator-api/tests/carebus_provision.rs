@@ -248,7 +248,7 @@ async fn provision_off_by_default_makes_no_carebus_call() {
     assert_eq!(s, StatusCode::CREATED, "{b}");
     assert_eq!(b["carebus"]["skipped"], true);
     assert!(mock.requests().is_empty(), "no care-bus call while off");
-    assert_eq!(audited(&e, "carebus.provision_skipped").await, 2);
+    assert_eq!(audited(&e, "carebus.provision_failed").await, 0);
     let t = b["tenant"]["id"].as_str().unwrap();
     let (s, b) = root(
         &e.app,
