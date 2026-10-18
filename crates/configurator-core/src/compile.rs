@@ -1910,7 +1910,8 @@ mod tests {
         assert_eq!(codes(&errors), vec![ErrorCode::TombstoneMissing]);
         assert_eq!(errors[0].row_id, Some(id(2)));
         // The inherited set is per kind: the same key under another kind is not inherited.
-        let rows = [tomb(3, tenant(), Kind::KnowledgeStore, SPACE)];
+        let known = known_inherited(&["connector_slot:crm-core"]);
+        let rows = [tomb(3, tenant(), Kind::KnowledgeStore, "crm-core")];
         let errors = compile(&sel_tenant_only(), &known, &rules(), &rows)
             .expect_err("kind is part of the identity");
         assert_eq!(codes(&errors), vec![ErrorCode::TombstoneMissing]);
