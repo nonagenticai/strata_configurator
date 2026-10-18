@@ -165,3 +165,46 @@ pub async fn tenant_created(
         steps,
     }
 }
+
+/// Suspend an offboarded `tenant` in care-bus: `put_tenant(name, suspended)`, the idempotent upsert
+/// care-bus's own `PUT /api/tenants/{t}` takes. care-bus then refuses the tenant's members and service
+/// tokens (403 `tenant_suspended`) and drops its jobs from the scope registry, so agents stop serving
+/// it. Its users are left in place: care-bus has no disable for a user (only `DELETE`, which would lose
+/// the membership for good), and suspension already refuses every one of them.
+///
+/// Called after the licence revoke and the archive, never instead of them. Best effort, never an
+/// error, as [`tenant_created`]: a failure is audited as `carebus.offboard_failed`
+/// (`{step, status, code}`) and returned, and `POST /api/tenants/{id}/carebus-provision` re-runs it for
+/// an archived tenant. With `CAREBUS_PROVISION_ENABLED` off nothing is called and nothing is audited.
+pub async fn tenant_offboarded(st: &AppState, actor: &str, tenant: &Tenant) -> CarebusProvision {
+    let client = match st.carebus.as_deref() {
+        Some(c) if st.cfg.carebus_provision_enabled => c,
+        _ => {
+            return CarebusProvision {
+                ok: false,
+                skipped: true,
+                steps: Vec::new(),
+            };
+        }
+    };
+    let r = client
+        .put_tenant(tenant.id, &tenant.name, "suspended")
+        .await;
+    let step = StepOutcome::of("suspend", &r);
+    if !step.ok {
+        tracing::warn!(tenant = %tenant.id, "suspending the offboarded tenant in care-bus failed");
+        record(
+            st,
+            actor,
+            tenant,
+            "carebus.offboard_failed",
+            &json!({"step": step.step, "status": step.status, "code": step.error_code}),
+        )
+        .await;
+    }
+    CarebusProvision {
+        ok: step.ok,
+        skipped: false,
+        steps: vec![step],
+    }
+}

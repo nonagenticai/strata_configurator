@@ -382,7 +382,9 @@ async fn store_licence(
 }
 
 /// Super-admin only: re-run the care-bus provision of tenant `id` with its first active
-/// `tenant_admin`. 409 `carebus_provision_disabled` while `CAREBUS_PROVISION_ENABLED` is off.
+/// `tenant_admin`; for an archived (offboarded) tenant, re-run its care-bus suspend instead
+/// ([`provision::tenant_offboarded`]). 409 `carebus_provision_disabled` while
+/// `CAREBUS_PROVISION_ENABLED` is off.
 async fn carebus_provision(
     State(st): State<AppState>,
     caller: Caller,
@@ -399,8 +401,11 @@ async fn carebus_provision(
     let t = tenants::get(&st.db, id)
         .await?
         .ok_or_else(|| tenancy::tenant_not_found(id))?;
+    // An offboarded tenant is never provisioned active again: the retry re-runs its suspend.
     if t.archived_at.is_some() {
-        return Err(tenancy::tenant_suspended(id));
+        return Ok(Json(json!(
+            provision::tenant_offboarded(&st, &caller.sub, &t).await
+        )));
     }
     let admin: Option<String> = sqlx::query_scalar(
         "SELECT sub FROM users WHERE tenant = $1 AND tenant_role = 'tenant_admin' \
@@ -848,7 +853,9 @@ struct OffboardBody {
 /// `invalid_tenant`, 400 `invalid_body`, 404 `tenant_not_found`, 400 `confirm_mismatch` unless
 /// `confirm_name` is the tenant's name. Then the licence is revoked (502 `license_provisioning_failed`
 /// when that fails: nothing else changed, the tenant is live and still licensed, retry), then the tenant
-/// is archived and its users disabled, audited as `tenant.offboard`. 200 with the archived tenant.
+/// is archived and its users disabled, audited as `tenant.offboard`, then the tenant is suspended in
+/// care-bus (`carebus`, see [`provision::tenant_offboarded`]; a care-bus failure is audited as
+/// `carebus.offboard_failed` and returned, never an error). 200 with the archived tenant.
 ///
 /// Idempotent: offboarding an archived tenant is 200 with the same tenant (its original `archived_at`),
 /// `already_archived: true` and `license_revoked: null`, without calling licences; nothing is written
@@ -882,10 +889,13 @@ async fn offboard(
         offboarding::revoke_tenant_license(&st, &caller.sub, tenant).await?
     };
     let done = offboarding::archive_tenant(&st, &caller.sub, tenant, revoked.as_deref()).await?;
+    // Last, and on a repeat too (an idempotent PUT): suspend it in care-bus. Never blocks the offboard.
+    let carebus = provision::tenant_offboarded(&st, &caller.sub, &done.tenant).await;
     Ok(Json(json!({
         "tenant": done.tenant,
         "already_archived": done.already_archived,
         "license_revoked": revoked,
         "users_disabled": done.users_disabled,
+        "carebus": carebus,
     })))
 }

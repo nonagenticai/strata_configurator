@@ -21,10 +21,19 @@
 		importAdmin = $state(''),
 		saving = $state(false),
 		formError = $state('');
-	/** The tenant whose care-bus provisioning failed and can be retried. */
-	let retryable = $state<{ id: string; name: string } | null>(null);
+	/** The tenant whose care-bus provisioning (or, once offboarded, suspend) failed and can be retried. */
+	let retryable = $state<{ id: string; name: string; suspend?: boolean } | null>(null);
+	/** An offboard's care-bus outcome: the tenant suspended there (step `suspend`). */
+	function suspendText(c: CarebusProvision | undefined): string {
+		if (!c) return '';
+		if (c.skipped) return 'care-bus is off (not suspended there).';
+		if (c.ok) return 'Suspended in care-bus.';
+		const failed = c.steps.find((s) => !s.ok);
+		return `But suspending it in care-bus failed (${failed?.error_code ?? failed?.status ?? 'error'}), so it still works there; retry below.`;
+	}
 	function carebusText(c: CarebusProvision | undefined): string {
 		if (!c) return '';
+		if (c.steps[0]?.step === 'suspend') return suspendText(c);
 		if (c.skipped) return 'care-bus provisioning is off (skipped).';
 		if (c.ok) return 'Provisioned into care-bus.';
 		const failed = c.steps.find((s) => !s.ok);
@@ -126,8 +135,16 @@
 		offboarding = true;
 		failure = '';
 		try {
-			await api(`/api/tenants/${t.id}/offboard`, { confirm_name: typed.trim() }, { activeTenant: '' });
-			notice = `Offboarded “${t.name}”: its licence is revoked, the workspace is archived and its users are disabled.`;
+			const out = await api<{ carebus?: CarebusProvision }>(
+				`/api/tenants/${t.id}/offboard`,
+				{ confirm_name: typed.trim() },
+				{ activeTenant: '' },
+			);
+			notice = `Offboarded “${t.name}”: its licence is revoked, the workspace is archived and its users are disabled. ${suspendText(out?.carebus)}`;
+			retryable =
+				out?.carebus && !out.carebus.ok && !out.carebus.skipped
+					? { id: t.id, name: t.name, suspend: true }
+					: null;
 			target = null;
 			// The switcher must not offer (or stay on) a tenant every request would now refuse.
 			session.tenants = session.tenants.filter((s) => s.id !== t.id);
@@ -163,7 +180,9 @@
 {:else}
 	{#if error}<div class="error" role="alert">{error}</div>{/if}
 	{#if notice}<div class="notice" role="status">{notice}</div>{/if}
-	{#if retryable}<button onclick={retry}>Retry care-bus provision</button>{/if}
+	{#if retryable}<button onclick={retry}
+			>{retryable.suspend ? 'Retry care-bus suspend' : 'Retry care-bus provision'}</button
+		>{/if}
 	{#if formError}<div class="error" role="alert">{formError}</div>{/if}
 	<section class="card forms">
 		<form

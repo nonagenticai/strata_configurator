@@ -167,3 +167,62 @@ it('carebus outcome shows skipped when provisioning is off', async () => {
 	expect(await view.findByText(/care-bus provisioning is off \(skipped\)/)).toBeTruthy();
 	expect(view.queryByRole('button', { name: 'Retry care-bus provision' })).toBeNull();
 });
+
+it('offboard shows the care-bus suspend outcome', async () => {
+	vi.mocked(all).mockResolvedValueOnce([acme]).mockResolvedValueOnce([]);
+	vi.mocked(api).mockResolvedValue({
+		tenant: { ...acme, archived_at: '2026-10-18T00:00:00Z' },
+		carebus: {
+			ok: true,
+			skipped: false,
+			steps: [{ step: 'suspend', status: 200, ok: true, error_code: null }],
+		},
+	});
+	const { view, submit, input } = await openDialog();
+	await fireEvent.input(input, { target: { value: 'Acme' } });
+	await fireEvent.submit(submit.closest('form')!);
+	expect(await view.findByText(/Offboarded “Acme”.*Suspended in care-bus\./)).toBeTruthy();
+	expect(view.queryByRole('button', { name: 'Retry care-bus suspend' })).toBeNull();
+});
+
+it('offboard surfaces a failed care-bus suspend and retries it', async () => {
+	vi.mocked(all).mockResolvedValueOnce([acme]).mockResolvedValue([]);
+	vi.mocked(api).mockResolvedValueOnce({
+		tenant: { ...acme, archived_at: '2026-10-18T00:00:00Z' },
+		carebus: {
+			ok: false,
+			skipped: false,
+			steps: [{ step: 'suspend', status: null, ok: false, error_code: 'carebus_unavailable' }],
+		},
+	});
+	const { view, submit, input } = await openDialog();
+	await fireEvent.input(input, { target: { value: 'Acme' } });
+	await fireEvent.submit(submit.closest('form')!);
+	expect(
+		await view.findByText(/Offboarded “Acme”.*suspending it in care-bus failed \(carebus_unavailable\)/),
+	).toBeTruthy();
+	vi.mocked(api).mockResolvedValueOnce({
+		ok: true,
+		skipped: false,
+		steps: [{ step: 'suspend', status: 200, ok: true, error_code: null }],
+	});
+	await fireEvent.click(view.getByRole('button', { name: 'Retry care-bus suspend' }));
+	await waitFor(() =>
+		expect(api).toHaveBeenCalledWith(`/api/tenants/${acme.id}/carebus-provision`, {}, { activeTenant: '' }),
+	);
+	expect(await view.findByText(/“Acme”: Suspended in care-bus\./)).toBeTruthy();
+	expect(view.queryByRole('button', { name: 'Retry care-bus suspend' })).toBeNull();
+});
+
+it('offboard says so when care-bus is off', async () => {
+	vi.mocked(all).mockResolvedValueOnce([acme]).mockResolvedValueOnce([]);
+	vi.mocked(api).mockResolvedValue({
+		tenant: { ...acme, archived_at: '2026-10-18T00:00:00Z' },
+		carebus: { ok: false, skipped: true, steps: [] },
+	});
+	const { view, submit, input } = await openDialog();
+	await fireEvent.input(input, { target: { value: 'Acme' } });
+	await fireEvent.submit(submit.closest('form')!);
+	expect(await view.findByText(/Offboarded “Acme”.*care-bus is off \(not suspended there\)\./)).toBeTruthy();
+	expect(view.queryByRole('button', { name: /Retry care-bus/ })).toBeNull();
+});
