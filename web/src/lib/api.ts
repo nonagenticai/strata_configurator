@@ -117,3 +117,56 @@ export function layerLabel(l: Layer): string {
 		.filter(Boolean)
 		.join('/');
 }
+/** A release target (`/api/targets`): one job of the tenant with its stored selection. */
+export interface Target {
+	id: string;
+	job: string;
+	selection: Record<string, unknown>;
+	created_by: string;
+	created_at: string;
+}
+/** A built release (`cfg-YYYY-MM-DD.N`) of a target. */
+export interface Release {
+	id: string;
+	target: string;
+	release_id: string;
+	hash: string;
+	created_by: string;
+	created_at: string;
+}
+/** One care-bus call made while pushing a release. */
+export interface PushStep {
+	id: number;
+	step: 'tenant' | 'job' | 'release';
+	status: number | null;
+	ok: boolean;
+	response: Record<string, unknown> | null;
+	error_code: string | null;
+	pushed_at: string;
+}
+/** A care-bus release conflict: a tenant refinement the new base no longer fits. */
+export interface Conflict {
+	id: number;
+	kind: string;
+	object: string;
+	key: Record<string, unknown>;
+	tenant_row: string;
+}
+export interface Drift {
+	status: 'in_sync' | 'drift' | 'never_pushed' | 'carebus_has_no_release' | 'carebus_unavailable';
+	carebus: { release_id: string; hash: string; applied_at: string; conflicts: Conflict[] } | null;
+	last_pushed: { release_id: string; hash: string; pushed_at: string } | null;
+	latest_built: { release_id: string; hash: string } | null;
+	config_changed: boolean;
+}
+/** How provisioning a tenant into care-bus went (`carebus` on create and import). */
+export interface CarebusProvision {
+	ok: boolean;
+	skipped: boolean;
+	steps: { step: string; status: number | null; ok: boolean; error_code: string | null }[];
+}
+/** A bundle violation (422 `bundle_incomplete` / `bundle_invalid`). */
+export interface Violation {
+	path: string;
+	message: string;
+}

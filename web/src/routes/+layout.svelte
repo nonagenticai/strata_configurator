@@ -57,6 +57,7 @@
 				><span>◈</span> Compile</a
 			>
 			<a href="/layers" class:active={page.url.pathname === '/layers'}><span>▱</span> Layers</a>
+			<a href="/releases" class:active={page.url.pathname === '/releases'}><span>⇪</span> Releases</a>
 		</nav>
 		{#if session.superAdmin}<div class="nav-label">PLATFORM</div>
 			<nav aria-label="Platform navigation">
@@ -79,7 +80,9 @@
 							? 'Signups'
 							: page.url.pathname === '/tenants'
 								? 'Tenants'
-								: 'Compile'}</strong
+								: page.url.pathname === '/releases'
+									? 'Releases'
+									: 'Compile'}</strong
 				></span
 			>
 			<div class="account">
