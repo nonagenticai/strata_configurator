@@ -51,6 +51,8 @@ pub struct CbState {
     /// The conflicts every release report carries.
     pub conflicts: Vec<Value>,
     tenants: Vec<String>,
+    /// tenant → its `status` (`active` | `suspended`), as care-bus stores it.
+    statuses: HashMap<String, String>,
     jobs: Vec<(String, String)>,
     releases: HashMap<(String, String), JobReleases>,
 }
@@ -123,6 +125,11 @@ async fn grant(State(m): State<Shared>, body: String) -> Response {
     Json(json!({"access_token": CB_TOKEN, "expires_in": 300})).into_response()
 }
 
+/// care-bus `put_tenant` (`routes/tenancy.rs`): the JSON body is extracted before the handler runs, so a
+/// body that is not `{name: string, status: "active" | "suspended"}` is 400 `invalid_body` first; then the
+/// path must be a bare, non-nil uuid (400 `invalid_tenant_id`), then the trimmed name 1..=120 characters
+/// (400 `invalid_body`). An idempotent upsert of name and status: 201 when new, else 200, answering
+/// `{id, name, status}` with the trimmed name.
 async fn put_tenant(
     State(m): State<Shared>,
     Path(t): Path<String>,
@@ -133,14 +140,39 @@ async fn put_tenant(
     if let Some(r) = pre(&m, "PUT", format!("/api/tenants/{t}"), &h, &v, "tenant") {
         return r;
     }
+    let (Some(name), Some(status)) = (v["name"].as_str(), v["status"].as_str()) else {
+        return error(400, "invalid_body", "The request body is not valid");
+    };
+    if !matches!(status, "active" | "suspended") {
+        return error(
+            400,
+            "invalid_body",
+            "The request body is not valid: unknown variant",
+        );
+    }
+    match uuid::Uuid::parse_str(&t) {
+        Ok(u) if !u.is_nil() && t.len() == 36 => {}
+        _ => {
+            return error(
+                400,
+                "invalid_tenant_id",
+                "The tenant id must be a bare, non-nil uuid.",
+            );
+        }
+    }
+    let name = name.trim();
+    if !(1..=120).contains(&name.chars().count()) {
+        return error(400, "invalid_body", "name must be 1 to 120 characters");
+    }
     let mut s = lock(&m);
     let created = !s.tenants.contains(&t);
     if created {
         s.tenants.push(t.clone());
     }
+    s.statuses.insert(t.clone(), status.to_owned());
     reply(
         if created { 201 } else { 200 },
-        json!({"id": t, "name": v["name"], "status": v["status"]}),
+        json!({"id": t, "name": name, "status": status}),
     )
 }
 
@@ -387,6 +419,11 @@ impl CarebusMock {
 
     pub fn requests(&self) -> Vec<Recorded> {
         lock(&self.state).requests.clone()
+    }
+
+    /// The tenant's status in care-bus (`active` | `suspended`); `None` when care-bus never saw it.
+    pub fn tenant_status(&self, tenant: &str) -> Option<String> {
+        lock(&self.state).statuses.get(tenant).cloned()
     }
 
     pub fn grants(&self) -> usize {

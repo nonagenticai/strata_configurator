@@ -169,7 +169,8 @@ export interface Drift {
 	latest_built: { release_id: string; hash: string } | null;
 	config_changed: boolean;
 }
-/** How provisioning a tenant into care-bus went (`carebus` on create and import). */
+/** How provisioning a tenant into care-bus went (`carebus` on create and import), or suspending it
+ * there on offboard (one step, `suspend`). */
 export interface CarebusProvision {
 	ok: boolean;
 	skipped: boolean;

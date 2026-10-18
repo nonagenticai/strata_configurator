@@ -1,6 +1,6 @@
 //! The care-bus client (W4) against the local care-bus mock: bearer token, tenant header, error
 //! classification, token caching; and provision-down on tenant create, import and the retry route,
-//! behind CAREBUS_PROVISION_ENABLED.
+//! behind CAREBUS_PROVISION_ENABLED; and the suspend on offboarding (and its retry).
 mod common;
 
 use axum::http::StatusCode;
@@ -401,4 +401,203 @@ async fn retry_route_needs_the_super_admin() {
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+// ---- offboarding suspends the tenant in care-bus ----
+
+/// Tenant "Acme" (first admin `alice`) created with provisioning on; its id.
+async fn created(e: &common::TestEnv) -> String {
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    b["id"].as_str().unwrap().to_owned()
+}
+
+async fn offboard(e: &common::TestEnv, t: &str) -> (StatusCode, Value) {
+    root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/offboard"),
+        json!({"confirm_name": "Acme"}),
+    )
+    .await
+}
+
+async fn archived(e: &common::TestEnv, t: &str) -> bool {
+    sqlx::query_scalar("SELECT archived_at IS NOT NULL FROM tenant WHERE id = $1::uuid")
+        .bind(t)
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+/// The metadata of the one `carebus.offboard_failed` event.
+async fn offboard_failed_metadata(e: &common::TestEnv) -> Value {
+    sqlx::query_scalar("SELECT metadata FROM audit_event WHERE action = 'carebus.offboard_failed'")
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn offboard_suspends_the_tenant_in_carebus() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let t = created(&e).await;
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("active"), "control");
+    let before = mock.requests().len();
+
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(archived(&e, &t).await);
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(b["carebus"]["skipped"], false);
+    assert_eq!(b["carebus"]["steps"][0]["step"], "suspend");
+    assert_eq!(b["carebus"]["steps"].as_array().unwrap().len(), 1);
+    let sent: Vec<(String, String, Value)> = mock.requests()[before..]
+        .iter()
+        .map(|r| (r.method.clone(), r.path.clone(), r.body.clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        [(
+            "PUT".to_owned(),
+            format!("/api/tenants/{t}"),
+            json!({"name": "Acme", "status": "suspended"})
+        )],
+        "one suspend, nothing else (care-bus has no user-disable; suspension refuses its members)"
+    );
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("suspended"));
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 0);
+
+    // A repeat offboard re-sends the same suspend (idempotent upsert, 200).
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["already_archived"], true);
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(b["carebus"]["steps"][0]["status"], 200);
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("suspended"));
+}
+
+#[tokio::test]
+async fn offboard_carebus_failure_is_audited_surfaced_and_retryable() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let t = created(&e).await;
+    mock.answer("tenant", 503, json!({}));
+
+    // The offboard itself completes: care-bus failing never blocks it.
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(archived(&e, &t).await);
+    assert_eq!(b["carebus"]["ok"], false, "{b}");
+    assert_eq!(b["carebus"]["skipped"], false);
+    assert_eq!(b["carebus"]["steps"][0]["step"], "suspend");
+    assert_eq!(
+        b["carebus"]["steps"][0]["error_code"],
+        "carebus_unavailable"
+    );
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 1);
+    let meta = offboard_failed_metadata(&e).await;
+    assert_eq!(meta["step"], "suspend", "{meta}");
+    assert_eq!(meta["code"], "carebus_unavailable", "{meta}");
+    assert_eq!(
+        mock.tenant_status(&t).as_deref(),
+        Some("active"),
+        "still active in care-bus"
+    );
+
+    // The retry route re-runs the suspend for an archived tenant (not the active provision).
+    mock.clear_answer("tenant");
+    let before = mock.requests().len();
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["ok"], true, "{b}");
+    assert_eq!(b["steps"][0]["step"], "suspend");
+    let sent = &mock.requests()[before..];
+    assert_eq!(sent.len(), 1, "only the suspend: no user is provisioned");
+    assert_eq!(sent[0].path, format!("/api/tenants/{t}"));
+    assert_eq!(sent[0].body, json!({"name": "Acme", "status": "suspended"}));
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("suspended"));
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 1);
+}
+
+#[tokio::test]
+async fn offboard_carebus_rejection_carries_its_code() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let t = created(&e).await;
+    mock.answer(
+        "tenant",
+        403,
+        json!({"error": {"code": "forbidden", "message": "this needs the provisioner role"}}),
+    );
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["carebus"]["ok"], false);
+    assert_eq!(b["carebus"]["steps"][0]["status"], 403);
+    assert_eq!(b["carebus"]["steps"][0]["error_code"], "forbidden");
+    let meta = offboard_failed_metadata(&e).await;
+    assert_eq!(
+        (&meta["status"], &meta["code"]),
+        (&json!(403), &json!("forbidden"))
+    );
+}
+
+#[tokio::test]
+async fn offboard_with_provision_off_makes_no_carebus_call() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, false).await;
+    let t = created(&e).await;
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(archived(&e, &t).await);
+    assert_eq!(
+        b["carebus"],
+        json!({"ok": false, "skipped": true, "steps": []})
+    );
+    assert!(mock.requests().is_empty(), "no care-bus call while off");
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 0);
+}
+
+#[tokio::test]
+async fn mock_put_tenant_validates_like_carebus() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    // An unknown status is rejected by care-bus's typed body: 400 invalid_body.
+    match c.put_tenant(t, "Acme", "archived").await {
+        Err(CarebusError::Rejected { status, code, .. }) => {
+            assert_eq!((status, code.as_deref()), (400, Some("invalid_body")));
+        }
+        other => panic!("expected 400 invalid_body, got {other:?}"),
+    }
+    assert_eq!(mock.tenant_status(&t.to_string()), None);
+    assert_eq!(
+        c.put_tenant(t, "Acme", "suspended").await.unwrap().status,
+        201
+    );
+    assert_eq!(
+        c.put_tenant(t, "Acme", "suspended").await.unwrap().status,
+        200
+    );
+    assert_eq!(
+        c.put_tenant(t, "Acme", "active").await.unwrap().body["status"],
+        "active"
+    );
+    assert_eq!(
+        mock.tenant_status(&t.to_string()).as_deref(),
+        Some("active")
+    );
 }

@@ -1220,6 +1220,38 @@ async fn a_failed_licence_revoke_keeps_the_tenant_live() {
 }
 
 #[tokio::test]
+async fn a_failed_licence_revoke_does_not_suspend_in_carebus() {
+    // Order: licence revoke, archive, THEN the care-bus suspend. A failed revoke leaves the tenant
+    // live everywhere, care-bus included; the retry suspends it there.
+    let up = upstream().await;
+    let cb = common::carebus_mock::CarebusMock::start().await;
+    let mut cfg = up.licensing();
+    cfg.extend(cb.config());
+    cfg.push(("CAREBUS_PROVISION_ENABLED", "true".into()));
+    let e = common::env_with(&cfg).await;
+    let t = tenant(&e).await;
+    up.set_introspection(json!({
+        "active": true, "tenant_id": t, "app": {"key": "strata-configurator"},
+        "expires_at": "2999-01-01T00:00:00Z"
+    }));
+    let provisioned = cb.requests().len();
+    lock(&up.mock).revoke_down = true;
+    let (s, b) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
+    assert_eq!(cb.requests().len(), provisioned, "no care-bus call");
+    assert_eq!(cb.tenant_status(&t.to_string()).as_deref(), Some("active"));
+
+    lock(&up.mock).revoke_down = false;
+    let (s, b) = offboard(&e, t, "Acme").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(
+        cb.tenant_status(&t.to_string()).as_deref(),
+        Some("suspended")
+    );
+}
+
+#[tokio::test]
 async fn offboarding_an_archived_tenant_is_the_same_answer_without_licences() {
     let (up, e, t) = licensed().await;
     let (s, first) = offboard(&e, t, "Acme").await;
