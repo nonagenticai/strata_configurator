@@ -713,7 +713,17 @@ async fn drift_when_carebus_holds_other_release() {
 #[tokio::test]
 async fn never_pushed() {
     let mock = CarebusMock::start().await;
-    let e = seeded(&mock).await;
+    // Provisioning on: tenant create puts the tenant into care-bus, but not the job. care-bus then
+    // answers the read-back 404 "job not found", which is "no release".
+    let mut cfg = mock.config();
+    cfg.push(("CAREBUS_PROVISION_ENABLED", "true".into()));
+    let e = common::env_with(&cfg).await;
+    configurator_api::seeder::apply(
+        &e.state.owner,
+        &configurator_api::seeder::embedded().unwrap(),
+    )
+    .await
+    .unwrap();
     let (_, target, r) = released(&e, "alice").await;
     let d = drift(&e, "alice", &target).await;
     assert_eq!(d["status"], "never_pushed", "{d}");
@@ -739,6 +749,18 @@ async fn never_pushed() {
 }
 
 #[tokio::test]
+async fn tenant_unknown_to_carebus_is_unavailable() {
+    let mock = CarebusMock::start().await;
+    // Provisioning off: care-bus has never heard of the tenant (404 "tenant not found"), which is an
+    // error, not "no release".
+    let e = seeded(&mock).await;
+    let (_, target, _) = released(&e, "alice").await;
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "carebus_unavailable", "{d}");
+    assert_eq!(d["carebus"], Value::Null);
+}
+
+#[tokio::test]
 async fn carebus_404_is_no_release() {
     let mock = CarebusMock::start().await;
     let e = seeded(&mock).await;
@@ -748,6 +770,14 @@ async fn carebus_404_is_no_release() {
         "current",
         404,
         json!({"error": {"code": "not_found", "message": "release not found"}}),
+    );
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "carebus_has_no_release", "{d}");
+    // The job gone from care-bus is no release either.
+    mock.answer(
+        "current",
+        404,
+        json!({"error": {"code": "not_found", "message": "job not found"}}),
     );
     let d = drift(&e, "alice", &target).await;
     assert_eq!(d["status"], "carebus_has_no_release", "{d}");

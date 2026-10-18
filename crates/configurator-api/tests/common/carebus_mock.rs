@@ -144,6 +144,37 @@ async fn put_tenant(
     )
 }
 
+/// care-bus's tenant scope for the release-writer (`tenancy.rs`): the header must name a bare, non-nil
+/// tenant uuid (400 `active_tenant_required` / `invalid_active_tenant`), the tenant must exist (404
+/// `not_found` "tenant not found"), then the job must exist in it (404 "job not found", `job_ctx`).
+fn job_scope(s: &CbState, h: &HeaderMap, job: &str) -> Result<String, Response> {
+    let Some(raw) = h.get("x-active-tenant-id").and_then(|v| v.to_str().ok()) else {
+        return Err(error(
+            400,
+            "active_tenant_required",
+            "Name the tenant to act in with the X-Active-Tenant-Id header.",
+        ));
+    };
+    match uuid::Uuid::parse_str(raw) {
+        Ok(u) if !u.is_nil() && raw.len() == 36 => {}
+        _ => {
+            return Err(error(
+                400,
+                "invalid_active_tenant",
+                "X-Active-Tenant-Id must be a bare, non-nil tenant uuid",
+            ));
+        }
+    }
+    let tenant = raw.to_owned();
+    if !s.tenants.contains(&tenant) {
+        return Err(error(404, "not_found", "tenant not found"));
+    }
+    if !s.jobs.contains(&(tenant.clone(), job.to_owned())) {
+        return Err(error(404, "not_found", "job not found"));
+    }
+    Ok(tenant)
+}
+
 async fn put_user(
     State(m): State<Shared>,
     Path((t, sub)): Path<(String, String)>,
@@ -160,6 +191,9 @@ async fn put_user(
         "user",
     ) {
         return r;
+    }
+    if !lock(&m).tenants.contains(&t) {
+        return error(404, "not_found", "tenant not found");
     }
     reply(200, json!({"sub": sub, "tenant_role": v["tenant_role"]}))
 }
@@ -182,6 +216,9 @@ async fn put_job(
         return r;
     }
     let mut s = lock(&m);
+    if !s.tenants.contains(&t) {
+        return error(404, "not_found", "tenant not found");
+    }
     let id = (t, key.clone());
     let created = !s.jobs.contains(&id);
     if created {
@@ -219,16 +256,9 @@ async fn put_release(
     if let Some(r) = pre(&m, "PUT", path, &h, &v, "release") {
         return r;
     }
-    let Some(tenant) = h
-        .get("x-active-tenant-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return error(
-            400,
-            "active_tenant_required",
-            "X-Active-Tenant-Id is required.",
-        );
+    let tenant = match job_scope(&lock(&m), &h, &job) {
+        Ok(t) => t,
+        Err(r) => return r,
     };
     if v["schema"] != SCHEMA_V1 {
         return error(400, "invalid_bundle", "schema");
@@ -295,15 +325,14 @@ async fn get_release(
     if let Some(r) = pre(&m, "GET", path, &h, &Value::Null, "current") {
         return r;
     }
+    let s = lock(&m);
+    let tenant = match job_scope(&s, &h, &job) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
     if rid != "current" {
         return error(404, "not_found", "release not found");
     }
-    let tenant = h
-        .get("x-active-tenant-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    let s = lock(&m);
     let conflicts = s.conflicts.clone();
     match s
         .releases

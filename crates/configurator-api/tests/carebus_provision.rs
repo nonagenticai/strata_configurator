@@ -27,6 +27,14 @@ fn client(mock: &CarebusMock) -> CarebusClient {
     CarebusClient::new(&cfg, reqwest::Client::new())
 }
 
+/// Tenant `t` and job `JOB` provisioned in the mock, as a push does before its release.
+async fn provisioned(c: &CarebusClient) -> Uuid {
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
+    t
+}
+
 /// The golden fixture's bundle as our release `RELEASE`.
 fn body() -> Value {
     let golden: ReleaseBodyV1 = serde_json::from_str(FIXTURE).expect("fixture parses");
@@ -40,6 +48,7 @@ async fn client_sends_bearer_and_tenant_header() {
     let t = Uuid::new_v4();
     let r = c.put_tenant(t, "Acme", "active").await.expect("tenant");
     assert_eq!(r.status, 201);
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
     let r = c
         .put_release(t, JOB, RELEASE, &body())
         .await
@@ -49,7 +58,7 @@ async fn client_sends_bearer_and_tenant_header() {
     assert_eq!(r.body["release_id"], RELEASE);
 
     let seen = mock.requests();
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 3);
     for req in &seen {
         assert_eq!(
             req.auth.as_deref(),
@@ -62,9 +71,10 @@ async fn client_sends_bearer_and_tenant_header() {
         "provisioning names the tenant in the path"
     );
     assert_eq!(seen[0].body, json!({"name": "Acme", "status": "active"}));
-    assert_eq!(seen[1].path, format!("/api/jobs/{JOB}/releases/{RELEASE}"));
-    assert_eq!(seen[1].tenant, Some(t.to_string()));
-    assert_eq!(seen[1].body, body());
+    assert_eq!(seen[1].tenant, None);
+    assert_eq!(seen[2].path, format!("/api/jobs/{JOB}/releases/{RELEASE}"));
+    assert_eq!(seen[2].tenant, Some(t.to_string()));
+    assert_eq!(seen[2].body, body());
 }
 
 #[tokio::test]
@@ -72,11 +82,12 @@ async fn put_job_never_sends_settings() {
     let mock = CarebusMock::start().await;
     let c = client(&mock);
     let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
     c.put_job(t, JOB, "Customer care agent").await.expect("job");
     c.put_user(t, "alice@example.test", "tenant_admin")
         .await
         .expect("user");
-    let seen = mock.requests();
+    let seen = &mock.requests()[1..];
     assert_eq!(seen[0].path, format!("/api/tenants/{t}/jobs/{JOB}"));
     assert_eq!(seen[0].body, json!({"label": "Customer care agent"}));
     assert_eq!(
@@ -92,6 +103,11 @@ async fn release_404_is_none() {
     let mock = CarebusMock::start().await;
     let c = client(&mock);
     let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    // The job is not provisioned yet: care-bus answers 404 "job not found", which is "no release".
+    assert_eq!(c.current_release(t, JOB).await.expect("read-back"), None);
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
+    // The job exists but was never released: 404 "release not found", also "no release".
     assert_eq!(c.current_release(t, JOB).await.expect("read-back"), None);
     c.put_release(t, JOB, RELEASE, &body()).await.expect("push");
     let current = c
@@ -101,16 +117,47 @@ async fn release_404_is_none() {
         .expect("a current release");
     assert_eq!(current["release_id"], RELEASE);
     assert_eq!(current["hash"], body()["hash"]);
-    // Another 404 (an unknown job) is not "no release".
+    // Any other 404 is not "no release": e.g. a route care-bus does not know.
     mock.answer(
         "current",
         404,
-        json!({"error": {"code": "not_found", "message": "job not found"}}),
+        json!({"error": {"code": "not_found", "message": "route not found"}}),
     );
     assert!(matches!(
         c.current_release(t, JOB).await,
         Err(CarebusError::Rejected { status: 404, .. })
     ));
+}
+
+#[tokio::test]
+async fn unknown_tenant_is_an_error_not_no_release() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    // care-bus resolves the header's tenant first: 404 "tenant not found".
+    match c.current_release(Uuid::new_v4(), JOB).await {
+        Err(CarebusError::Rejected { status, code, body }) => {
+            assert_eq!((status, code.as_deref()), (404, Some("not_found")));
+            assert_eq!(body["error"]["message"], "tenant not found");
+        }
+        other => panic!("expected the tenant 404, got {other:?}"),
+    }
+    match c.put_release(Uuid::new_v4(), JOB, RELEASE, &body()).await {
+        Err(CarebusError::Rejected { status, body, .. }) => {
+            assert_eq!(status, 404);
+            assert_eq!(body["error"]["message"], "tenant not found");
+        }
+        other => panic!("expected the tenant 404, got {other:?}"),
+    }
+    // A release for an unprovisioned job: 404 "job not found", before the body is looked at.
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    match c.put_release(t, JOB, RELEASE, &body()).await {
+        Err(CarebusError::Rejected { status, body, .. }) => {
+            assert_eq!(status, 404);
+            assert_eq!(body["error"]["message"], "job not found");
+        }
+        other => panic!("expected the job 404, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -131,9 +178,10 @@ async fn rejected_carries_code() {
     }
     // A body with a wrong hash is refused by the mock as care-bus refuses it.
     mock.clear_answer("release");
+    let t = provisioned(&c).await;
     let mut bad = body();
     bad["hash"] = json!(format!("sha256:{}", "0".repeat(64)));
-    match c.put_release(Uuid::new_v4(), JOB, RELEASE, &bad).await {
+    match c.put_release(t, JOB, RELEASE, &bad).await {
         Err(CarebusError::Rejected { status, code, .. }) => {
             assert_eq!(
                 (status, code.as_deref()),

@@ -186,7 +186,10 @@ impl CarebusClient {
     }
 
     /// `GET /api/jobs/{job}/releases/current` in `tenant`: the release report with its open
-    /// conflicts; `None` when the job never had a release (care-bus's 404 "release not found").
+    /// conflicts; `None` when care-bus has no release for the job. care-bus resolves the tenant, then
+    /// the job, then the release (`tenancy.rs` `job_ctx`), all as 404 `not_found` told apart by the
+    /// message: "job not found" (the job was never provisioned) and "release not found" (it was, but
+    /// never released) both mean no release. "tenant not found" and any other 404 stay errors.
     pub async fn current_release(
         &self,
         tenant: Uuid,
@@ -204,7 +207,13 @@ impl CarebusClient {
             Ok(r) => Ok(Some(r.body)),
             Err(CarebusError::Rejected {
                 status: 404, body, ..
-            }) if body["error"]["message"].as_str() == Some("release not found") => Ok(None),
+            }) if matches!(
+                body["error"]["message"].as_str(),
+                Some("release not found" | "job not found")
+            ) =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
