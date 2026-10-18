@@ -226,3 +226,74 @@ it('offboard says so when care-bus is off', async () => {
 	expect(await view.findByText(/Offboarded “Acme”.*care-bus is off \(not suspended there\)\./)).toBeTruthy();
 	expect(view.queryByRole('button', { name: /Retry care-bus/ })).toBeNull();
 });
+
+const gone = {
+	id: '7a2b3c4d-5e6f-4a70-8b9c-0d1e2f3a4b5c',
+	name: 'Gone Ltd',
+	created_at: '2026-10-01T10:00:00Z',
+	archived_at: '2026-10-18T09:30:00Z',
+};
+
+it('the archived view lists offboarded tenants and retries their care-bus suspend', async () => {
+	// live view first, then the archived view (the API returns live + archived with include_archived)
+	vi.mocked(all).mockResolvedValueOnce([acme]).mockResolvedValueOnce([acme, gone]);
+	const view = render(Tenants);
+	await view.findByText('Acme');
+	expect(view.queryByText('Gone Ltd')).toBeNull();
+	await fireEvent.click(view.getByRole('button', { name: 'Archived' }));
+	await waitFor(() =>
+		expect(all).toHaveBeenLastCalledWith('/api/tenants?include_archived=true', { activeTenant: '' }),
+	);
+	const row = (await view.findByText('Gone Ltd')).closest('tr')!;
+	expect(row.textContent).toContain(gone.id);
+	expect(row.textContent).toContain(new Date(gone.archived_at).toLocaleString());
+	// only archived tenants are in this view, and none can be offboarded again
+	expect(view.queryByText('Acme')).toBeNull();
+	expect(view.queryByRole('button', { name: /^Offboard / })).toBeNull();
+
+	vi.mocked(api).mockResolvedValueOnce({
+		ok: false,
+		skipped: false,
+		steps: [{ step: 'suspend', status: 503, ok: false, error_code: 'carebus_unavailable' }],
+	});
+	await fireEvent.click(view.getByRole('button', { name: 'Retry care-bus suspend for Gone Ltd' }));
+	await waitFor(() =>
+		expect(api).toHaveBeenCalledWith(`/api/tenants/${gone.id}/carebus-provision`, {}, { activeTenant: '' }),
+	);
+	expect(await view.findByText(/suspending it in care-bus failed \(carebus_unavailable\)/)).toBeTruthy();
+
+	vi.mocked(api).mockResolvedValueOnce({
+		ok: true,
+		skipped: false,
+		steps: [{ step: 'suspend', status: 200, ok: true, error_code: null }],
+	});
+	await fireEvent.click(view.getByRole('button', { name: 'Retry care-bus suspend for Gone Ltd' }));
+	expect(await view.findByText('Suspended in care-bus.')).toBeTruthy();
+});
+
+it('the archived view says so when there are none and switches back to live', async () => {
+	vi.mocked(all).mockResolvedValueOnce([acme]).mockResolvedValueOnce([acme]).mockResolvedValueOnce([acme]);
+	const view = render(Tenants);
+	await view.findByText('Acme');
+	await fireEvent.click(view.getByRole('button', { name: 'Archived' }));
+	expect(await view.findByText('No archived tenants.')).toBeTruthy();
+	await fireEvent.click(view.getByRole('button', { name: 'Live' }));
+	expect(await view.findByText('Acme')).toBeTruthy();
+	expect(all).toHaveBeenLastCalledWith('/api/tenants', { activeTenant: '' });
+});
+
+it('a retry failure in the archived view is shown on the row', async () => {
+	vi.mocked(all).mockResolvedValueOnce([acme]).mockResolvedValueOnce([gone]);
+	vi.mocked(api).mockRejectedValueOnce(
+		new ApiError(
+			'carebus_provision_disabled',
+			'provisioning into care-bus is off (CAREBUS_PROVISION_ENABLED)',
+		),
+	);
+	const view = render(Tenants);
+	await view.findByText('Acme');
+	await fireEvent.click(view.getByRole('button', { name: 'Archived' }));
+	await fireEvent.click(await view.findByRole('button', { name: 'Retry care-bus suspend for Gone Ltd' }));
+	const row = view.getByText('Gone Ltd').closest('tr')!;
+	await waitFor(() => expect(row.textContent).toContain('CAREBUS_PROVISION_ENABLED'));
+});
