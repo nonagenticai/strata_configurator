@@ -7,6 +7,7 @@
 		type Row,
 		type EffectiveConfig,
 		type CompileError,
+		type Origin,
 	} from '$lib/api';
 	import { session } from '$lib/session.svelte';
 	import Provenance from '$lib/Provenance.svelte';
@@ -27,15 +28,65 @@
 		errors = $state<CompileError[]>([]),
 		loading = $state(true),
 		compiling = $state(false);
-	let tab = $state('entity'),
+	/** One tab per overlay kind the compiled view lists; the value is the overlay `kind`. */
+	const tabs = [
+		['entity', 'Entities'],
+		['attribute', 'Attributes'],
+		['relation', 'Relations'],
+		['context_space', 'Context spaces'],
+		['procedure', 'Procedures'],
+		['connector_slot', 'Connector slots'],
+		['knowledge_store', 'Knowledge stores'],
+	] as const;
+	type Tab = (typeof tabs)[number][0];
+	let tab = $state<Tab>('entity'),
 		search = $state('');
+	/** The active tenant's layer (null until it exists) and its current tombstones: what this tenant hides. */
+	let tenantLayer = $state<Layer | null>(null),
+		hiddenRows = $state<Row[]>([]),
+		hiding = $state(''),
+		hideError = $state(''),
+		hideNotice = $state('');
+	/** Acting in a tenant: a member always is; a super-admin when a tenant is selected or they have a home one. */
+	let inTenant = $derived(
+		session.superAdmin ? !!session.activeTenant || !!session.workspace : !!session.workspace,
+	);
+	/** Hiding needs tenant_admin in that tenant (a super-admin acting in it counts); tenant_user only sees state. */
+	let canHide = $derived(inTenant && (session.superAdmin || session.workspace?.role === 'tenant_admin'));
+	function itemsOf(r: EffectiveConfig, kind: Tab): Record<string, Record<string, unknown>> {
+		const c = r.job_content;
+		switch (kind) {
+			case 'entity':
+				return r.entities;
+			case 'attribute':
+				return r.attributes;
+			case 'relation':
+				return r.relations;
+			case 'context_space':
+				return c?.context_spaces ?? {};
+			case 'procedure':
+				return c?.procedures ?? {};
+			case 'connector_slot':
+				return c?.connectors ?? {};
+			case 'knowledge_store':
+				return c?.knowledge_stores ?? {};
+		}
+	}
+	/** A base item: every row that built it is a platform (inherited) row, none is this tenant's own. */
+	function isBase(origins: Origin[] | undefined): boolean {
+		return !!origins?.length && origins.every((o) => o.layer.scope !== 'tenant');
+	}
+	let hiddenKeys = $derived(new Set(hiddenRows.map((r) => `${r.kind}:${r.key}`)));
+	let hiddenEntries = $derived(
+		hiddenRows.filter((r) => r.kind === tab && r.key.toLowerCase().includes(search.toLowerCase())),
+	);
 	let selectedProfile = $derived(profiles.find((p) => p.id === profile));
 	let departmentOptions = $derived(dimensions.find((d) => d.key === 'department')?.values || []);
 	let entries = $derived(
 		result
-			? Object.entries(
-					tab === 'entity' ? result.entities : tab === 'attribute' ? result.attributes : result.relations,
-				).filter(([key]) => key.toLowerCase().includes(search.toLowerCase()))
+			? Object.entries(itemsOf(result, tab)).filter(
+					([key]) => key.toLowerCase().includes(search.toLowerCase()) && !hiddenKeys.has(`${tab}:${key}`),
+				)
 			: [],
 	);
 	let context = 0;
@@ -54,6 +105,11 @@
 		selectedDimensions = {};
 		customProfile = '{}';
 		compiling = false;
+		tenantLayer = null;
+		hiddenRows = [];
+		hiding = '';
+		hideError = '';
+		hideNotice = '';
 		async function load() {
 			try {
 				const opts = { activeTenant, signal: controller.signal };
@@ -78,7 +134,11 @@
 						})),
 					),
 				]);
+				const ownLayer = layers.find((l) => l.scope === 'tenant') ?? null;
+				const ownRows = ownLayer ? await all<Row>(`/api/layers/${ownLayer.id}/rows`, opts) : [];
 				if (controller.signal.aborted) return;
+				tenantLayer = ownLayer;
+				hiddenRows = ownRows.filter((r) => r.op === 'tombstone');
 				industries = [...new Set(layers.map((l) => l.industry).filter((v): v is string => !!v))].sort();
 				jobs = [
 					...new Set(
@@ -99,11 +159,12 @@
 		void load();
 		return () => controller.abort();
 	});
-	async function compile() {
+	/** `keep`: leave the current result on screen until the new one arrives (a recompile after hide/unhide). */
+	async function compile(keep = false) {
 		compiling = true;
 		error = '';
 		errors = [];
-		result = null;
+		if (!keep) result = null;
 		const generation = context;
 		try {
 			const body = {
@@ -121,12 +182,63 @@
 			if (generation === context) result = value;
 		} catch (e) {
 			if (generation === context) {
+				result = null;
 				error = e instanceof Error ? e.message : String(e);
 				errors = e instanceof ApiError ? e.errors : [];
 			}
 		} finally {
 			if (generation === context) compiling = false;
 		}
+	}
+	/** The tenant's layer, created on first use; a concurrent creator's 409 `layer_exists` reuses theirs. */
+	async function ensureTenantLayer(): Promise<Layer> {
+		if (tenantLayer) return tenantLayer;
+		let layer: Layer | undefined;
+		try {
+			layer = await api<Layer>('/api/layers', { scope: 'tenant' });
+		} catch (e) {
+			if (!(e instanceof ApiError && e.code === 'layer_exists')) throw e;
+			layer = (await all<Layer>('/api/layers?scope=tenant')).find((l) => l.scope === 'tenant');
+			if (!layer) throw e;
+		}
+		tenantLayer = layer;
+		return layer;
+	}
+	/** Run a hide/unhide write, then recompile so the preview shows the effect. */
+	async function change(id: string, write: () => Promise<string>) {
+		const generation = context;
+		hiding = id;
+		hideError = '';
+		hideNotice = '';
+		try {
+			const notice = await write();
+			if (generation !== context) return;
+			hideNotice = notice;
+			if (result) await compile(true);
+		} catch (e) {
+			if (generation === context) hideError = e instanceof Error ? e.message : String(e);
+		} finally {
+			if (generation === context) hiding = '';
+		}
+	}
+	function hide(kind: Tab, key: string) {
+		return change(`${kind}:${key}`, async () => {
+			const layer = await ensureTenantLayer();
+			const row = await api<Row>(`/api/layers/${layer.id}/rows`, { kind, key, op: 'tombstone', fields: {} });
+			hiddenRows = [...hiddenRows, row];
+			return `${key} is now hidden in this tenant.`;
+		});
+	}
+	function unhide(row: Row) {
+		return change(`${row.kind}:${row.key}`, async () => {
+			await api<void>(
+				`/api/layers/${tenantLayer?.id}/rows/${row.kind}/${encodeURIComponent(row.key)}?expected_rev=${row.rev}`,
+				undefined,
+				{ method: 'DELETE' },
+			);
+			hiddenRows = hiddenRows.filter((r) => r.id !== row.id);
+			return `${row.key} is visible again in this tenant.`;
+		});
 	}
 	function useGolden() {
 		industry = 'retail';
@@ -255,10 +367,10 @@
 				</div>
 				<div class="result-tools">
 					<div class="tabs" role="group" aria-label="Object kind">
-						{#each [['entity', 'Entities'], ['attribute', 'Attributes'], ['relation', 'Relations']] as [value, label]}<button
+						{#each tabs as [value, label]}<button
 								class:chosen={tab === value}
 								onclick={() => {
-									tab = value!;
+									tab = value;
 									search = '';
 								}}>{label}</button
 							>{/each}
@@ -269,19 +381,61 @@
 						bind:value={search}
 					/>
 				</div>
+				{#if hideError}<div class="error hide-error" role="alert">{hideError}</div>{/if}
+				{#if hideNotice}<p class="hide-notice" role="status">{hideNotice}</p>{/if}
 				<div class="table-wrap">
 					<table>
-						<thead><tr><th>OBJECT</th><th>DETAILS</th><th>PROVENANCE</th></tr></thead><tbody
-							>{#each entries as [key, value]}<tr
+						<thead
+							><tr
+								><th>OBJECT</th><th>DETAILS</th><th>PROVENANCE</th>{#if inTenant}<th
+										><span class="sr-only">Visibility</span></th
+									>{/if}</tr
+							></thead
+						><tbody
+							>{#each entries as [key, value]}{@const origins = result.provenance[`${tab}:${key}`]}<tr
 									><td><code class="object-key">{key}</code></td><td
-										><span>{String(value.label || value.data_type || value.cardinality || '')}</span
+										><span
+											>{String(
+												value.label ||
+													value.name ||
+													value.data_type ||
+													value.cardinality ||
+													value.status ||
+													'',
+											)}</span
 										>{#if value.pii}<span class="pill">PII</span>{/if}</td
-									><td><Provenance origins={result.provenance[`${tab}:${key}`]} /></td></tr
-								>{:else}<tr><td colspan="3" class="empty">No matching objects.</td></tr>{/each}</tbody
+									><td><Provenance {origins} /></td>{#if inTenant}<td class="visibility"
+											>{#if canHide && isBase(origins)}<button
+													class="hide-button"
+													aria-label={`Hide ${key} in this tenant`}
+													disabled={!!hiding}
+													onclick={() => hide(tab, key)}
+													>{hiding === `${tab}:${key}` ? 'Hiding…' : 'Hide in this tenant'}</button
+												>{/if}</td
+										>{/if}</tr
+								>{/each}{#each hiddenEntries as row}<tr class="hidden-row"
+									><td><code class="object-key">{row.key}</code></td><td colspan="2"
+										><span class="pill hidden-pill">Hidden in this tenant</span></td
+									><td class="visibility"
+										>{#if canHide}<button
+												class="hide-button"
+												aria-label={`Unhide ${row.key}`}
+												disabled={!!hiding}
+												onclick={() => unhide(row)}
+												>{hiding === `${row.kind}:${row.key}` ? 'Unhiding…' : 'Unhide'}</button
+											>{/if}</td
+									></tr
+								>{/each}{#if !entries.length && !hiddenEntries.length}<tr
+									><td colspan={inTenant ? 4 : 3} class="empty">No matching objects.</td></tr
+								>{/if}</tbody
 						>
 					</table>
 				</div>
 			</section>
+			{#if inTenant}<p class="muted hide-hint">
+					Hiding an inherited item removes it from this tenant's preview now; it takes effect in the next
+					release build and push.
+				</p>{/if}
 			<div class="hash">
 				<span class="status-dot"></span><span>CONFIGURATION HASH</span><code>{result.hash}</code>
 			</div>
@@ -394,6 +548,33 @@
 		font-size: 11px;
 		padding: 8px 10px;
 		width: 150px;
+	}
+	.visibility {
+		text-align: right;
+		white-space: nowrap;
+	}
+	.hide-button {
+		background: none;
+		color: var(--teal);
+		border: 1px solid var(--line);
+		font-size: 10px;
+		padding: 4px 8px;
+	}
+	.hidden-row {
+		opacity: 0.75;
+	}
+	.hidden-pill {
+		background: #fcf0e9;
+		color: #995d42;
+	}
+	.hide-error,
+	.hide-notice {
+		margin: 12px 20px 0;
+		font-size: 11px;
+	}
+	.hide-hint {
+		font-size: 10px;
+		margin: 12px 0 0;
 	}
 	.object-key {
 		color: var(--teal);

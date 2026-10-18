@@ -43,8 +43,17 @@ export interface EffectiveConfig {
 	attributes: Record<string, Record<string, unknown>>;
 	relations: Record<string, Record<string, unknown>>;
 	job: Record<string, unknown> | null;
+	/** Absent when the job has no content (or no job is selected). */
+	job_content?: JobContent;
 	provenance: Record<string, Origin[]>;
 	warnings: { code: string; key: string }[];
+}
+/** The job's content beyond the ontology, keyed by overlay row key (`name@version` for procedures). */
+export interface JobContent {
+	context_spaces: Record<string, Record<string, unknown>>;
+	procedures: Record<string, Record<string, unknown>>;
+	connectors: Record<string, Record<string, unknown>>;
+	knowledge_stores: Record<string, Record<string, unknown>>;
 }
 export class ApiError extends Error {
 	constructor(
@@ -58,7 +67,7 @@ export class ApiError extends Error {
 export async function api<T>(
 	path: string,
 	body?: unknown,
-	options: { activeTenant?: string; signal?: AbortSignal } = {},
+	options: { activeTenant?: string; signal?: AbortSignal; method?: 'GET' | 'POST' | 'PUT' | 'DELETE' } = {},
 ): Promise<T> {
 	// Capture the selection before awaiting token refresh; a switcher change cannot retarget an in-flight request.
 	// Only a super-admin selects a tenant; everyone else is scoped to their home tenant by the server.
@@ -68,7 +77,7 @@ export async function api<T>(
 		if (activeTenant) headers['X-Active-Tenant-Id'] = activeTenant;
 		if (body !== undefined) headers['Content-Type'] = 'application/json';
 		return fetch(path, {
-			method: body === undefined ? 'GET' : 'POST',
+			method: options.method ?? (body === undefined ? 'GET' : 'POST'),
 			headers,
 			body: body === undefined ? undefined : JSON.stringify(body),
 			signal: options.signal,
@@ -76,7 +85,8 @@ export async function api<T>(
 	};
 	let response = await send(false);
 	if (response.status === 401) response = await send(true);
-	const value = await response.json();
+	// 204 (a DELETE) has no body.
+	const value = response.status === 204 ? undefined : await response.json();
 	if (!response.ok)
 		throw new ApiError(
 			value.error?.code || 'request_failed',
