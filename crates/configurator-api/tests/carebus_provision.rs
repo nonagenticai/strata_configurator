@@ -78,7 +78,8 @@ async fn put_job_never_sends_settings() {
     assert_eq!(seen[0].body, json!({"label": "Customer care agent"}));
     assert_eq!(
         seen[1].path,
-        format!("/api/tenants/{t}/users/alice%40example.test")
+        // The client percent-encodes the sub; the mock records the decoded path.
+        format!("/api/tenants/{t}/users/alice@example.test")
     );
     assert_eq!(seen[1].body, json!({"tenant_role": "tenant_admin"}));
 }
