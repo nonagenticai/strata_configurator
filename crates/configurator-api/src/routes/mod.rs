@@ -10,6 +10,7 @@ pub mod layers;
 pub mod license;
 pub mod me;
 pub mod platform;
+pub mod releases;
 pub mod signups;
 pub mod tenants;
 
@@ -22,7 +23,8 @@ pub fn router(state: AppState) -> Router {
         .merge(me::routes())
         .merge(license::routes())
         .merge(tenants::routes())
-        .merge(layers::routes());
+        .merge(layers::routes())
+        .merge(releases::routes());
     // Early access ships dark: unless it is switched on, its paths are the unknown-route 404.
     let app = if state.cfg.signup.enabled {
         app.merge(signups::routes())

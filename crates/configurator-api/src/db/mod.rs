@@ -104,6 +104,7 @@ pub mod dimensions;
 pub mod layers;
 pub mod licenses;
 pub mod profiles;
+pub mod releases;
 pub mod rows;
 pub mod signups;
 pub mod tenants;

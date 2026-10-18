@@ -56,3 +56,26 @@ pub async fn scope_switch(
     .await?;
     Ok(())
 }
+
+/// Record one audit event with `metadata` (no values, no secrets: ids, hashes, statuses and counts).
+pub async fn event(
+    conn: &mut PgConnection,
+    actor: &str,
+    tenant: Option<Uuid>,
+    action: &str,
+    object: &str,
+    metadata: &Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO audit_event (actor, tenant, action, object, metadata) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(actor)
+    .bind(tenant)
+    .bind(action)
+    .bind(object)
+    .bind(metadata)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
