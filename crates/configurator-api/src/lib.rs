@@ -10,6 +10,7 @@ pub mod license_token;
 pub mod licenses_admin;
 pub mod offboarding;
 pub mod page;
+pub mod provision;
 pub mod routes;
 pub mod seeder;
 pub mod service_token;

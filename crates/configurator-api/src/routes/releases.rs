@@ -7,7 +7,7 @@
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use configurator_core::release::{BuildError, BundleV1, build_bundle, bundle_hash, release_body};
 use serde::Deserialize;
@@ -16,12 +16,15 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::audit;
-use crate::db::releases::{self as db, NewRelease, Release, Target};
+use crate::carebus_client::CarebusError;
+use crate::db::releases::{self as db, NewRelease, NewStep, Release, Target};
+use crate::db::tenants;
 use crate::error::ApiError;
 use crate::page::{self, Paged, TimeCursor};
+use crate::provision::{self, StepOutcome};
 use crate::routes::compile::{SelectionRequest, compile_selection};
 use crate::state::AppState;
-use crate::tenancy::{Role, TenantCtx};
+use crate::tenancy::{self, Role, TenantCtx};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -31,6 +34,7 @@ pub fn routes() -> Router<AppState> {
             get(list_releases).post(build_release),
         )
         .route("/api/releases/{id}", get(show_release))
+        .route("/api/releases/{id}/push", post(push))
 }
 
 fn internal(e: impl Into<anyhow::Error>) -> ApiError {
@@ -244,5 +248,131 @@ async fn show_release(
     tx.commit().await?;
     Ok(Json(
         json!({"release": release, "body": body, "push_steps": steps}),
+    ))
+}
+
+fn carebus_unconfigured() -> ApiError {
+    ApiError::Unavailable(
+        "carebus_unconfigured",
+        "care-bus is not configured (CAREBUS_API_URL, CAREBUS_TOKEN_URL, CAREBUS_CLIENT_ID, \
+         CAREBUS_CLIENT_SECRET)"
+            .into(),
+    )
+}
+
+/// `POST /api/releases/{id}/push` (tenant_admin): provision the tenant and job into care-bus, then PUT
+/// the release in this tenant. Every call is recorded as a push step, failures included, before the
+/// answer is given; the care-bus report (with its conflicts) is returned as `carebus`.
+async fn push(
+    State(st): State<AppState>,
+    ctx: TenantCtx,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    ctx.require(Role::TenantAdmin)?;
+    let client = st.carebus.clone().ok_or_else(carebus_unconfigured)?;
+    let uuid = Uuid::parse_str(&id).map_err(|_| release_not_found(&id))?;
+    // Read, then let go of the transaction: no network call inside one.
+    let mut tx = st.tx(Some(ctx.tenant)).await?;
+    let (release, body) = db::get_release(&mut tx, uuid)
+        .await?
+        .ok_or_else(|| release_not_found(&id))?;
+    let target = db::get_target(&mut tx, release.target)
+        .await?
+        .ok_or_else(|| internal(anyhow::anyhow!("release {uuid} has no target")))?;
+    tx.commit().await?;
+    let tenant = tenants::get(&st.db, ctx.tenant)
+        .await?
+        .ok_or_else(|| tenancy::tenant_not_found(ctx.tenant))?;
+
+    let (mut steps, provisioned) = provision::ensure_tenant_and_job(
+        &client,
+        &st.owner,
+        &tenant,
+        &target.job,
+        &release.job_label,
+    )
+    .await;
+    let mut failure = provisioned.err();
+    let mut report = Value::Null;
+    if failure.is_none() {
+        let r = client
+            .put_release(ctx.tenant, &target.job, &release.release_id, &body)
+            .await;
+        steps.push(StepOutcome::of("release", &r));
+        match r {
+            Ok(resp) => report = resp.body,
+            Err(e) => failure = Some(e),
+        }
+    }
+
+    let mut tx = st.tx(Some(ctx.tenant)).await?;
+    for s in &steps {
+        db::insert_step(
+            &mut tx,
+            NewStep {
+                tenant: ctx.tenant,
+                release: release.id,
+                step: s.step,
+                request_hash: (s.step == "release").then_some(release.hash.as_str()),
+                status: s.status.map(i32::from),
+                ok: s.ok,
+                response: Some(&s.body).filter(|b| !b.is_null()),
+                error_code: s.error_code.as_deref(),
+                by: &ctx.caller.sub,
+            },
+        )
+        .await?;
+    }
+    let conflicts = report["conflicts"].as_array().map_or(0, Vec::len);
+    audit::event(
+        &mut tx,
+        &ctx.caller.sub,
+        Some(ctx.tenant),
+        "release.push",
+        &format!("config_release:{}", release.id),
+        &json!({
+            "release_id": release.release_id,
+            "hash": release.hash,
+            "step": steps.last().map(|s| s.step),
+            "status": steps.last().and_then(|s| s.status),
+            "ok": failure.is_none(),
+            "conflicts": conflicts,
+        }),
+    )
+    .await?;
+    let recorded = db::push_steps(&mut tx, release.id).await?;
+    tx.commit().await?;
+
+    if let Some(e) = failure {
+        let step = steps.last().map_or("tenant", |s| s.step);
+        return Err(match e {
+            CarebusError::Rejected {
+                status: 409,
+                code: Some(c),
+                ..
+            } if step == "release" && c == "release_hash_mismatch" => ApiError::Conflict(
+                "carebus_release_conflict",
+                format!(
+                    "care-bus already holds release {} with another hash",
+                    release.release_id
+                ),
+            ),
+            CarebusError::Rejected { status, code, .. } => ApiError::Detailed {
+                status: StatusCode::BAD_GATEWAY,
+                code: "carebus_rejected",
+                message: format!("care-bus refused the {step} step (HTTP {status})"),
+                errors: vec![json!({"step": step, "status": status, "code": code})],
+            },
+            CarebusError::Unavailable(why) => {
+                tracing::warn!(release = %release.id, step, %why, "care-bus unavailable");
+                ApiError::BadGateway(
+                    "carebus_unavailable",
+                    format!("care-bus is unavailable (the {step} step)"),
+                )
+            }
+        });
+    }
+    Ok(Json(
+        json!({"release": release, "steps": recorded, "carebus": report}),
     ))
 }

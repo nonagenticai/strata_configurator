@@ -4,7 +4,9 @@ mod common;
 
 use axum::http::StatusCode;
 use common::carebus_mock::CarebusMock;
-use common::client::{member, tenant};
+use common::carebus_mock::{CB_SECRET, CB_TOKEN};
+use common::client::{member, request, tenant};
+use common::keys::super_admin;
 use configurator_core::release::bundle_hash;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -358,4 +360,292 @@ async fn rls_hides_other_tenant_releases() {
         matches!(&denied, Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501")),
         "{denied:?}"
     );
+}
+
+// --- Task 7: push ----------------------------------------------------------------------------------
+
+/// `sub`'s tenant (created with `sub` as its first admin), a target for the golden selection and its
+/// release 1: (tenant, target id, release).
+async fn released(e: &common::TestEnv, sub: &str) -> (Uuid, String, Value) {
+    let t = tenant(&e.app, sub).await;
+    let target = create_target(e, sub, JOB, golden()).await;
+    let (s, r) = build(e, sub, &target).await;
+    assert_eq!(s, StatusCode::CREATED, "{r}");
+    (t, target, r)
+}
+
+async fn push(e: &common::TestEnv, sub: &str, release: &Value) -> (StatusCode, Value) {
+    member(
+        &e.app,
+        "POST",
+        &format!("/api/releases/{}/push", release["id"].as_str().unwrap()),
+        sub,
+        Value::Null,
+    )
+    .await
+}
+
+/// (step, ok, status, error_code) of one push step.
+type Step = (String, bool, Option<i32>, Option<String>);
+
+/// Every push step, in order.
+async fn steps(e: &common::TestEnv) -> Vec<Step> {
+    sqlx::query_as("SELECT step, ok, status, error_code FROM push_step ORDER BY id")
+        .fetch_all(common::pool(e))
+        .await
+        .unwrap()
+}
+
+fn step(name: &str, ok: bool, status: Option<i32>, code: Option<&str>) -> Step {
+    (name.into(), ok, status, code.map(str::to_owned))
+}
+
+#[tokio::test]
+async fn push_provisions_then_puts_release() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (t, _, r) = released(&e, "alice").await;
+    let (s, out) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["carebus"]["applied"], true);
+    assert_eq!(out["carebus"]["release_id"], r["release_id"]);
+    assert_eq!(out["steps"].as_array().unwrap().len(), 3);
+
+    let seen = mock.requests();
+    let rid = r["release_id"].as_str().unwrap();
+    let paths: Vec<(&str, &str)> = seen
+        .iter()
+        .map(|q| (q.method.as_str(), q.path.as_str()))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            ("PUT", format!("/api/tenants/{t}").as_str()),
+            ("PUT", format!("/api/tenants/{t}/jobs/{JOB}").as_str()),
+            ("PUT", format!("/api/jobs/{JOB}/releases/{rid}").as_str()),
+        ]
+    );
+    assert_eq!(seen[0].body, json!({"name": "alice", "status": "active"}));
+    assert_eq!(seen[1].body, json!({"label": "Customer care agent"}));
+    assert_eq!(seen[2].tenant, Some(t.to_string()));
+    assert_eq!(seen[2].body["hash"], r["hash"]);
+    assert_eq!(
+        bundle_hash(&seen[2].body["bundle"]).unwrap(),
+        r["hash"].as_str().unwrap()
+    );
+
+    assert_eq!(
+        steps(&e).await,
+        [
+            step("tenant", true, Some(201), None),
+            step("job", true, Some(201), None),
+            step("release", true, Some(201), None),
+        ]
+    );
+    let hashes: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT request_hash FROM push_step ORDER BY id")
+            .fetch_all(common::pool(&e))
+            .await
+            .unwrap();
+    assert_eq!(hashes, [None, None, r["hash"].as_str().map(str::to_owned)]);
+    let provisioned: bool =
+        sqlx::query_scalar("SELECT carebus_provisioned_at IS NOT NULL FROM tenant WHERE id = $1")
+            .bind(t)
+            .fetch_one(common::pool(&e))
+            .await
+            .unwrap();
+    assert!(provisioned);
+    assert_eq!(
+        count(
+            &e,
+            "SELECT count(*) FROM audit_event WHERE action = 'release.push'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn push_sends_release_tenant_header() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    released(&e, "alice").await;
+    let (b, _, rb) = released(&e, "bob").await;
+    // The super-admin, acting in B through the header, pushes B's release.
+    let (s, out) = request(
+        &e.app,
+        "POST",
+        &format!("/api/releases/{}/push", rb["id"].as_str().unwrap()),
+        &super_admin("root"),
+        Some(b),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    let seen = mock.requests();
+    let put = seen
+        .iter()
+        .find(|q| q.path.starts_with("/api/jobs/"))
+        .unwrap();
+    assert_eq!(put.tenant, Some(b.to_string()));
+    assert_eq!(seen[0].path, format!("/api/tenants/{b}"));
+}
+
+#[tokio::test]
+async fn cross_tenant_release_is_404() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, _, ra) = released(&e, "alice").await;
+    tenant(&e.app, "bob").await;
+    let (s, b) = push(&e, "bob", &ra).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::NOT_FOUND, &json!("release_not_found"))
+    );
+    assert!(mock.requests().is_empty(), "nothing reached care-bus");
+    assert_eq!(count(&e, "SELECT count(*) FROM push_step").await, 0);
+}
+
+#[tokio::test]
+async fn repush_records_noop() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, _, r) = released(&e, "alice").await;
+    let (s, _) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, out) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["carebus"]["applied"], false);
+    assert_eq!(out["steps"].as_array().unwrap().len(), 6);
+    assert_eq!(count(&e, "SELECT count(*) FROM push_step").await, 6);
+    assert_eq!(count(&e, "SELECT count(*) FROM config_release").await, 1);
+    let last = steps(&e).await.pop().unwrap();
+    assert_eq!(last, step("release", true, Some(200), None));
+}
+
+#[tokio::test]
+async fn conflicts_are_returned_and_stored() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, _, r) = released(&e, "alice").await;
+    let conflict = json!({
+        "id": 17, "kind": "base_removed", "object": "ontology_entity", "key": {"name": "Carrier"},
+        "tenant_row": "override", "base_hash_before": format!("sha256:{}", "a".repeat(64)),
+        "base_hash_after": null
+    });
+    mock.set_conflicts(vec![conflict.clone()]);
+    let (s, out) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["carebus"]["conflicts"], json!([conflict]));
+    let stored: Value =
+        sqlx::query_scalar("SELECT response -> 'conflicts' FROM push_step WHERE step = 'release'")
+            .fetch_one(common::pool(&e))
+            .await
+            .unwrap();
+    assert_eq!(stored, json!([conflict]));
+}
+
+#[tokio::test]
+async fn hash_mismatch_is_409() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, _, r) = released(&e, "alice").await;
+    mock.answer(
+        "release",
+        409,
+        json!({"error": {"code": "release_hash_mismatch", "message": "known release, other hash"}}),
+    );
+    let (s, b) = push(&e, "alice", &r).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::CONFLICT, &json!("carebus_release_conflict")),
+        "{b}"
+    );
+    assert_eq!(
+        steps(&e).await.pop().unwrap(),
+        step("release", false, Some(409), Some("release_hash_mismatch"))
+    );
+    // Any other refusal is a 502 naming the step.
+    mock.answer(
+        "release",
+        400,
+        json!({"error": {"code": "invalid_bundle", "message": "x", "details": []}}),
+    );
+    let (s, b) = push(&e, "alice", &r).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_GATEWAY, &json!("carebus_rejected")),
+        "{b}"
+    );
+    assert_eq!(
+        b["errors"],
+        json!([{"step": "release", "status": 400, "code": "invalid_bundle"}])
+    );
+}
+
+#[tokio::test]
+async fn carebus_down_is_502_and_recorded() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, _, r) = released(&e, "alice").await;
+    mock.answer("release", 503, json!({"error": {"code": "unavailable"}}));
+    let (s, b) = push(&e, "alice", &r).await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::BAD_GATEWAY, &json!("carebus_unavailable")),
+        "{b}"
+    );
+    assert_eq!(
+        steps(&e).await,
+        [
+            step("tenant", true, Some(201), None),
+            step("job", true, Some(201), None),
+            step("release", false, None, Some("carebus_unavailable")),
+        ]
+    );
+    // A failed provision stops before the release.
+    mock.clear_answer("release");
+    mock.answer("tenant", 503, json!({}));
+    let (s, _) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        steps(&e).await.pop().unwrap(),
+        step("tenant", false, None, Some("carebus_unavailable"))
+    );
+}
+
+#[tokio::test]
+async fn unconfigured_is_503() {
+    let e = common::client::seeded().await;
+    let (_, _, r) = released(&e, "alice").await;
+    let (s, b) = push(&e, "alice", &r).await;
+    assert_eq!(
+        (s, code(&b)),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!("carebus_unconfigured")
+        )
+    );
+    assert_eq!(count(&e, "SELECT count(*) FROM push_step").await, 0);
+}
+
+#[tokio::test]
+async fn no_token_in_push_step_or_audit() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, _, r) = released(&e, "alice").await;
+    let (s, out) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::OK);
+    for secret in [CB_TOKEN, CB_SECRET] {
+        assert!(!out.to_string().contains(secret), "response leaks {secret}");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM push_step WHERE response::text LIKE '%' || $1 || '%') \
+                  + (SELECT count(*) FROM audit_event WHERE coalesce(metadata::text, '') LIKE '%' || $1 || '%')",
+        )
+        .bind(secret)
+        .fetch_one(common::pool(&e))
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "{secret} stored");
+    }
 }
