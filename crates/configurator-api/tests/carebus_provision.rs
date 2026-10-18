@@ -1,8 +1,11 @@
 //! The care-bus client (W4) against the local care-bus mock: bearer token, tenant header, error
-//! classification, token caching. No database.
+//! classification, token caching; and provision-down on tenant create, import and the retry route,
+//! behind CAREBUS_PROVISION_ENABLED.
 mod common;
 
+use axum::http::StatusCode;
 use common::carebus_mock::{CB_SECRET, CB_TOKEN, CarebusMock};
+use common::client::root;
 use configurator_api::carebus_client::{CarebusClient, CarebusError};
 use configurator_api::config::CarebusConfig;
 use configurator_core::release::{ReleaseBodyV1, release_body};
@@ -190,4 +193,164 @@ async fn a_401_refreshes_the_token_once() {
         c.put_tenant(t, "Acme", "active").await,
         Err(CarebusError::Rejected { status: 401, .. })
     ));
+}
+
+// ---- Task 9: provision-down on tenant create, import and the retry route ----
+
+async fn env(mock: &CarebusMock, enabled: bool) -> common::TestEnv {
+    let mut cfg = mock.config();
+    if enabled {
+        cfg.push(("CAREBUS_PROVISION_ENABLED", "true".into()));
+    }
+    common::env_with(&cfg).await
+}
+
+async fn provisioned_at_set(e: &common::TestEnv, t: &str) -> bool {
+    sqlx::query_scalar("SELECT carebus_provisioned_at IS NOT NULL FROM tenant WHERE id = $1::uuid")
+        .bind(t)
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+async fn audited(e: &common::TestEnv, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = $1")
+        .bind(action)
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn provision_off_by_default_makes_no_carebus_call() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, false).await;
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(
+        b["carebus"],
+        json!({"ok": false, "skipped": true, "steps": []})
+    );
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants/import",
+        json!({"id": "0195f48b-d000-7000-8000-000000000099", "name": "fr-test-user",
+               "first_admin_sub": "fr-admin"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(b["carebus"]["skipped"], true);
+    assert!(mock.requests().is_empty(), "no care-bus call while off");
+    assert_eq!(audited(&e, "carebus.provision_skipped").await, 2);
+    let t = b["tenant"]["id"].as_str().unwrap();
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    assert_eq!(b["error"]["code"], "carebus_provision_disabled");
+}
+
+#[tokio::test]
+async fn create_provisions_down() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let t = b["id"].as_str().unwrap();
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(b["carebus"]["steps"].as_array().unwrap().len(), 2);
+    let seen: Vec<(String, Value)> = mock
+        .requests()
+        .into_iter()
+        .map(|r| (r.path, r.body))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                format!("/api/tenants/{t}"),
+                json!({"name": "Acme", "status": "active"})
+            ),
+            (
+                format!("/api/tenants/{t}/users/alice"),
+                json!({"tenant_role": "tenant_admin"})
+            ),
+        ]
+    );
+    assert!(provisioned_at_set(&e, t).await);
+}
+
+#[tokio::test]
+async fn create_survives_carebus_down() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    mock.answer("tenant", 503, json!({}));
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(b["carebus"]["ok"], false);
+    assert_eq!(b["carebus"]["skipped"], false);
+    let t = b["id"].as_str().unwrap().to_owned();
+    assert!(!provisioned_at_set(&e, &t).await);
+    assert_eq!(audited(&e, "carebus.provision_failed").await, 1);
+
+    // The retry route provisions once care-bus is back.
+    mock.clear_answer("tenant");
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["ok"], true, "{b}");
+    assert!(provisioned_at_set(&e, &t).await);
+    let last = mock.requests().pop().unwrap();
+    assert_eq!(last.path, format!("/api/tenants/{t}/users/alice"));
+}
+
+#[tokio::test]
+async fn retry_route_needs_the_super_admin() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let (_, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    let t = b["id"].as_str().unwrap();
+    let (s, _) = common::client::member(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        "alice",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
 }

@@ -29,6 +29,9 @@ pub struct Config {
     /// The care-bus release-writer SA (W4); `None` (push and drift answer 503
     /// `carebus_unconfigured`) unless all four `CAREBUS_*` settings are set.
     pub carebus: Option<CarebusConfig>,
+    /// `CAREBUS_PROVISION_ENABLED` (default off): tenant create, signup approve and import provision
+    /// the tenant and its first admin down into care-bus. Needs the `CAREBUS_*` client settings.
+    pub carebus_provision_enabled: bool,
 }
 
 /// Client credentials for portal-realm client `strata-configurator-release-writer`, which holds
@@ -210,6 +213,7 @@ impl std::fmt::Debug for Config {
             .field("license_token_key", &self.license_token_key)
             .field("signup", &self.signup)
             .field("carebus", &self.carebus)
+            .field("carebus_provision_enabled", &self.carebus_provision_enabled)
             .finish_non_exhaustive()
     }
 }
@@ -370,8 +374,16 @@ impl Config {
                 client_secret,
             },
         );
+        let carebus_provision_enabled = flag(&get, "CAREBUS_PROVISION_ENABLED")?;
+        if carebus_provision_enabled && carebus.is_none() {
+            anyhow::bail!(
+                "CAREBUS_PROVISION_ENABLED is on but the care-bus client is not configured \
+                 (CAREBUS_API_URL, CAREBUS_TOKEN_URL, CAREBUS_CLIENT_ID, CAREBUS_CLIENT_SECRET)"
+            );
+        }
         Ok(Self {
             carebus,
+            carebus_provision_enabled,
             signup,
             database_url: req("DATABASE_URL")?,
             migrate_database_url: get("MIGRATE_DATABASE_URL").filter(|v| !v.trim().is_empty()),
@@ -711,6 +723,12 @@ mod tests {
             ("CAREBUS_CLIENT_SECRET", "release-writer-secret"),
         ];
         assert!(Config::from_lookup(base).unwrap().carebus.is_none());
+        assert!(!Config::from_lookup(base).unwrap().carebus_provision_enabled);
+        // Provisioning without the client is a startup error naming the flag.
+        let err = Config::from_lookup(with(&[("CAREBUS_PROVISION_ENABLED", "true")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CAREBUS_PROVISION_ENABLED"), "{err}");
         let c = Config::from_lookup(with(&CAREBUS)).unwrap();
         let cb = c.carebus.as_ref().unwrap();
         assert_eq!(cb.api_url, "http://carebus.test:8095");

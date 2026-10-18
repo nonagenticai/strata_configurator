@@ -21,12 +21,18 @@ use crate::error::ApiError;
 use crate::licenses_admin::{Issued, registry_name};
 use crate::offboarding;
 use crate::page::{self, Paged, TimeCursor};
+use crate::provision;
 use crate::state::AppState;
 use crate::tenancy::{self, Role, TenantCtx};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/tenants", get(list).post(create))
+        .route("/api/tenants/import", post(import))
+        .route(
+            "/api/tenants/{id}/carebus-provision",
+            post(carebus_provision),
+        )
         .route("/api/tenants/{id}/users", get(list_users).post(add_user))
         .route(
             "/api/tenants/{id}/users/{sub}",
@@ -172,7 +178,192 @@ async fn create(
         Origin::Manual,
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(json!(created.tenant))))
+    let carebus =
+        provision::tenant_created(&st, &caller.sub, &created.tenant, &created.first_admin_sub)
+            .await;
+    let mut out = json!(created.tenant);
+    out["carebus"] = json!(carebus);
+    Ok((StatusCode::CREATED, Json(out)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportTenant {
+    id: String,
+    name: String,
+    first_admin_sub: Option<String>,
+    first_admin_email: Option<String>,
+}
+
+/// Super-admin only: adopt a tenant that already exists elsewhere (care-bus, licences) under its own
+/// id, e.g. the platform fr-test tenant. Absent here: the tenant-create path with that id (licence
+/// first; a failure creates nothing), 201 `{tenant, imported: true, carebus}`. Present under the same
+/// name: 200 `{tenant, imported: false, carebus}`, issuing the licence now when it has none (repair),
+/// and re-running the care-bus provision. Present under another name: 409 `tenant_exists`; archived:
+/// 403 `tenant_suspended`.
+async fn import(
+    State(st): State<AppState>,
+    caller: Caller,
+    body: Result<Json<ImportTenant>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_super_admin(&caller)?;
+    let Json(b) = body?;
+    let id = tenancy::parse_tenant_id(&b.id)?;
+    let name = clean("name", &b.name, MAX_NAME)?;
+    let Some(existing) = tenants::get(&st.db, id).await? else {
+        let created = create_tenant(
+            &st,
+            &caller.sub,
+            &name,
+            (b.first_admin_sub, b.first_admin_email),
+            Origin::Import(id),
+        )
+        .await?;
+        let carebus =
+            provision::tenant_created(&st, &caller.sub, &created.tenant, &created.first_admin_sub)
+                .await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(json!({"tenant": created.tenant, "imported": true, "carebus": carebus})),
+        ));
+    };
+    if existing.archived_at.is_some() {
+        return Err(tenancy::tenant_suspended(id));
+    }
+    if existing.name != name {
+        return Err(ApiError::Conflict(
+            "tenant_exists",
+            format!("tenant {id} exists under another name"),
+        ));
+    }
+    let (holder, invited) = subject(
+        &st,
+        ("first_admin_sub", b.first_admin_sub),
+        ("first_admin_email", b.first_admin_email),
+    )
+    .await?;
+    if st.licenses_admin.is_some()
+        && licenses::license_id(&st.owner, id).await?.is_none()
+        && let Err(e) = repair_licence(&st, &caller.sub, &existing, &holder).await
+    {
+        kept_identity(&holder, invited);
+        return Err(e);
+    }
+    let carebus = provision::tenant_created(&st, &caller.sub, &existing, &holder).await;
+    Ok((
+        StatusCode::OK,
+        Json(json!({"tenant": existing, "imported": false, "carebus": carebus})),
+    ))
+}
+
+/// Issue and store the licence of an existing tenant that has none (an import's repair path), audited
+/// `license.issue`; a failure is 502 `licences_unavailable`, audited `license.issue_failed`.
+async fn repair_licence(
+    st: &AppState,
+    actor: &str,
+    t: &tenants::Tenant,
+    holder: &str,
+) -> Result<(), ApiError> {
+    let Some(la) = st.licenses_admin.as_deref() else {
+        return Ok(());
+    };
+    let issued = match la.issue(t.id, &registry_name(&t.name, t.id), holder).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(tenant = %t.id, error = %e, "licence issuance failed on import");
+            audit::record(
+                &mut *st.owner.acquire().await?,
+                actor,
+                Some(t.id),
+                "license.issue_failed",
+                &format!("tenant:{}", t.id),
+                None,
+                Some(&json!({"tenant": t.id, "holder_sub": holder})),
+            )
+            .await?;
+            return Err(ApiError::BadGateway(
+                "licences_unavailable",
+                "licensing the imported tenant failed".into(),
+            ));
+        }
+    };
+    let stored = store_licence(st, actor, t, &issued, holder).await;
+    if stored.is_err() {
+        give_back(st, t.id, Some(&issued)).await;
+    }
+    stored
+}
+
+async fn store_licence(
+    st: &AppState,
+    actor: &str,
+    t: &tenants::Tenant,
+    issued: &Issued,
+    holder: &str,
+) -> Result<(), ApiError> {
+    let cipher = st.token_cipher.as_deref().ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!(
+            "a licence was issued but LICENSE_TOKEN_ENC_KEY is not configured"
+        ))
+    })?;
+    let sealed = cipher
+        .seal(t.id, &issued.token)
+        .map_err(|e| ApiError::Internal(anyhow::Error::from(e)))?;
+    let mut tx = st.owner.begin().await?;
+    licenses::store(&mut tx, t.id, issued, holder, &sealed).await?;
+    let after = json!({"tenant": t.id, "license_id": issued.license_id,
+                       "subject_id": issued.subject_id, "holder_sub": holder});
+    audit::record(
+        &mut tx,
+        actor,
+        Some(t.id),
+        "license.issue",
+        &format!("license:{}", issued.license_id),
+        None,
+        Some(&after),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Super-admin only: re-run the care-bus provision of tenant `id` with its first active
+/// `tenant_admin`. 409 `carebus_provision_disabled` while `CAREBUS_PROVISION_ENABLED` is off.
+async fn carebus_provision(
+    State(st): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&caller)?;
+    let id = tenancy::parse_tenant_id(&id)?;
+    if !st.cfg.carebus_provision_enabled {
+        return Err(ApiError::Conflict(
+            "carebus_provision_disabled",
+            "provisioning into care-bus is off (CAREBUS_PROVISION_ENABLED)".into(),
+        ));
+    }
+    let t = tenants::get(&st.db, id)
+        .await?
+        .ok_or_else(|| tenancy::tenant_not_found(id))?;
+    if t.archived_at.is_some() {
+        return Err(tenancy::tenant_suspended(id));
+    }
+    let admin: Option<String> = sqlx::query_scalar(
+        "SELECT sub FROM users WHERE tenant = $1 AND tenant_role = 'tenant_admin' \
+         AND disabled_at IS NULL ORDER BY created_at, sub LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&st.owner)
+    .await?;
+    let Some(admin) = admin else {
+        return Err(ApiError::Conflict(
+            "no_tenant_admin",
+            format!("tenant {id} has no active tenant_admin to provision"),
+        ));
+    };
+    Ok(Json(json!(
+        provision::tenant_created(&st, &caller.sub, &t, &admin).await
+    )))
 }
 
 /// What asked for a tenant: a super-admin's `POST /api/tenants`, or their approval of an early-access
@@ -181,6 +372,8 @@ async fn create(
 pub(crate) enum Origin {
     Manual,
     Signup(Uuid),
+    /// `POST /api/tenants/import`: the tenant keeps this id (it exists elsewhere already).
+    Import(Uuid),
 }
 
 /// A tenant [`create_tenant`] created.
@@ -215,7 +408,10 @@ pub(crate) async fn create_tenant(
 ) -> Result<Created, ApiError> {
     let (first_admin_sub, invited) =
         subject(st, ("first_admin_sub", sub), ("first_admin_email", email)).await?;
-    let id = Uuid::new_v4();
+    let id = match origin {
+        Origin::Import(id) => id,
+        Origin::Manual | Origin::Signup(_) => Uuid::new_v4(),
+    };
 
     let licence = match st.licenses_admin.as_deref() {
         None => None,
@@ -342,11 +538,15 @@ async fn insert_tenant(
         return Ok(None);
     };
     let after = json!({"tenant": t, "first_admin_sub": first_admin_sub});
+    let action = match origin {
+        Origin::Import(_) => "tenant.import",
+        Origin::Manual | Origin::Signup(_) => "tenant.create",
+    };
     audit::record(
         &mut tx,
         actor,
         Some(t.id),
-        "tenant.create",
+        action,
         &format!("tenant:{}", t.id),
         None,
         Some(&after),
@@ -377,7 +577,7 @@ async fn insert_tenant(
         .await?;
     }
     let signup = match origin {
-        Origin::Manual => None,
+        Origin::Manual | Origin::Import(_) => None,
         Origin::Signup(sid) => {
             let Some(a) = signups::approve(&mut tx, sid, t.id, actor).await? else {
                 return Err(approval_not_pending(sid));

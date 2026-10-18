@@ -1010,3 +1010,55 @@ async fn a_tenant_member_cannot_reach_the_queue() {
     let (s, b) = member(&e.app, "GET", "/api/signup-approvals", "alice", Value::Null).await;
     assert_eq!((s, code(&b)), (StatusCode::FORBIDDEN, &json!("forbidden")));
 }
+
+// ---- W4: approval provisions the tenant down into care-bus ----
+
+#[tokio::test]
+async fn approve_provisions_down() {
+    let up = upstream().await;
+    let mock = common::carebus_mock::CarebusMock::start().await;
+    let mut cfg = up.keycloak_admin();
+    cfg.extend(mock.config());
+    cfg.push(("CAREBUS_PROVISION_ENABLED", "true".into()));
+    let e = enabled(cfg).await;
+    submit(&e, signup("ann@globex.com")).await;
+    let id = signup_id(&e, "ann@globex.com").await;
+    let (s, b) = approve(&e, id, Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    let tenant = b["tenant"]["id"].as_str().unwrap();
+    let sub = b["first_admin_sub"].as_str().unwrap();
+    let seen: Vec<(String, Value)> = mock
+        .requests()
+        .into_iter()
+        .map(|r| (r.path, r.body))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                format!("/api/tenants/{tenant}"),
+                json!({"name": "Globex", "status": "active"})
+            ),
+            (
+                format!("/api/tenants/{tenant}/users/{sub}"),
+                json!({"tenant_role": "tenant_admin"})
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn approve_with_provisioning_off_calls_no_carebus() {
+    let up = upstream().await;
+    let mock = common::carebus_mock::CarebusMock::start().await;
+    let mut cfg = up.keycloak_admin();
+    cfg.extend(mock.config());
+    let e = enabled(cfg).await;
+    submit(&e, signup("ann@globex.com")).await;
+    let id = signup_id(&e, "ann@globex.com").await;
+    let (s, b) = approve(&e, id, Value::Null).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["carebus"]["skipped"], true, "{b}");
+    assert!(mock.requests().is_empty());
+}
