@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status (2026-10-18):** Tasks 1 to 10 are implemented on `feat/w4-release-push` (PR #6, draft) and
+green in CI, including the review fixes (care-bus 404 order tenant → job → release mirrored in the mock;
+RFC 8785 UTF-16 key order in canonical JSON; a re-import's first admin must be, or atomically become,
+this tenant's `tenant_admin`; the seed v1+v2 build is compared field by field with care-bus's golden
+bundle). Open: Task 11 (gitops) and Task 12 (live verification, after care-bus W3 is deployed).
+
 **Goal:** the configurator builds a versioned base release per `(tenant, job)` from its compile output, provisions the tenant and job into care-bus, pushes the release to care-bus's release endpoint as the `release-writer` SA, records the response and conflicts, and reads the release back to detect drift. A super-admin can also adopt an existing tenant id (the platform fr-test tenant) with a licence, as the first managed tenant.
 
 **Architecture:** `configurator-core` gains a typed mirror of care-bus's *release bundle v1* together with its JCS hash, its referential validation, and a pure `build_bundle(&EffectiveConfig)`. The four bundle sections the phase-1 model cannot express (context spaces, procedures, connector slots, knowledge-store layout) become four new overlay kinds, compiled by the same layer and overlay rules. A new seed v2 fills them for `customer_care_agent` from care-bus's golden fixture. `configurator-api` adds three things: `target`, `release` and `push_step` tables under RLS; a care-bus client (a client-credentials token, then `PUT` tenant, user, job and release, and `GET releases/current`); and routes to build, push and drift-check. Tenant creation, signup approval and the new import path provision down to care-bus as a best-effort step that can be retried. A failed provision never fails the create.
