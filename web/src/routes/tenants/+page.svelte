@@ -5,6 +5,8 @@
 	/** One tenant (`GET /api/tenants`); archived ones are left out unless asked for. */
 	type Tenant = { id: string; name: string; created_at: string; archived_at: string | null };
 	let tenants = $state<Tenant[]>([]),
+		archived = $state<Tenant[]>([]),
+		view = $state<'live' | 'archived'>('live'),
 		loading = $state(true),
 		error = $state(''),
 		notice = $state('');
@@ -21,6 +23,9 @@
 		importAdmin = $state(''),
 		saving = $state(false),
 		formError = $state('');
+	/** The last care-bus suspend retry per archived tenant, from this view (the API keeps no outcome). */
+	let outcomes = $state<Record<string, { text: string; failed: boolean }>>({}),
+		retrying = $state<string | null>(null);
 	/** The tenant whose care-bus provisioning (or, once offboarded, suspend) failed and can be retried. */
 	let retryable = $state<{ id: string; name: string; suspend?: boolean } | null>(null);
 	/** An offboard's care-bus outcome: the tenant suspended there (step `suspend`). */
@@ -113,11 +118,36 @@
 		loading = true;
 		error = '';
 		try {
-			tenants = await all<Tenant>('/api/tenants', { activeTenant: '' });
+			if (view === 'archived') {
+				// Super-admin only: the live tenants come too, so keep the archived ones.
+				const every = await all<Tenant>('/api/tenants?include_archived=true', { activeTenant: '' });
+				archived = every.filter((t) => t.archived_at !== null);
+			} else tenants = await all<Tenant>('/api/tenants', { activeTenant: '' });
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			loading = false;
+		}
+	}
+	function show(v: 'live' | 'archived') {
+		if (view === v) return;
+		view = v;
+		void load();
+	}
+	/** Re-run the care-bus suspend of an offboarded tenant (`carebus-provision` does that when archived). */
+	async function retrySuspend(t: Tenant) {
+		retrying = t.id;
+		try {
+			const c = await api<CarebusProvision>(
+				`/api/tenants/${t.id}/carebus-provision`,
+				{},
+				{ activeTenant: '' },
+			);
+			outcomes[t.id] = { text: suspendText(c), failed: !c.ok && !c.skipped };
+		} catch (e) {
+			outcomes[t.id] = { text: e instanceof Error ? e.message : String(e), failed: true };
+		} finally {
+			retrying = null;
 		}
 	}
 	function open(t: Tenant) {
@@ -168,10 +198,11 @@
 		<div class="eyebrow">PLATFORM</div>
 		<h1>Tenants</h1>
 		<p class="lede">
-			Every live workspace. Offboarding revokes its licence, archives it and disables its users.
+			Every live workspace (offboarded ones under Archived, where a failed care-bus suspend can be retried).
+			Offboarding revokes its licence, archives it and disables its users.
 		</p>
 	</div>
-	<span class="pill">{tenants.length} live</span>
+	<span class="pill">{view === 'archived' ? `${archived.length} archived` : `${tenants.length} live`}</span>
 </div>
 {#if !session.superAdmin}<div class="empty" role="status">
 		<h2>Super-admin only</h2>
@@ -216,8 +247,38 @@
 			<button type="submit" disabled={saving}>Import tenant</button>
 		</form>
 	</section>
+	<div class="views" role="group" aria-label="Tenants view">
+		<button class:active={view === 'live'} aria-pressed={view === 'live'} onclick={() => show('live')}
+			>Live</button
+		><button
+			class:active={view === 'archived'}
+			aria-pressed={view === 'archived'}
+			onclick={() => show('archived')}>Archived</button
+		>
+	</div>
 	<section class="card">
-		{#if loading}<div class="empty">Loading tenants…</div>{:else}<div class="table-wrap">
+		{#if loading}<div class="empty">Loading tenants…</div>{:else if view === 'archived'}<div
+				class="table-wrap"
+			>
+				<table>
+					<thead><tr><th>TENANT</th><th>ARCHIVED</th><th>CARE-BUS</th><th></th></tr></thead><tbody
+						>{#each archived as t (t.id)}<tr
+								><td
+									><strong>{t.name}</strong>
+									<div class="muted">{t.id}</div></td
+								><td>{new Date(t.archived_at ?? '').toLocaleString()}</td><td
+									class:fail={outcomes[t.id]?.failed}>{outcomes[t.id]?.text ?? ''}</td
+								><td class="actions"
+									><button
+										onclick={() => retrySuspend(t)}
+										disabled={retrying === t.id}
+										aria-label={`Retry care-bus suspend for ${t.name}`}>Retry care-bus suspend</button
+									></td
+								></tr
+							>{:else}<tr><td colspan="4" class="empty">No archived tenants.</td></tr>{/each}</tbody
+					>
+				</table>
+			</div>{:else}<div class="table-wrap">
 				<table>
 					<thead><tr><th>TENANT</th><th>CREATED</th><th></th></tr></thead><tbody
 						>{#each tenants as t (t.id)}<tr
@@ -277,6 +338,18 @@
 	.danger:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+	.views {
+		display: flex;
+		gap: 8px;
+		margin-bottom: 12px;
+	}
+	.views button.active {
+		background: var(--teal-light);
+		font-weight: 600;
+	}
+	.fail {
+		color: #904c30;
 	}
 	.forms {
 		display: grid;
