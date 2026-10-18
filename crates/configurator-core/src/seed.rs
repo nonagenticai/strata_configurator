@@ -129,12 +129,21 @@ impl SeedBundle {
                 )
             })
             .collect();
+        let inherited = self
+            .layers
+            .iter()
+            .filter(|l| l.layer.tenant.is_none())
+            .flat_map(|l| l.rows.iter())
+            .filter(|r| r.op == Op::Add)
+            .map(|r| crate::compile::inherited_key(r.kind, &r.key))
+            .collect();
         Known {
             industries,
             departments,
             jobs,
             dimensions,
             axes: self.axes.clone(),
+            inherited,
         }
     }
 

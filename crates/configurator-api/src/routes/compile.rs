@@ -118,16 +118,18 @@ pub async fn compile_selection(
         tenant,
     };
     let layers = platform_layers(&mut *tx).await?;
-    let base: Vec<_> = layers
+    // Every platform row once: base-layer jobs are the selectable jobs, and every platform `add` is
+    // an inherited object a tenant tombstone may name outside this selection.
+    let platform_rows = rows::load_for_layers_conn(&mut *tx, &layers).await?;
+    let jobs = platform_rows
         .iter()
-        .filter(|l| l.scope == Scope::Base)
-        .cloned()
+        .filter(|r| r.layer.scope == Scope::Base && r.kind == Kind::Job && r.op == Op::Add)
+        .map(|r| r.key.clone())
         .collect();
-    let jobs = rows::load_for_layers_conn(&mut *tx, &base)
-        .await?
-        .into_iter()
-        .filter(|r| r.kind == Kind::Job && r.op == Op::Add)
-        .map(|r| r.key)
+    let inherited = platform_rows
+        .iter()
+        .filter(|r| r.op == Op::Add)
+        .map(|r| compile::inherited_key(r.kind, &r.key))
         .collect();
     let mut known_dimensions: BTreeMap<String, BTreeSet<String>> = dimensions::load(&mut *tx)
         .await?
@@ -153,6 +155,7 @@ pub async fn compile_selection(
         jobs,
         dimensions: known_dimensions,
         axes: axes::load(&mut *tx).await?,
+        inherited,
     };
     let rules = axes::rules(&mut *tx).await?;
     let rows = rows::load_for_layers_conn(&mut *tx, &compile::layer_order(&sel, &rules)).await?;

@@ -92,6 +92,16 @@ describe('API client', () => {
 		expect(fetch.mock.calls[1]?.[1].headers['X-Active-Tenant-Id']).toBe('tenant-a');
 		expect(fetch.mock.calls[1]?.[0]).toContain('before=cursor');
 	});
+	it('sends DELETE without a body and accepts an empty 204', async () => {
+		const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+		vi.stubGlobal('fetch', fetch);
+		expect(
+			await api('/api/layers/l/rows/entity/Order?expected_rev=1', undefined, { method: 'DELETE' }),
+		).toBeUndefined();
+		expect(fetch.mock.calls[0]?.[1].method).toBe('DELETE');
+		expect(fetch.mock.calls[0]?.[1].body).toBeUndefined();
+		expect(fetch.mock.calls[0]?.[1].headers['Content-Type']).toBeUndefined();
+	});
 	it('labels tenant roles', () => {
 		expect(roleLabel('tenant_admin')).toBe('Tenant admin');
 		expect(roleLabel('tenant_user')).toBe('Tenant user');
