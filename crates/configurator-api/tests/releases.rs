@@ -160,7 +160,10 @@ async fn create_target_and_build_release_1() {
     let (s, list) = member(&e.app, "GET", "/api/targets", "alice", Value::Null).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
-    assert_eq!(list["items"][0]["selection"], golden());
+    // Stored normalised: the job is the target's, empty dimensions are explicit.
+    let mut stored = golden();
+    stored["dimensions"] = json!({});
+    assert_eq!(list["items"][0]["selection"], stored);
 }
 
 #[tokio::test]
@@ -648,4 +651,135 @@ async fn no_token_in_push_step_or_audit() {
         .unwrap();
         assert_eq!(n, 0, "{secret} stored");
     }
+}
+
+// --- Task 8: drift ---------------------------------------------------------------------------------
+
+async fn drift(e: &common::TestEnv, sub: &str, target: &str) -> Value {
+    let (s, b) = member(
+        &e.app,
+        "GET",
+        &format!("/api/targets/{target}/drift"),
+        sub,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    b
+}
+
+#[tokio::test]
+async fn in_sync_after_push() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, target, r) = released(&e, "alice").await;
+    let (s, _) = push(&e, "alice", &r).await;
+    assert_eq!(s, StatusCode::OK);
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "in_sync", "{d}");
+    assert_eq!(d["carebus"]["release_id"], r["release_id"]);
+    assert_eq!(d["carebus"]["hash"], r["hash"]);
+    assert_eq!(d["last_pushed"]["release_id"], r["release_id"]);
+    assert_eq!(d["latest_built"]["hash"], r["hash"]);
+    assert_eq!(d["config_changed"], false);
+    // The read-back names the tenant.
+    let read = mock
+        .requests()
+        .into_iter()
+        .find(|q| q.method == "GET")
+        .unwrap();
+    assert_eq!(read.path, format!("/api/jobs/{JOB}/releases/current"));
+    assert!(read.tenant.is_some());
+}
+
+#[tokio::test]
+async fn drift_when_carebus_holds_other_release() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, target, r) = released(&e, "alice").await;
+    push(&e, "alice", &r).await;
+    mock.answer(
+        "current",
+        200,
+        json!({"release_id": "2026-10-20.1", "hash": format!("sha256:{}", "b".repeat(64)),
+               "applied": true, "applied_at": "2026-10-20T00:00:00Z", "conflicts": []}),
+    );
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "drift", "{d}");
+    assert_eq!(d["carebus"]["release_id"], "2026-10-20.1");
+    assert_eq!(d["last_pushed"]["release_id"], r["release_id"]);
+}
+
+#[tokio::test]
+async fn never_pushed() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, target, r) = released(&e, "alice").await;
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "never_pushed", "{d}");
+    assert_eq!(d["carebus"], Value::Null);
+    assert_eq!(d["last_pushed"], Value::Null);
+    assert_eq!(d["latest_built"]["release_id"], r["release_id"]);
+    assert_eq!(d["config_changed"], false);
+    // A tenant_user reads drift too.
+    let t: Uuid = sqlx::query_scalar("SELECT id FROM tenant WHERE name = 'alice'")
+        .fetch_one(common::pool(&e))
+        .await
+        .unwrap();
+    let (s, _) = member(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/users"),
+        "alice",
+        json!({"sub": "carol", "role": "tenant_user"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(drift(&e, "carol", &target).await["status"], "never_pushed");
+}
+
+#[tokio::test]
+async fn carebus_404_is_no_release() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, target, r) = released(&e, "alice").await;
+    push(&e, "alice", &r).await;
+    mock.answer(
+        "current",
+        404,
+        json!({"error": {"code": "not_found", "message": "release not found"}}),
+    );
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "carebus_has_no_release", "{d}");
+    // care-bus down is a status, not a 502.
+    mock.answer("current", 503, json!({}));
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["status"], "carebus_unavailable", "{d}");
+    assert_eq!(d["carebus"], Value::Null);
+}
+
+#[tokio::test]
+async fn config_changed_after_tenant_patch() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, target, r) = released(&e, "alice").await;
+    push(&e, "alice", &r).await;
+    patch_space_label(&e, "alice", "FAQ (Acme)").await;
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["config_changed"], true, "{d}");
+    assert_eq!(d["status"], "in_sync", "nothing new was pushed");
+}
+
+#[tokio::test]
+async fn open_conflicts_surface_in_drift() {
+    let mock = CarebusMock::start().await;
+    let e = seeded(&mock).await;
+    let (_, target, r) = released(&e, "alice").await;
+    let conflict = json!({"id": 3, "kind": "base_changed", "object": "context_space",
+                          "key": {"key": "retail:faq:general"}, "tenant_row": "override",
+                          "base_hash_before": null, "base_hash_after": null});
+    mock.set_conflicts(vec![conflict.clone()]);
+    push(&e, "alice", &r).await;
+    let d = drift(&e, "alice", &target).await;
+    assert_eq!(d["carebus"]["conflicts"], json!([conflict]), "{d}");
 }

@@ -35,6 +35,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/releases/{id}", get(show_release))
         .route("/api/releases/{id}/push", post(push))
+        .route("/api/targets/{id}/drift", get(drift))
 }
 
 fn internal(e: impl Into<anyhow::Error>) -> ApiError {
@@ -375,4 +376,61 @@ async fn push(
     Ok(Json(
         json!({"release": release, "steps": recorded, "carebus": report}),
     ))
+}
+
+/// `GET /api/targets/{id}/drift` (tenant_user): what care-bus holds against what was pushed and what
+/// the configuration builds now. `status` is `in_sync`, `drift` (care-bus's current release is not the
+/// last one pushed), `never_pushed`, `carebus_has_no_release` or `carebus_unavailable` (an upstream
+/// failure is a status here, not a 502). `config_changed`: a fresh build hashes differently from the
+/// latest built release, or does not build.
+async fn drift(
+    State(st): State<AppState>,
+    ctx: TenantCtx,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let client = st.carebus.clone().ok_or_else(carebus_unconfigured)?;
+    let mut tx = st.tx(Some(ctx.tenant)).await?;
+    let target = target_of(&mut tx, &id).await?;
+    let latest = db::latest_release(&mut tx, target.id).await?;
+    let last_pushed = db::last_pushed(&mut tx, target.id).await?;
+    let config_changed = match build(&mut tx, ctx.tenant, &target).await {
+        Ok(b) => latest.as_ref().is_none_or(|l| l.hash != b.hash),
+        Err(_) => true,
+    };
+    tx.rollback().await?;
+
+    let current = client.current_release(ctx.tenant, &target.job).await;
+    if let Err(e) = &current {
+        tracing::warn!(release_target = %target.id, error = %e, "care-bus release read-back failed");
+    }
+    let status = match (&current, &last_pushed) {
+        (Err(_), _) => "carebus_unavailable",
+        (Ok(_), None) => "never_pushed",
+        (Ok(None), Some(_)) => "carebus_has_no_release",
+        (Ok(Some(r)), Some((release_id, hash, _))) => {
+            if r["release_id"] == release_id.as_str() && r["hash"] == hash.as_str() {
+                "in_sync"
+            } else {
+                "drift"
+            }
+        }
+    };
+    let carebus = match &current {
+        Ok(Some(r)) => json!({
+            "release_id": r["release_id"],
+            "hash": r["hash"],
+            "applied_at": r["applied_at"],
+            "conflicts": r["conflicts"],
+        }),
+        _ => Value::Null,
+    };
+    Ok(Json(json!({
+        "status": status,
+        "carebus": carebus,
+        "last_pushed": last_pushed.map(|(release_id, hash, pushed_at)| {
+            json!({"release_id": release_id, "hash": hash, "pushed_at": pushed_at})
+        }),
+        "latest_built": latest.map(|l| json!({"release_id": l.release_id, "hash": l.hash})),
+        "config_changed": config_changed,
+    })))
 }
