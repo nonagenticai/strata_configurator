@@ -41,6 +41,12 @@ pub struct Known {
     pub jobs: BTreeSet<String>,
     pub dimensions: BTreeMap<String, BTreeSet<String>>,
     pub axes: Vec<Axis>,
+    /// Every object a platform (non-tenant) layer adds, in any layer, as [`inherited_key`]
+    /// (`kind:key`). A tenant tombstone of one of these that the selection does not contain is
+    /// skipped with a `tombstone_out_of_selection` warning; a tenant tombstone of anything else is
+    /// `tombstone_missing` (a stale or mistyped key).
+    #[serde(default)]
+    pub inherited: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +377,11 @@ fn provenance_key(kind: Kind, key: &str) -> String {
     format!("{}:{key}", kind_name(kind))
 }
 
+/// `kind:key`, as [`Known::inherited`] holds it (the same shape as a provenance key).
+pub fn inherited_key(kind: Kind, key: &str) -> String {
+    provenance_key(kind, key)
+}
+
 /// `Order.order_id` -> `Order`.
 fn attribute_entity(key: &str) -> &str {
     key.split_once('.').map_or(key, |(entity, _)| entity)
@@ -471,7 +482,8 @@ impl State {
     }
 
     /// Apply one row of the layer at index `layer` in `layer_order`.
-    fn apply(&mut self, row: &OverlayRow, layer: usize) {
+    /// `inherited` is [`Known::inherited`].
+    fn apply(&mut self, row: &OverlayRow, layer: usize, inherited: &BTreeSet<String>) {
         let kind = row.kind;
         let idx = kind_index(kind);
         // A patch/tombstone of an attribute/relation whose entity this same layer
@@ -542,6 +554,17 @@ impl State {
             },
             Op::Tombstone => {
                 if !self.exists(kind, &row.key) {
+                    // The tenant layer applies to every selection, so it may hide an inherited
+                    // object this selection does not contain (another job's knowledge store, say):
+                    // a no-op here, reported, not an error.
+                    let object = provenance_key(kind, &row.key);
+                    if row.layer.scope == Scope::Tenant && inherited.contains(&object) {
+                        self.warnings.push(Warning {
+                            code: "tombstone_out_of_selection",
+                            key: object,
+                        });
+                        return;
+                    }
                     let msg = self.missing_message("tombstone", row, layer);
                     self.error(ErrorCode::TombstoneMissing, row, msg);
                     return;
@@ -787,7 +810,7 @@ pub fn compile(
                 continue;
             }
             previous = Some(current);
-            state.apply(row, pos);
+            state.apply(row, pos, &known.inherited);
         }
     }
 
@@ -936,6 +959,7 @@ mod tests {
                 label: None,
                 description: None,
             }],
+            inherited: BTreeSet::new(),
         }
     }
 
@@ -1825,5 +1849,81 @@ mod tests {
         assert_eq!(j.preamble.as_deref(), Some("You are the intake step."));
         assert_eq!(j.actor_label.as_deref(), Some("Customer care desk"));
         assert_eq!(j.actor, "customer");
+    }
+    // --- tenant tombstones outside the selection ------------------------------
+
+    fn known_inherited(keys: &[&str]) -> Known {
+        Known {
+            inherited: keys.iter().map(|k| (*k).to_owned()).collect(),
+            ..known()
+        }
+    }
+
+    fn sel_tenant_only() -> Selection {
+        Selection {
+            tenant: Some(TENANT),
+            ..Selection::default()
+        }
+    }
+
+    const SPACE: &str = "retail:order-support:returns";
+
+    #[test]
+    fn tenant_tombstone_of_inherited_item_outside_selection_is_info() {
+        // The tenant hid a context space of job A's layer; a compile without that job skips the
+        // tombstone and says so, instead of failing with tombstone_missing.
+        let rows = [
+            space(1, job_layer()),
+            tomb(2, tenant(), Kind::ContextSpace, SPACE),
+        ];
+        let known = known_inherited(&[&format!("context_space:{SPACE}")]);
+        let cfg = compile(&sel_tenant_only(), &known, &rules(), &rows)
+            .unwrap_or_else(|e| panic!("unexpected compile errors: {e:?}"));
+        assert!(cfg.job_content.context_spaces.is_empty());
+        assert_eq!(
+            cfg.warnings,
+            vec![Warning {
+                code: "tombstone_out_of_selection",
+                key: format!("context_space:{SPACE}"),
+            }]
+        );
+        // In job A's selection the same tombstone still hides the space, with no diagnostic.
+        let cfg = compile(&sel_job_tenant(), &known, &rules(), &rows)
+            .unwrap_or_else(|e| panic!("unexpected compile errors: {e:?}"));
+        assert!(!cfg.job_content.context_spaces.contains_key(SPACE));
+        assert!(
+            cfg.warnings
+                .iter()
+                .all(|w| w.code != "tombstone_out_of_selection")
+        );
+    }
+
+    #[test]
+    fn tenant_tombstone_of_unknown_key_is_still_tombstone_missing() {
+        let rows = [
+            space(1, job_layer()),
+            tomb(2, tenant(), Kind::ContextSpace, "retail:order-support:nope"),
+        ];
+        let known = known_inherited(&[&format!("context_space:{SPACE}")]);
+        let errors = compile(&sel_tenant_only(), &known, &rules(), &rows)
+            .expect_err("a tombstone of a key no platform row adds is stale");
+        assert_eq!(codes(&errors), vec![ErrorCode::TombstoneMissing]);
+        assert_eq!(errors[0].row_id, Some(id(2)));
+        // The inherited set is per kind: the same key under another kind is not inherited.
+        let rows = [tomb(3, tenant(), Kind::KnowledgeStore, SPACE)];
+        let errors = compile(&sel_tenant_only(), &known, &rules(), &rows)
+            .expect_err("kind is part of the identity");
+        assert_eq!(codes(&errors), vec![ErrorCode::TombstoneMissing]);
+    }
+
+    #[test]
+    fn platform_tombstone_outside_selection_is_still_an_error() {
+        // Only the tenant layer may name items outside the selection; platform layers are authored
+        // against what is below them.
+        let rows = [tomb(1, industry("retail"), Kind::Entity, "Order")];
+        let known = known_inherited(&["entity:Order"]);
+        let errors =
+            compile(&sel_retail(), &known, &rules(), &rows).expect_err("platform tombstone");
+        assert_eq!(codes(&errors), vec![ErrorCode::TombstoneMissing]);
     }
 }

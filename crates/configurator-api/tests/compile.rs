@@ -275,3 +275,65 @@ async fn export_round_trips() {
     assert_eq!(value.label.as_deref(), Some("Curated label"));
     assert_eq!(value.description.as_deref(), Some("Curated description"));
 }
+
+/// A tenant hides `kind`/`key` in its own layer; returns the tombstone row.
+async fn hide(app: &axum::Router, who: &str, kind: &str, key: &str) -> Value {
+    let (s, layer) = member(app, "POST", "/api/layers", who, json!({"scope":"tenant"})).await;
+    assert_eq!(s, StatusCode::CREATED, "{layer}");
+    let uri = format!("/api/layers/{}/rows", layer["id"].as_str().unwrap());
+    let (s, row) = member(
+        app,
+        "POST",
+        &uri,
+        who,
+        json!({"kind": kind, "key": key, "op": "tombstone"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{row}");
+    row
+}
+
+#[tokio::test]
+async fn hidden_item_of_another_job_is_info_not_an_error() {
+    let e = seeded().await;
+    tenant(&e.app, "alice").await;
+    // faq-policies is a knowledge store of customer_care_agent's job layer only.
+    hide(&e.app, "alice", "knowledge_store", "faq-policies").await;
+    let (s, out) = member(
+        &e.app,
+        "POST",
+        "/api/compile",
+        "alice",
+        json!({"job":"employee_care_agent"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert!(
+        out["warnings"].as_array().unwrap().iter().any(|w| w
+            == &json!({"code":"tombstone_out_of_selection", "key":"knowledge_store:faq-policies"})),
+        "{out}"
+    );
+    // Selecting the job it belongs to, the tombstone hides it.
+    let (s, out) = member(&e.app, "POST", "/api/compile", "alice", golden()).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    let stores = out["job_content"]["knowledge_stores"].as_object().unwrap();
+    assert!(stores.contains_key("faq"), "{out}");
+    assert!(!stores.contains_key("faq-policies"), "{out}");
+}
+
+#[tokio::test]
+async fn tombstone_of_a_key_no_platform_row_adds_stays_an_error() {
+    let e = seeded().await;
+    tenant(&e.app, "alice").await;
+    let row = hide(&e.app, "alice", "knowledge_store", "no-such-store").await;
+    let (s, out) = member(&e.app, "POST", "/api/compile", "alice", json!({})).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{out}");
+    assert!(
+        out["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|err| err["row_id"] == row["id"] && err["code"] == "tombstone_missing"),
+        "{out}"
+    );
+}
