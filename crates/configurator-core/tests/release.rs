@@ -369,3 +369,209 @@ fn build_is_deterministic() {
         bundle_hash(&b).expect("hash")
     );
 }
+
+/// RFC 8785 key order (UTF-16 code units), as care-bus hashes: a key above U+FFFF sorts before one in
+/// U+E000..U+FFFF, the reverse of UTF-8 byte order. The expected hash is computed independently
+/// (Python, keys sorted by their UTF-16BE encoding).
+#[test]
+fn hash_sorts_keys_by_utf16() {
+    let v = json!({"\u{e000}": 1, "\u{1f600}": 2, "a": 0});
+    assert_eq!(
+        bundle_hash(&v).unwrap(),
+        "sha256:eeb65aeaeec6c59da0989967658b0d4bc9a07d6550fbf60fb3fc60b9af7ae8ef"
+    );
+}
+
+// --- parity: seed v1 + v2 builds care-bus's golden base ---------------------------------------
+
+/// `items` keyed by their natural key.
+fn keyed(
+    items: &Value,
+    key: impl Fn(&Value) -> String,
+) -> std::collections::BTreeMap<String, Value> {
+    items
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|v| (key(v), v.clone()))
+        .collect()
+}
+
+/// One line per difference between `ours` and care-bus's `theirs` (both keyed), field by field.
+fn diff(
+    section: &str,
+    ours: &std::collections::BTreeMap<String, Value>,
+    theirs: &std::collections::BTreeMap<String, Value>,
+    out: &mut Vec<String>,
+) {
+    let keys: std::collections::BTreeSet<&String> = ours.keys().chain(theirs.keys()).collect();
+    for k in keys {
+        match (ours.get(k), theirs.get(k)) {
+            (Some(_), None) => out.push(format!("{section} {k}: only in ours")),
+            (None, Some(_)) => out.push(format!("{section} {k}: only in care-bus")),
+            (Some(a), Some(b)) if a != b => {
+                let fields: std::collections::BTreeSet<&String> = a
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|m| m.keys())
+                    .chain(b.as_object().into_iter().flat_map(|m| m.keys()))
+                    .collect();
+                for f in fields {
+                    if a.get(f) != b.get(f) {
+                        out.push(format!(
+                            "{section} {k}.{f}: ours {} care-bus {}",
+                            a.get(f).map_or("absent".into(), canonical_json),
+                            b.get(f).map_or("absent".into(), canonical_json),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The natural key `field` of a list item.
+fn by(field: &'static str) -> impl Fn(&Value) -> String {
+    move |v| v[field].as_str().unwrap_or_default().to_owned()
+}
+
+/// Every difference between two bundles, lists compared by natural key (order is not content).
+fn bundle_diff(ours: &Value, theirs: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    // entities without their attributes, then attributes as Entity.attribute
+    let strip = |b: &Value| -> Value {
+        let mut list = b["ontology"]["entities"].clone();
+        for e in list.as_array_mut().expect("entities") {
+            e.as_object_mut().expect("entity").remove("attributes");
+        }
+        list
+    };
+    let attrs = |b: &Value| -> Value {
+        Value::Array(
+            b["ontology"]["entities"]
+                .as_array()
+                .expect("entities")
+                .iter()
+                .flat_map(|e| {
+                    let entity = e["name"].as_str().unwrap_or_default().to_owned();
+                    e["attributes"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |mut a| {
+                            a["_entity"] = json!(entity);
+                            a
+                        })
+                })
+                .collect(),
+        )
+    };
+    let attr_key = |a: &Value| {
+        format!(
+            "{}.{}",
+            a["_entity"].as_str().unwrap_or_default(),
+            a["name"].as_str().unwrap_or_default()
+        )
+    };
+    let rel_key = |r: &Value| {
+        format!(
+            "{}|{}|{}",
+            r["subject"].as_str().unwrap_or_default(),
+            r["predicate"].as_str().unwrap_or_default(),
+            r["object"].as_str().unwrap_or_default()
+        )
+    };
+    let proc_key = |p: &Value| {
+        format!(
+            "{}@{}",
+            p["name"].as_str().unwrap_or_default(),
+            p["version"].as_str().unwrap_or_default()
+        )
+    };
+    let one = |v: &Value| keyed(&json!([v]), |_| String::new());
+    diff(
+        "job_settings",
+        &one(&ours["job_settings"]),
+        &one(&theirs["job_settings"]),
+        &mut out,
+    );
+    diff(
+        "entity",
+        &keyed(&strip(ours), by("name")),
+        &keyed(&strip(theirs), by("name")),
+        &mut out,
+    );
+    diff(
+        "attribute",
+        &keyed(&attrs(ours), attr_key),
+        &keyed(&attrs(theirs), attr_key),
+        &mut out,
+    );
+    diff(
+        "relation",
+        &keyed(&ours["ontology"]["relations"], rel_key),
+        &keyed(&theirs["ontology"]["relations"], rel_key),
+        &mut out,
+    );
+    diff(
+        "context_space",
+        &keyed(&ours["context_spaces"], by("key")),
+        &keyed(&theirs["context_spaces"], by("key")),
+        &mut out,
+    );
+    diff(
+        "procedure",
+        &keyed(&ours["procedures"], proc_key),
+        &keyed(&theirs["procedures"], proc_key),
+        &mut out,
+    );
+    diff(
+        "connector",
+        &keyed(&ours["connectors"], by("id")),
+        &keyed(&theirs["connectors"], by("id")),
+        &mut out,
+    );
+    diff(
+        "knowledge_store",
+        &keyed(&ours["knowledge_stores"], by("key")),
+        &keyed(&theirs["knowledge_stores"], by("key")),
+        &mut out,
+    );
+    out
+}
+
+/// The bundle built from the embedded seeds (v1 + v2) for customer_care_agent reproduces care-bus's
+/// golden base, verified field by field. The only differences are the recorded model decisions:
+/// Order, Product and Payment are base (generic) objects here (`carebus_0002_ontology.json`
+/// `_deltas`), and the job stance stays seed v1's (plan 03 Task 3).
+#[test]
+fn seed_build_reproduces_the_carebus_golden_bundle() {
+    let built = serde_json::to_value(build_seeded()).expect("serialises");
+    let golden = fixture()["bundle"].clone();
+    let got = bundle_diff(&built, &golden);
+    let stance = format!(
+        "job_settings .stance: ours {} care-bus {}",
+        canonical_json(&built["job_settings"]["stance"]),
+        canonical_json(&golden["job_settings"]["stance"]),
+    );
+    let mut want = vec![stance];
+    for entity in ["Order", "Payment", "Product"] {
+        want.push(format!(
+            "entity {entity}.industry: ours null care-bus \"retail\""
+        ));
+        want.push(format!(
+            "entity {entity}.scope: ours \"generic\" care-bus \"industry\""
+        ));
+    }
+    want.sort();
+    let mut got_sorted = got.clone();
+    got_sorted.sort();
+    assert_eq!(
+        got_sorted,
+        want,
+        "differences from the care-bus golden bundle:\n{}",
+        got.join("\n")
+    );
+}

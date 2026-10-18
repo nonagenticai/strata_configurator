@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 
 use crate::compile::EffectiveConfig;
 
-/// Canonical JSON: object keys sorted recursively, no whitespace. Numbers and
-/// strings are printed exactly as `serde_json` prints them.
+/// Canonical JSON: object keys sorted recursively by UTF-16 code units (RFC 8785,
+/// as care-bus sorts them), no whitespace. Numbers and strings are printed exactly
+/// as `serde_json` prints them.
 pub fn canonical_json(v: &Value) -> String {
     let mut out = String::new();
     write_value(v, &mut out);
@@ -40,7 +41,9 @@ fn write_value(v: &Value, out: &mut String) {
         }
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
+            // UTF-16 order differs from UTF-8 byte order once a key holds a character above
+            // U+FFFF next to one in U+E000..U+FFFF.
+            keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
             out.push('{');
             for (i, k) in keys.into_iter().enumerate() {
                 if i > 0 {
@@ -212,6 +215,24 @@ mod tests {
         assert_eq!(
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn keys_sort_by_utf16_code_units() {
+        // U+1F600 is F0.. in UTF-8 but D83D DE00 in UTF-16; U+E000 is EE.. / E000. UTF-8 byte
+        // order puts U+E000 first, UTF-16 (care-bus, RFC 8785) puts the emoji first.
+        let v = json!({"\u{e000}": 1, "\u{1f600}": 2, "a": 0});
+        assert_eq!(
+            canonical_json(&v),
+            "{\"a\":0,\"\u{1f600}\":2,\"\u{e000}\":1}"
+        );
+        let mut utf8: Vec<&str> = vec!["\u{e000}", "\u{1f600}"];
+        utf8.sort_unstable();
+        assert_eq!(
+            utf8,
+            ["\u{e000}", "\u{1f600}"],
+            "UTF-8 order really differs"
         );
     }
 }
