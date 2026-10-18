@@ -242,6 +242,11 @@ async fn import(
         ("first_admin_email", b.first_admin_email),
     )
     .await?;
+    // care-bus makes this person tenant_admin, so they must be one here too.
+    if let Err(e) = ensure_first_admin(&st, &caller.sub, id, &holder).await {
+        kept_identity(&holder, invited);
+        return Err(e);
+    }
     if st.licenses_admin.is_some()
         && licenses::license_id(&st.owner, id).await?.is_none()
         && let Err(e) = repair_licence(&st, &caller.sub, &existing, &holder).await
@@ -254,6 +259,55 @@ async fn import(
         StatusCode::OK,
         Json(json!({"tenant": existing, "imported": false, "carebus": carebus})),
     ))
+}
+
+/// The re-import's first admin must be an active `tenant_admin` of tenant `id` here before care-bus is
+/// told so: an identity in no tenant becomes one now (the `users` row path of create, audited
+/// `user.add`, under a row lock); anyone else (another tenant's member, a `tenant_user`, a disabled
+/// user) is 409 `first_admin_not_tenant_admin`.
+async fn ensure_first_admin(
+    st: &AppState,
+    actor: &str,
+    id: Uuid,
+    sub: &str,
+) -> Result<(), ApiError> {
+    let mut tx = st.owner.begin().await?;
+    // Serialise with a concurrent import or user add of this subject.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('users:' || $1::text, 0))")
+        .bind(sub)
+        .execute(&mut *tx)
+        .await?;
+    let row: Option<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT tenant, tenant_role::text, disabled_at IS NOT NULL FROM users WHERE sub = $1",
+    )
+    .bind(sub)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match row {
+        Some((t, role, false)) if t == id && role == Role::TenantAdmin.as_str() => Ok(()),
+        Some(_) => Err(ApiError::Conflict(
+            "first_admin_not_tenant_admin",
+            format!("{sub} is not an active tenant_admin of tenant {id}"),
+        )),
+        None => {
+            let Some(u) = users::add(&mut tx, id, sub, Role::TenantAdmin).await? else {
+                return Err(user_exists(sub));
+            };
+            let after = json!({"tenant": id, "sub": u.sub, "role": u.role});
+            audit::record(
+                &mut tx,
+                actor,
+                Some(id),
+                "user.add",
+                &format!("user:{id}:{}", u.sub),
+                None,
+                Some(&after),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+    }
 }
 
 /// Issue and store the licence of an existing tenant that has none (an import's repair path), audited

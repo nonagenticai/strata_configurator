@@ -1520,3 +1520,70 @@ async fn nil_or_braced_id_is_400() {
         );
     }
 }
+
+async fn import_as(e: &common::TestEnv, sub: &str) -> (StatusCode, Value) {
+    root(
+        &e.app,
+        "POST",
+        "/api/tenants/import",
+        json!({"id": FR_TEST, "name": "fr-test-user", "first_admin_sub": sub}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn reimport_admin_must_be_this_tenants_admin() {
+    let up = upstream().await;
+    let e = common::env_with(&up.licensing()).await;
+    let (s, _) = import(&e, "fr-test-user").await;
+    assert_eq!(s, StatusCode::CREATED);
+    tenant(&e).await; // Acme, first admin alice
+
+    // Another tenant's member is refused, and stays where they are.
+    let (s, b) = import_as(&e, "alice").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::CONFLICT, &json!("first_admin_not_tenant_admin")),
+        "{b}"
+    );
+    assert_ne!(user_row(&e, "alice").await.map(|(t, _)| t), Some(fr()));
+    // A tenant_user of this tenant is refused too.
+    sqlx::query("INSERT INTO users (sub, tenant, tenant_role) VALUES ('carol', $1, 'tenant_user')")
+        .bind(fr())
+        .execute(common::pool(&e))
+        .await
+        .unwrap();
+    let (s, b) = import_as(&e, "carol").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::CONFLICT, &json!("first_admin_not_tenant_admin"))
+    );
+    // An identity in no tenant becomes this tenant's tenant_admin.
+    let (s, b) = import_as(&e, "newbie").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        user_row(&e, "newbie").await,
+        Some((fr(), "tenant_admin".into()))
+    );
+    assert_eq!(audited(&e, "user.add").await, 1);
+    // The existing first admin passes as before.
+    let (s, _) = import_as(&e, "fr-admin").await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn import_of_an_archived_tenant_is_403() {
+    let up = upstream().await;
+    let e = common::env_with(&up.licensing()).await;
+    import(&e, "fr-test-user").await;
+    sqlx::query("UPDATE tenant SET archived_at = now() WHERE id = $1")
+        .bind(fr())
+        .execute(common::pool(&e))
+        .await
+        .unwrap();
+    let (s, b) = import(&e, "fr-test-user").await;
+    assert_eq!(
+        (s, code(&b)),
+        (StatusCode::FORBIDDEN, &json!("tenant_suspended"))
+    );
+}
