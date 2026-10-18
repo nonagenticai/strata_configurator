@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod auth;
+pub mod carebus_client;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod license_token;
 pub mod licenses_admin;
 pub mod offboarding;
 pub mod page;
+pub mod provision;
 pub mod routes;
 pub mod seeder;
 pub mod service_token;

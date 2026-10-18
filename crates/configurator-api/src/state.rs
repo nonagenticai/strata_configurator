@@ -4,6 +4,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::auth::Verifier;
+use crate::carebus_client::CarebusClient;
 use crate::config::Config;
 use crate::db;
 use crate::keycloak_admin::KeycloakAdmin;
@@ -46,6 +47,8 @@ pub struct AppState {
     pub token_cipher: Option<Arc<TokenCipher>>,
     /// Early-access signup settings, Turnstile and Telegram (W2.3).
     pub signup: Arc<Signup>,
+    /// The care-bus release-writer SA (W4); `None` when not configured.
+    pub carebus: Option<Arc<CarebusClient>>,
 }
 
 impl AppState {
@@ -80,6 +83,10 @@ impl AppState {
             .as_ref()
             .map(|k| Arc::new(TokenCipher::new(k)));
         let signup = Arc::new(Signup::new(cfg.signup.clone(), http.clone()));
+        let carebus = cfg
+            .carebus
+            .as_ref()
+            .map(|c| Arc::new(CarebusClient::new(c, http.clone())));
         let auth = Arc::new(Verifier::jwks(
             &cfg.keycloak_issuer,
             &cfg.keycloak_audience,
@@ -97,6 +104,7 @@ impl AppState {
             licenses_admin,
             token_cipher,
             signup,
+            carebus,
         }
     }
 

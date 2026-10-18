@@ -5,17 +5,22 @@ spec (`docs/superpowers/specs/2026-10-16-configurator-design.md`, rev 2) and of 
 (`2026-10-16-configurator-00-overview.md`) that are listed in §3. The first task of the next
 session is spec rev 3 (W1.0), which folds these decisions into the spec.
 
-**Progress (2026-10-17, evening).** Done: W0, spec rev 3, W1 (incl. W1.1 invite), W2.1 gate 2,
-W2.2 issuance and W2.3 early-access signup. They ship in strata_configurator PR #2, with every
-integration dark by env; gitops-production#4752 carries the waypoint PSA fix, the `configurator_app`
-DB role, the Keycloak `super_admin` client role, the `strata-configurator-admin` SA, and in-cluster
-admin URLs plus egress and AuthZ. Open, in order:
-1. **W6** (licences repo). Gate 2 and issuance stay dark until it lands; then set
-   `LICENSES_ADMIN_*` and flip `LICENSE_GATE_2_ENABLED`.
+**Progress (2026-10-18).** Done and merged to main: W0, spec rev 3, W1 (incl. W1.1 invite), W2.1 gate 2
+(also for a super-admin acting in a tenant), W2.2 issuance (token sealed at rest, `LICENSE_TOKEN_ENC_KEY`),
+W2.3 early-access signup, and tenant offboarding (licence revoke, soft archive): strata_configurator
+PRs #2 to #5, every integration dark by env; gitops-production#4752 carries the waypoint PSA fix, the
+`configurator_app` DB role, the Keycloak `super_admin` client role, the `strata-configurator-admin` SA
+and the in-cluster admin URLs, egress and AuthZ. care-bus **W3** is merged on care-bus-agents main
+(PR #23, fc7f394) but not deployed yet. **W4** is in strata_configurator PR #6 (draft), plan
+`2026-10-18-configurator-03-w4-release-push.md`: Tasks 1 to 10 are done and green in CI, incl.
+provision-down at the former `// W4:` marker (behind `CAREBUS_PROVISION_ENABLED`, default off). Open, in
+order:
+1. **W6** (licences repo; licences#287 adds the `strata-configurator` grant for the fr-test tenant). Gate
+   2 and issuance stay dark until it lands; then set `LICENSES_ADMIN_*` and flip `LICENSE_GATE_2_ENABLED`.
 2. Keycloak client `configurator-signup-intake` plus the signup env, then flip
    `EARLY_ACCESS_SIGNUP_ENABLED`.
-3. **W3**, after the care-bus session hands back its note (§8.1 item 4).
-4. **W4**, which includes provision-down at the `// W4:` marker in `routes/signups.rs` `approve`.
+3. The care-bus W3 deploy (care-bus's session; it flips `KEYCLOAK_AUDIENCE` to `care-bus`).
+4. W4 Tasks 11 (gitops: `CAREBUS_*` env and secret, egress) and 12 (live verification), then merge #6.
 
 Known gaps:
 - licence revoke on offboarding;

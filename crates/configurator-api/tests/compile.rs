@@ -15,7 +15,8 @@ fn golden() -> Value {
 #[tokio::test]
 async fn golden_selection_hash_matches_core() {
     let e = seeded().await;
-    let b = configurator_api::seeder::embedded().unwrap().remove(0);
+    let bundles = configurator_api::seeder::embedded().unwrap();
+    let b = &bundles[0];
     let sel = Selection {
         industry: Some("retail".into()),
         departments: ["faq", "logistics", "order-support", "payments"]
@@ -25,12 +26,24 @@ async fn golden_selection_hash_matches_core() {
         job: Some("customer_care_agent".into()),
         ..Default::default()
     };
-    let (rules, rows) = seed::to_rows(&b);
+    // Every embedded version is seeded: v1 (ontology, jobs) and v2 (job content).
+    let (rules, mut rows) = seed::to_rows(b);
+    for later in &bundles[1..] {
+        rows.extend(seed::to_rows(later).1);
+    }
     let expected = compile(&sel, &b.known(), &rules, &rows).unwrap();
     let (s, actual) = root(&e.app, "POST", "/api/compile", golden()).await;
     assert_eq!(s, StatusCode::OK, "{actual}");
     assert_eq!(actual["hash"], expected.hash);
     println!("GOLDEN_HASH={}", expected.hash);
+    assert_eq!(
+        actual["job_content"]["procedures"]
+            .as_object()
+            .map(|m| m.len()),
+        Some(6),
+        "seed v2 job content compiles through the API"
+    );
+    assert_eq!(actual["job"]["actor_label"], "Customer care desk");
     assert_eq!(
         actual["provenance"]["entity:Order"]
             .as_array()
@@ -214,14 +227,15 @@ async fn export_round_trips() {
     assert_eq!(s, StatusCode::FORBIDDEN);
     let (s, out) = root(&e.app, "GET", "/api/platform/export", Value::Null).await;
     assert_eq!(s, StatusCode::OK, "{out}");
-    assert_eq!(out["version"], 2);
+    // Seeds v1 and v2 are recorded, so the export is version 3.
+    assert_eq!(out["version"], 3);
     let files: Vec<_> = out["files"]
         .as_object()
         .unwrap()
         .iter()
         .map(|(n, t)| (n.as_str(), t.as_str().unwrap()))
         .collect();
-    let parsed = seed::parse(2, &files).unwrap();
+    let parsed = seed::parse(3, &files).unwrap();
     let (_, exported) = seed::to_rows(&parsed);
     let keys: Vec<LayerKey> = parsed
         .layers

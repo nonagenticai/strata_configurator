@@ -34,8 +34,14 @@ const V1: &[(&str, &str)] = &[
     ("jobs.toml", include_str!("../../../seed/v1/jobs.toml")),
 ];
 
+/// customer_care_agent job content from care-bus's golden release bundle v1 (W4).
+const V2: &[(&str, &str)] = &[(
+    "customer_care_agent.toml",
+    include_str!("../../../seed/v2/customer_care_agent.toml"),
+)];
+
 /// Every seed version shipped in this build, as `(version, files)`.
-const EMBEDDED: &[(u32, &[(&str, &str)])] = &[(1, V1)];
+const EMBEDDED: &[(u32, &[(&str, &str)])] = &[(1, V1), (2, V2)];
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeedError {
@@ -333,6 +339,10 @@ pub fn kind_name(k: Kind) -> &'static str {
         Kind::Attribute => "attribute",
         Kind::Relation => "relation",
         Kind::Job => "job",
+        Kind::ContextSpace => "context_space",
+        Kind::Procedure => "procedure",
+        Kind::ConnectorSlot => "connector_slot",
+        Kind::KnowledgeStore => "knowledge_store",
     }
 }
 

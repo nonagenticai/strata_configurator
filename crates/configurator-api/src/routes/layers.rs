@@ -91,7 +91,7 @@ fn parse_enum<T: serde::de::DeserializeOwned>(
 fn parse_kind(s: &str) -> Result<Kind, ApiError> {
     parse_enum(
         "invalid_kind",
-        "kind (entity | attribute | relation | job)",
+        "kind (entity | attribute | relation | job | context_space | procedure | connector_slot | knowledge_store)",
         s,
     )
 }

@@ -10,6 +10,9 @@ use uuid::Uuid;
 use crate::axis::{Axis, Cardinality, Condition, Profile};
 use crate::layer::{LayerKey, Scope};
 use crate::overlay::{Kind, Op, OverlayRow, validate_fields, validate_key};
+use crate::release::{
+    ConnectorSlotV1, ContentItem, ContextSpaceV1, KnowledgeStoreV1, ProcedureV1, content_item,
+};
 
 /// What a compile is asked for (spec 5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -51,6 +54,9 @@ pub enum ErrorCode {
     AddTombstoned,
     DanglingReference,
     InvalidRow,
+    /// A job-content kind (context space, procedure, connector slot, knowledge
+    /// store) in a layer other than job or tenant.
+    KindNotAllowedInLayer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +127,13 @@ pub struct Job {
     pub label: String,
     pub actor: String,
     pub stance: Option<String>,
+    /// The prompt preamble care-bus uses (bundle `job_settings.preamble`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<String>,
+    /// The actor as care-bus prompts name it, e.g. `Customer care desk`
+    /// (bundle `job_settings.actor`); `actor` stays the role word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_label: Option<String>,
     pub ontology_slice: Vec<String>,
     pub channels: Vec<String>,
     pub escalation: Option<Value>,
@@ -128,6 +141,25 @@ pub struct Job {
     pub sops: Vec<String>,
     pub tools: Vec<String>,
     pub stores: Vec<String>,
+}
+
+/// The job's content beyond the ontology, keyed by row key (`name@version` for
+/// procedures). Built from the four job-content overlay kinds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobContent {
+    pub context_spaces: BTreeMap<String, ContextSpaceV1>,
+    pub procedures: BTreeMap<String, ProcedureV1>,
+    pub connectors: BTreeMap<String, ConnectorSlotV1>,
+    pub knowledge_stores: BTreeMap<String, KnowledgeStoreV1>,
+}
+
+impl JobContent {
+    pub fn is_empty(&self) -> bool {
+        self.context_spaces.is_empty()
+            && self.procedures.is_empty()
+            && self.connectors.is_empty()
+            && self.knowledge_stores.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -144,6 +176,8 @@ pub struct EffectiveConfig {
     pub attributes: BTreeMap<String, Attribute>,
     pub relations: BTreeMap<String, Relation>,
     pub job: Option<Job>,
+    #[serde(skip_serializing_if = "JobContent::is_empty")]
+    pub job_content: JobContent,
     /// `"entity:Order"` -> the rows that built the object, in apply order.
     pub provenance: BTreeMap<String, Vec<Origin>>,
     pub warnings: Vec<Warning>,
@@ -313,6 +347,10 @@ fn kind_index(kind: Kind) -> usize {
         Kind::Attribute => 1,
         Kind::Relation => 2,
         Kind::Job => 3,
+        Kind::ContextSpace => 4,
+        Kind::Procedure => 5,
+        Kind::ConnectorSlot => 6,
+        Kind::KnowledgeStore => 7,
     }
 }
 
@@ -322,6 +360,10 @@ fn kind_name(kind: Kind) -> &'static str {
         Kind::Attribute => "attribute",
         Kind::Relation => "relation",
         Kind::Job => "job",
+        Kind::ContextSpace => "context_space",
+        Kind::Procedure => "procedure",
+        Kind::ConnectorSlot => "connector_slot",
+        Kind::KnowledgeStore => "knowledge_store",
     }
 }
 
@@ -355,7 +397,12 @@ fn referenced_entities(kind: Kind, key: &str) -> Vec<&str> {
                 vec![subject, object]
             }
         }
-        Kind::Entity | Kind::Job => Vec::new(),
+        Kind::Entity
+        | Kind::Job
+        | Kind::ContextSpace
+        | Kind::Procedure
+        | Kind::ConnectorSlot
+        | Kind::KnowledgeStore => Vec::new(),
     }
 }
 
@@ -392,10 +439,10 @@ struct Obj {
 #[derive(Default)]
 struct State {
     /// Present objects, indexed by `kind_index`.
-    objects: [BTreeMap<String, Obj>; 4],
+    objects: [BTreeMap<String, Obj>; 8],
     /// Objects removed by a tombstone (directly or by cascade) -> index of the
     /// layer (in `layer_order`) that removed them.
-    removed: [BTreeMap<String, usize>; 4],
+    removed: [BTreeMap<String, usize>; 8],
     provenance: BTreeMap<String, Vec<Origin>>,
     errors: Vec<CompileError>,
     warnings: Vec<Warning>,
@@ -622,6 +669,8 @@ fn to_job(key: &str, fields: &Map<String, Value>) -> Job {
         label: text(fields, "label").unwrap_or_default(),
         actor: text(fields, "actor").unwrap_or_default(),
         stance: text(fields, "stance"),
+        preamble: text(fields, "preamble"),
+        actor_label: text(fields, "actor_label"),
         ontology_slice: list(fields, "ontology_slice"),
         channels: list(fields, "channels"),
         escalation: fields.get("escalation").cloned(),
@@ -630,6 +679,45 @@ fn to_job(key: &str, fields: &Map<String, Value>) -> Job {
         tools: list(fields, "tools"),
         stores: list(fields, "stores"),
     }
+}
+
+/// Type the job-content objects. Patches merge shallowly, so the merged fields
+/// are parsed again here; a failure is `invalid_row` on the object's add row.
+fn build_job_content(state: &mut State) -> JobContent {
+    let mut out = JobContent::default();
+    let mut errors = Vec::new();
+    for kind in [
+        Kind::ContextSpace,
+        Kind::Procedure,
+        Kind::ConnectorSlot,
+        Kind::KnowledgeStore,
+    ] {
+        for (key, obj) in &state.objects[kind_index(kind)] {
+            match content_item(kind, key, &obj.fields) {
+                Ok(ContentItem::ContextSpace(x)) => {
+                    out.context_spaces.insert(key.clone(), x);
+                }
+                Ok(ContentItem::Procedure(x)) => {
+                    out.procedures.insert(key.clone(), x);
+                }
+                Ok(ContentItem::ConnectorSlot(x)) => {
+                    out.connectors.insert(key.clone(), x);
+                }
+                Ok(ContentItem::KnowledgeStore(x)) => {
+                    out.knowledge_stores.insert(key.clone(), x);
+                }
+                Err(message) => errors.push(CompileError::row(
+                    ErrorCode::InvalidRow,
+                    obj.add_row,
+                    kind,
+                    key,
+                    message,
+                )),
+            }
+        }
+    }
+    state.errors.extend(errors);
+    out
 }
 
 // --- compile ----------------------------------------------------------------
@@ -662,6 +750,14 @@ pub fn compile(
             }
             continue;
         };
+        if row.kind.is_job_content() && !matches!(row.layer.scope, Scope::Job | Scope::Tenant) {
+            let msg = format!(
+                "{} rows are allowed only in job and tenant layers",
+                kind_name(row.kind)
+            );
+            state.error(ErrorCode::KindNotAllowedInLayer, row, msg);
+            continue;
+        }
         let problems = row_problems(row);
         if problems.is_empty() {
             by_layer[pos].push(row);
@@ -696,6 +792,7 @@ pub fn compile(
     }
 
     state.check_dangling();
+    let job_content = build_job_content(&mut state);
     if !state.errors.is_empty() {
         return Err(state.errors);
     }
@@ -747,6 +844,7 @@ pub fn compile(
         attributes,
         relations,
         job,
+        job_content,
         provenance,
         warnings,
         hash: String::new(),
@@ -1520,5 +1618,212 @@ mod tests {
             vec!["Order".to_owned(), "Refund".to_owned()]
         );
         assert_eq!(job.actor, "customer");
+    }
+
+    fn job_layer() -> LayerKey {
+        LayerKey {
+            job: Some("customer_care_agent".into()),
+            ..layer(Scope::Job)
+        }
+    }
+
+    fn sel_job() -> Selection {
+        Selection {
+            job: Some("customer_care_agent".into()),
+            ..Selection::default()
+        }
+    }
+
+    fn sel_job_tenant() -> Selection {
+        Selection {
+            tenant: Some(TENANT),
+            ..sel_job()
+        }
+    }
+
+    fn space(n: u128, layer: LayerKey) -> OverlayRow {
+        row(
+            n,
+            layer,
+            Kind::ContextSpace,
+            "retail:order-support:returns",
+            Op::Add,
+            json!({
+                "area": "order-support",
+                "label": "Returns",
+                "request_type": "return",
+                "required": ["order_id"],
+                "entities": ["Order"],
+                "procedure": "return"
+            }),
+        )
+    }
+
+    fn procedure(n: u128, layer: LayerKey, fields: Value) -> OverlayRow {
+        row(n, layer, Kind::Procedure, "return@1.3.0", Op::Add, fields)
+    }
+
+    fn procedure_fields() -> Value {
+        json!({
+            "status": "PUBLISHED",
+            "context_space": "retail:order-support:returns",
+            "domain": "customer_care",
+            "tool_requirements": ["order_create_rma"],
+            "success_criteria": [],
+            "reviewers": [],
+            "plan": {"phases": [{"steps": []}]},
+            "steps": []
+        })
+    }
+
+    #[test]
+    fn job_content_compiles_in_job_layer() {
+        let rows = [
+            space(1, job_layer()),
+            procedure(2, job_layer(), procedure_fields()),
+        ];
+        let cfg = compile_ok(&sel_job(), &rows);
+        let s = &cfg.job_content.context_spaces["retail:order-support:returns"];
+        assert_eq!(s.key, "retail:order-support:returns");
+        assert_eq!(s.label, "Returns");
+        let p = &cfg.job_content.procedures["return@1.3.0"];
+        assert_eq!((p.name.as_str(), p.version.as_str()), ("return", "1.3.0"));
+        assert_eq!(p.description, None);
+        // An absent gate is restored as null (care-bus Phase.gate is nullable).
+        assert_eq!(p.plan, json!({"phases": [{"steps": [], "gate": null}]}));
+        assert!(
+            cfg.provenance
+                .contains_key("context_space:retail:order-support:returns")
+        );
+        // Job content is hashed: a label change moves the hash.
+        let mut changed = rows.to_vec();
+        changed[0]
+            .fields
+            .insert("label".into(), json!("Returns and refunds"));
+        assert_ne!(compile_ok(&sel_job(), &changed).hash, cfg.hash);
+    }
+
+    #[test]
+    fn procedure_fields_must_parse_as_v1() {
+        let mut fields = procedure_fields();
+        if let Some(o) = fields.as_object_mut() {
+            o.remove("steps");
+        }
+        let errors = compile_err(&sel_job(), &[procedure(1, job_layer(), fields)]);
+        assert_eq!(codes(&errors), vec![ErrorCode::InvalidRow]);
+        assert!(errors[0].message.contains("steps"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn tenant_patch_overrides_context_space_label() {
+        let rows = [
+            space(1, job_layer()),
+            row(
+                2,
+                tenant(),
+                Kind::ContextSpace,
+                "retail:order-support:returns",
+                Op::Patch,
+                json!({"label": "Mine"}),
+            ),
+        ];
+        let cfg = compile_ok(&sel_job_tenant(), &rows);
+        let s = &cfg.job_content.context_spaces["retail:order-support:returns"];
+        assert_eq!(s.label, "Mine");
+        assert_eq!(s.request_type, "return");
+        // A patch that breaks the item is invalid_row after the merge.
+        let bad = [
+            space(1, job_layer()),
+            row(
+                2,
+                tenant(),
+                Kind::ContextSpace,
+                "retail:order-support:returns",
+                Op::Patch,
+                json!({"required": "order_id"}),
+            ),
+        ];
+        let errors = compile_err(&sel_job_tenant(), &bad);
+        assert_eq!(codes(&errors), vec![ErrorCode::InvalidRow]);
+    }
+
+    #[test]
+    fn tombstone_removes_procedure() {
+        let rows = [
+            procedure(1, job_layer(), procedure_fields()),
+            tomb(2, tenant(), Kind::Procedure, "return@1.3.0"),
+        ];
+        let cfg = compile_ok(&sel_job_tenant(), &rows);
+        assert!(cfg.job_content.procedures.is_empty());
+        assert!(cfg.job_content.is_empty());
+    }
+
+    #[test]
+    fn job_content_in_industry_layer_is_refused() {
+        for l in [industry("retail"), base()] {
+            let errors = compile_err(&sel_retail(), &[space(1, l)]);
+            assert_eq!(codes(&errors), vec![ErrorCode::KindNotAllowedInLayer]);
+        }
+    }
+
+    #[test]
+    fn phase1_hash_unchanged() {
+        // Without job content and without the new job fields, neither key is
+        // serialised or hashed: the hash is the phase-1 formula.
+        let rows = [
+            entity(1, base(), "Order"),
+            row(
+                2,
+                base(),
+                Kind::Job,
+                "customer_care_agent",
+                Op::Add,
+                json!({"label": "Customer care", "actor": "customer"}),
+            ),
+        ];
+        let cfg = compile_ok(&sel_job(), &rows);
+        let v = serde_json::to_value(&cfg).expect("serialises");
+        assert!(v.get("job_content").is_none());
+        assert!(v["job"].get("preamble").is_none());
+        assert!(v["job"].get("actor_label").is_none());
+        let phase1 = json!({
+            "selection": cfg.selection,
+            "entities": cfg.entities,
+            "attributes": cfg.attributes,
+            "relations": cfg.relations,
+            "job": cfg.job,
+        });
+        assert_eq!(
+            cfg.hash,
+            crate::canonical::sha256_hex(&crate::canonical::canonical_json(&phase1))
+        );
+    }
+
+    #[test]
+    fn job_preamble_and_actor_label_are_optional() {
+        let job = |n: u128, fields: Value| {
+            row(n, base(), Kind::Job, "customer_care_agent", Op::Add, fields)
+        };
+        let cfg = compile_ok(
+            &sel_job(),
+            &[job(1, json!({"label": "Care", "actor": "customer"}))],
+        );
+        let j = cfg.job.expect("job");
+        assert_eq!((j.preamble, j.actor_label), (None, None));
+        let rows = [
+            job(1, json!({"label": "Care", "actor": "customer"})),
+            row(
+                2,
+                job_layer(),
+                Kind::Job,
+                "customer_care_agent",
+                Op::Patch,
+                json!({"preamble": "You are the intake step.", "actor_label": "Customer care desk"}),
+            ),
+        ];
+        let j = compile_ok(&sel_job(), &rows).job.expect("job");
+        assert_eq!(j.preamble.as_deref(), Some("You are the intake step."));
+        assert_eq!(j.actor_label.as_deref(), Some("Customer care desk"));
+        assert_eq!(j.actor, "customer");
     }
 }

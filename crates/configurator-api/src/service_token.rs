@@ -101,6 +101,12 @@ impl ServiceToken {
         }
     }
 
+    /// Forget the cached token, so the next [`ServiceToken::get`] fetches a fresh one (an upstream
+    /// answered 401 to it: revoked, or the realm keys rotated).
+    pub async fn clear(&self) {
+        *self.cached.lock().await = None;
+    }
+
     /// The cached token, or a fresh one when it is missing or about to expire.
     pub async fn get(&self) -> Result<String, UpstreamError> {
         let mut c = self.cached.lock().await;

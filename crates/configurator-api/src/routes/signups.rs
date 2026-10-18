@@ -28,6 +28,7 @@ use crate::auth::{Caller, require_super_admin};
 use crate::db::signups::{self, NewSignup};
 use crate::error::ApiError;
 use crate::page::{self, Paged, TimeCursor};
+use crate::provision;
 use crate::signup::{
     Decision, default_tenant_name, multi_line_field, require_intake_caller, single_line_field,
 };
@@ -268,8 +269,11 @@ async fn approve(
         Origin::Signup(id),
     )
     .await?;
-    // W4: provision the new tenant down into care-bus here (spec 10.7: approval "provisions the tenant
-    // down into care-bus once care-bus accepts it"). Not built: care-bus W3 has not landed.
+    // Spec 10.7: approval provisions the tenant down into care-bus (best effort, behind
+    // CAREBUS_PROVISION_ENABLED).
+    let carebus =
+        provision::tenant_created(&st, &caller.sub, &created.tenant, &created.first_admin_sub)
+            .await;
     st.signup.notify_decision(
         id,
         Decision::Approved {
@@ -282,6 +286,7 @@ async fn approve(
         "tenant": created.tenant,
         "first_admin_sub": created.first_admin_sub,
         "invited": created.invited,
+        "carebus": carebus,
     })))
 }
 

@@ -166,6 +166,10 @@ fn kind_name(k: Kind) -> &'static str {
         Kind::Attribute => "attribute",
         Kind::Relation => "relation",
         Kind::Job => "job",
+        Kind::ContextSpace => "context_space",
+        Kind::Procedure => "procedure",
+        Kind::ConnectorSlot => "connector_slot",
+        Kind::KnowledgeStore => "knowledge_store",
     }
 }
 
