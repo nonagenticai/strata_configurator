@@ -1,5 +1,9 @@
 # strata-configurator
 
+> **RETIRED 2026-10-24.** The configurator was merged into [`nonagenticai/agent`](https://github.com/nonagenticai/agent)
+> (spec `docs/superpowers/specs/2026-10-18-agent-merge/`, 08 §3 step 8b). This repo is frozen and will be archived;
+> its CI is deleted. Do not open PRs here. The last images stay at `registry.internal:5000/strata-configurator-{api,web}`.
+
 Multi-tenant configuration model, overlay compiler and read-only model explorer.
 
 - `configurator-core`: pure model validation, compilation, canonical hashing, care-bus projection and seed format.
