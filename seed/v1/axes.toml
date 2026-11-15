@@ -1,0 +1,119 @@
+# Seed v1 — classifier axes (spec 4.3). Source: ~/Documents/01Quant/objects.txt.
+# A value's parent is its dotted prefix; `axis = v` also holds for descendants of v.
+
+[[axis]]
+key = "customer_type"
+label = "Customer type"
+description = "Consumers (natural person, household) and legal entities (sole proprietorship, corporation, single representative of legal entities, conglomerate/committee)."
+cardinality = "many"
+values = [
+  { key = "natural_person", label = "Natural person" },
+  { key = "household", label = "Household" },
+  { key = "sole_proprietorship", label = "Sole proprietorship" },
+  { key = "corporation", label = "Corporation" },
+  { key = "group_representative", label = "Representative of several legal entities" },
+  { key = "conglomerate", label = "Conglomerate / committee" },
+]
+
+[[axis]]
+key = "product_type"
+label = "Product type"
+description = "Service (consult), physical (pizza), virtual (e-book), access (lease, rental, SaaS), customer product (freemium)."
+cardinality = "many"
+values = [
+  { key = "service", label = "Service product" },
+  { key = "physical", label = "Physical product" },
+  { key = "virtual", label = "Virtual product" },
+  { key = "access_lease", label = "Access product (lease, rental, SaaS)" },
+  { key = "freemium", label = "Freemium" },
+]
+
+[[axis]]
+key = "offering_type"
+label = "Product offering type"
+description = "Availability (regular, seasonal, pre-order), combinatory (bundle, configurable), consumption (usage based)."
+cardinality = "one"
+values = [
+  { key = "availability", label = "Availability" },
+  { key = "availability.regular", parent = "availability", label = "Regular" },
+  { key = "availability.seasonal", parent = "availability", label = "Seasonal / limited time" },
+  { key = "availability.preorder", parent = "availability", label = "Pre-order / backorder" },
+  { key = "combinatory", label = "Combinatory" },
+  { key = "combinatory.bundle", parent = "combinatory", label = "Bundle / combo" },
+  { key = "combinatory.configurable", parent = "combinatory", label = "Configurable / customizable" },
+  { key = "consumption", label = "Consumption" },
+  { key = "consumption.usage_based", parent = "consumption", label = "Usage based / pay per use" },
+]
+
+[[axis]]
+key = "order_type"
+label = "Order type"
+description = "Discrete (ecommerce), recurring (subscription), continuous (electricity)."
+cardinality = "one"
+values = [
+  { key = "discrete", label = "Discrete" },
+  { key = "recurring", label = "Recurring" },
+  { key = "continuous", label = "Continuous" },
+]
+
+[[axis]]
+key = "renewal_type"
+label = "Order renewal type"
+description = "No renewal, customer initiated, provider initiated (explicit, implicit)."
+cardinality = "one"
+values = [
+  { key = "none", label = "No renewal" },
+  { key = "customer_initiated", label = "Customer initiated" },
+  { key = "provider", label = "Provider initiated" },
+  { key = "provider.explicit", parent = "provider", label = "Explicit" },
+  { key = "provider.implicit", parent = "provider", label = "Implicit" },
+]
+
+[[axis]]
+key = "delivery_type"
+label = "Delivery type"
+description = "Pickup or delivery."
+cardinality = "one"
+values = [
+  { key = "pickup", label = "Pickup" },
+  { key = "delivery", label = "Delivery" },
+]
+
+[[axis]]
+key = "delivery_method"
+label = "Delivery method"
+description = "Physical, digital or administrative delivery."
+cardinality = "one"
+values = [
+  { key = "physical", label = "Physical" },
+  { key = "digital", label = "Digital" },
+  { key = "administrative", label = "Administrative" },
+]
+
+[[axis]]
+key = "payment_type"
+label = "Payment type"
+description = "Singleton, recurring (fixed, variable), balancing."
+cardinality = "one"
+values = [
+  { key = "singleton", label = "Singleton" },
+  { key = "recurring", label = "Recurring" },
+  { key = "recurring.fixed", parent = "recurring", label = "Fixed" },
+  { key = "recurring.variable", parent = "recurring", label = "Variable" },
+  { key = "balancing", label = "Balancing" },
+]
+
+[[axis]]
+key = "payment_method"
+label = "Payment method"
+description = "Cash, card, bank transfer, digital wallet (mobile, web, crypto)."
+cardinality = "many"
+values = [
+  { key = "cash", label = "Cash" },
+  { key = "card", label = "Card" },
+  { key = "bank_transfer", label = "Bank transfer" },
+  { key = "digital_wallet", label = "Digital wallet" },
+  { key = "digital_wallet.mobile", parent = "digital_wallet", label = "Mobile wallet" },
+  { key = "digital_wallet.web", parent = "digital_wallet", label = "Web wallet" },
+  { key = "digital_wallet.crypto", parent = "digital_wallet", label = "Crypto wallet" },
+]

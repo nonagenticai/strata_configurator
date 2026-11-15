@@ -1,0 +1,603 @@
+//! The care-bus client (W4) against the local care-bus mock: bearer token, tenant header, error
+//! classification, token caching; and provision-down on tenant create, import and the retry route,
+//! behind CAREBUS_PROVISION_ENABLED; and the suspend on offboarding (and its retry).
+mod common;
+
+use axum::http::StatusCode;
+use common::carebus_mock::{CB_SECRET, CB_TOKEN, CarebusMock};
+use common::client::root;
+use configurator_api::carebus_client::{CarebusClient, CarebusError};
+use configurator_api::config::CarebusConfig;
+use configurator_core::release::{ReleaseBodyV1, release_body};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+const FIXTURE: &str =
+    include_str!("../../configurator-core/tests/fixtures/carebus-release-bundle-v1.json");
+const JOB: &str = "customer_care_agent";
+const RELEASE: &str = "cfg-2026-10-18.1";
+
+fn client(mock: &CarebusMock) -> CarebusClient {
+    let cfg = CarebusConfig {
+        api_url: mock.url.clone(),
+        token_url: format!("{}/token", mock.url),
+        client_id: "strata-configurator-release-writer".into(),
+        client_secret: CB_SECRET.into(),
+    };
+    CarebusClient::new(&cfg, reqwest::Client::new())
+}
+
+/// Tenant `t` and job `JOB` provisioned in the mock, as a push does before its release.
+async fn provisioned(c: &CarebusClient) -> Uuid {
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
+    t
+}
+
+/// The golden fixture's bundle as our release `RELEASE`.
+fn body() -> Value {
+    let golden: ReleaseBodyV1 = serde_json::from_str(FIXTURE).expect("fixture parses");
+    release_body(RELEASE, JOB, &golden.bundle).expect("release body")
+}
+
+#[tokio::test]
+async fn client_sends_bearer_and_tenant_header() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    let r = c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    assert_eq!(r.status, 201);
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
+    let r = c
+        .put_release(t, JOB, RELEASE, &body())
+        .await
+        .expect("release");
+    assert_eq!(r.status, 201, "{}", r.body);
+    assert_eq!(r.body["applied"], true);
+    assert_eq!(r.body["release_id"], RELEASE);
+
+    let seen = mock.requests();
+    assert_eq!(seen.len(), 3);
+    for req in &seen {
+        assert_eq!(
+            req.auth.as_deref(),
+            Some(format!("Bearer {CB_TOKEN}").as_str())
+        );
+    }
+    assert_eq!(seen[0].path, format!("/api/tenants/{t}"));
+    assert_eq!(
+        seen[0].tenant, None,
+        "provisioning names the tenant in the path"
+    );
+    assert_eq!(seen[0].body, json!({"name": "Acme", "status": "active"}));
+    assert_eq!(seen[1].tenant, None);
+    assert_eq!(seen[2].path, format!("/api/jobs/{JOB}/releases/{RELEASE}"));
+    assert_eq!(seen[2].tenant, Some(t.to_string()));
+    assert_eq!(seen[2].body, body());
+}
+
+#[tokio::test]
+async fn put_job_never_sends_settings() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
+    c.put_user(t, "alice@example.test", "tenant_admin")
+        .await
+        .expect("user");
+    let seen = &mock.requests()[1..];
+    assert_eq!(seen[0].path, format!("/api/tenants/{t}/jobs/{JOB}"));
+    assert_eq!(seen[0].body, json!({"label": "Customer care agent"}));
+    assert_eq!(
+        seen[1].path,
+        // The client percent-encodes the sub; the mock records the decoded path.
+        format!("/api/tenants/{t}/users/alice@example.test")
+    );
+    assert_eq!(seen[1].body, json!({"tenant_role": "tenant_admin"}));
+}
+
+#[tokio::test]
+async fn release_404_is_none() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    // The job is not provisioned yet: care-bus answers 404 "job not found", which is "no release".
+    assert_eq!(c.current_release(t, JOB).await.expect("read-back"), None);
+    c.put_job(t, JOB, "Customer care agent").await.expect("job");
+    // The job exists but was never released: 404 "release not found", also "no release".
+    assert_eq!(c.current_release(t, JOB).await.expect("read-back"), None);
+    c.put_release(t, JOB, RELEASE, &body()).await.expect("push");
+    let current = c
+        .current_release(t, JOB)
+        .await
+        .expect("read-back")
+        .expect("a current release");
+    assert_eq!(current["release_id"], RELEASE);
+    assert_eq!(current["hash"], body()["hash"]);
+    // Any other 404 is not "no release": e.g. a route care-bus does not know.
+    mock.answer(
+        "current",
+        404,
+        json!({"error": {"code": "not_found", "message": "route not found"}}),
+    );
+    assert!(matches!(
+        c.current_release(t, JOB).await,
+        Err(CarebusError::Rejected { status: 404, .. })
+    ));
+}
+
+#[tokio::test]
+async fn unknown_tenant_is_an_error_not_no_release() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    // care-bus resolves the header's tenant first: 404 "tenant not found".
+    match c.current_release(Uuid::new_v4(), JOB).await {
+        Err(CarebusError::Rejected { status, code, body }) => {
+            assert_eq!((status, code.as_deref()), (404, Some("not_found")));
+            assert_eq!(body["error"]["message"], "tenant not found");
+        }
+        other => panic!("expected the tenant 404, got {other:?}"),
+    }
+    match c.put_release(Uuid::new_v4(), JOB, RELEASE, &body()).await {
+        Err(CarebusError::Rejected { status, body, .. }) => {
+            assert_eq!(status, 404);
+            assert_eq!(body["error"]["message"], "tenant not found");
+        }
+        other => panic!("expected the tenant 404, got {other:?}"),
+    }
+    // A release for an unprovisioned job: 404 "job not found", before the body is looked at.
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("tenant");
+    match c.put_release(t, JOB, RELEASE, &body()).await {
+        Err(CarebusError::Rejected { status, body, .. }) => {
+            assert_eq!(status, 404);
+            assert_eq!(body["error"]["message"], "job not found");
+        }
+        other => panic!("expected the job 404, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejected_carries_code() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    mock.answer(
+        "release",
+        409,
+        json!({"error": {"code": "release_hash_mismatch", "message": "x"}}),
+    );
+    match c.put_release(Uuid::new_v4(), JOB, RELEASE, &body()).await {
+        Err(CarebusError::Rejected { status, code, .. }) => {
+            assert_eq!(status, 409);
+            assert_eq!(code.as_deref(), Some("release_hash_mismatch"));
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+    // A body with a wrong hash is refused by the mock as care-bus refuses it.
+    mock.clear_answer("release");
+    let t = provisioned(&c).await;
+    let mut bad = body();
+    bad["hash"] = json!(format!("sha256:{}", "0".repeat(64)));
+    match c.put_release(t, JOB, RELEASE, &bad).await {
+        Err(CarebusError::Rejected { status, code, .. }) => {
+            assert_eq!(
+                (status, code.as_deref()),
+                (400, Some("bundle_hash_mismatch"))
+            );
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn unavailable_on_5xx() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    mock.answer("tenant", 503, json!({"error": {"code": "unavailable"}}));
+    assert!(matches!(
+        c.put_tenant(Uuid::new_v4(), "Acme", "active").await,
+        Err(CarebusError::Unavailable(_))
+    ));
+    // Nothing listening at all is unavailable too.
+    let gone = CarebusConfig {
+        api_url: "http://127.0.0.1:9".into(),
+        token_url: format!("{}/token", mock.url),
+        client_id: "strata-configurator-release-writer".into(),
+        client_secret: CB_SECRET.into(),
+    };
+    let c = CarebusClient::new(&gone, reqwest::Client::new());
+    assert!(matches!(
+        c.put_tenant(Uuid::new_v4(), "Acme", "active").await,
+        Err(CarebusError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn token_cached_across_calls() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("1");
+    c.put_job(t, JOB, "Care").await.expect("2");
+    c.current_release(t, JOB).await.expect("3");
+    assert_eq!(mock.grants(), 1);
+}
+
+#[tokio::test]
+async fn a_401_refreshes_the_token_once() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    c.put_tenant(t, "Acme", "active").await.expect("warm");
+    mock.reject_tokens(1);
+    c.put_tenant(t, "Acme", "active").await.expect("retried");
+    assert_eq!(mock.grants(), 2);
+    // Two 401s in a row: the retry is not repeated, the caller gets the refusal.
+    mock.reject_tokens(2);
+    assert!(matches!(
+        c.put_tenant(t, "Acme", "active").await,
+        Err(CarebusError::Rejected { status: 401, .. })
+    ));
+}
+
+// ---- Task 9: provision-down on tenant create, import and the retry route ----
+
+async fn env(mock: &CarebusMock, enabled: bool) -> common::TestEnv {
+    let mut cfg = mock.config();
+    if enabled {
+        cfg.push(("CAREBUS_PROVISION_ENABLED", "true".into()));
+    }
+    common::env_with(&cfg).await
+}
+
+async fn provisioned_at_set(e: &common::TestEnv, t: &str) -> bool {
+    sqlx::query_scalar("SELECT carebus_provisioned_at IS NOT NULL FROM tenant WHERE id = $1::uuid")
+        .bind(t)
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+async fn audited(e: &common::TestEnv, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = $1")
+        .bind(action)
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn provision_off_by_default_makes_no_carebus_call() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, false).await;
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(
+        b["carebus"],
+        json!({"ok": false, "skipped": true, "steps": []})
+    );
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants/import",
+        json!({"id": "0195f48b-d000-7000-8000-000000000099", "name": "fr-test-user",
+               "first_admin_sub": "fr-admin"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(b["carebus"]["skipped"], true);
+    assert!(mock.requests().is_empty(), "no care-bus call while off");
+    assert_eq!(audited(&e, "carebus.provision_failed").await, 0);
+    let t = b["tenant"]["id"].as_str().unwrap();
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{b}");
+    assert_eq!(b["error"]["code"], "carebus_provision_disabled");
+}
+
+#[tokio::test]
+async fn create_provisions_down() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let t = b["id"].as_str().unwrap();
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(b["carebus"]["steps"].as_array().unwrap().len(), 2);
+    let seen: Vec<(String, Value)> = mock
+        .requests()
+        .into_iter()
+        .map(|r| (r.path, r.body))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                format!("/api/tenants/{t}"),
+                json!({"name": "Acme", "status": "active"})
+            ),
+            (
+                format!("/api/tenants/{t}/users/alice"),
+                json!({"tenant_role": "tenant_admin"})
+            ),
+        ]
+    );
+    assert!(provisioned_at_set(&e, t).await);
+}
+
+#[tokio::test]
+async fn create_survives_carebus_down() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    mock.answer("tenant", 503, json!({}));
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    assert_eq!(b["carebus"]["ok"], false);
+    assert_eq!(b["carebus"]["skipped"], false);
+    let t = b["id"].as_str().unwrap().to_owned();
+    assert!(!provisioned_at_set(&e, &t).await);
+    assert_eq!(audited(&e, "carebus.provision_failed").await, 1);
+
+    // The retry route provisions once care-bus is back.
+    mock.clear_answer("tenant");
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["ok"], true, "{b}");
+    assert!(provisioned_at_set(&e, &t).await);
+    let last = mock.requests().pop().unwrap();
+    assert_eq!(last.path, format!("/api/tenants/{t}/users/alice"));
+}
+
+#[tokio::test]
+async fn retry_route_needs_the_super_admin() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let (_, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    let t = b["id"].as_str().unwrap();
+    let (s, _) = common::client::member(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        "alice",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+// ---- offboarding suspends the tenant in care-bus ----
+
+/// Tenant "Acme" (first admin `alice`) created with provisioning on; its id.
+async fn created(e: &common::TestEnv) -> String {
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        "/api/tenants",
+        json!({"name": "Acme", "first_admin_sub": "alice"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    b["id"].as_str().unwrap().to_owned()
+}
+
+async fn offboard(e: &common::TestEnv, t: &str) -> (StatusCode, Value) {
+    root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/offboard"),
+        json!({"confirm_name": "Acme"}),
+    )
+    .await
+}
+
+async fn archived(e: &common::TestEnv, t: &str) -> bool {
+    sqlx::query_scalar("SELECT archived_at IS NOT NULL FROM tenant WHERE id = $1::uuid")
+        .bind(t)
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+/// The metadata of the one `carebus.offboard_failed` event.
+async fn offboard_failed_metadata(e: &common::TestEnv) -> Value {
+    sqlx::query_scalar("SELECT metadata FROM audit_event WHERE action = 'carebus.offboard_failed'")
+        .fetch_one(common::pool(e))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn offboard_suspends_the_tenant_in_carebus() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let t = created(&e).await;
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("active"), "control");
+    let before = mock.requests().len();
+
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(archived(&e, &t).await);
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(b["carebus"]["skipped"], false);
+    assert_eq!(b["carebus"]["steps"][0]["step"], "suspend");
+    assert_eq!(b["carebus"]["steps"].as_array().unwrap().len(), 1);
+    let sent: Vec<(String, String, Value)> = mock.requests()[before..]
+        .iter()
+        .map(|r| (r.method.clone(), r.path.clone(), r.body.clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        [(
+            "PUT".to_owned(),
+            format!("/api/tenants/{t}"),
+            json!({"name": "Acme", "status": "suspended"})
+        )],
+        "one suspend, nothing else (care-bus has no user-disable; suspension refuses its members)"
+    );
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("suspended"));
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 0);
+
+    // A repeat offboard re-sends the same suspend (idempotent upsert, 200).
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["already_archived"], true);
+    assert_eq!(b["carebus"]["ok"], true, "{b}");
+    assert_eq!(b["carebus"]["steps"][0]["status"], 200);
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("suspended"));
+}
+
+#[tokio::test]
+async fn offboard_carebus_failure_is_audited_surfaced_and_retryable() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let t = created(&e).await;
+    mock.answer("tenant", 503, json!({}));
+
+    // The offboard itself completes: care-bus failing never blocks it.
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(archived(&e, &t).await);
+    assert_eq!(b["carebus"]["ok"], false, "{b}");
+    assert_eq!(b["carebus"]["skipped"], false);
+    assert_eq!(b["carebus"]["steps"][0]["step"], "suspend");
+    assert_eq!(
+        b["carebus"]["steps"][0]["error_code"],
+        "carebus_unavailable"
+    );
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 1);
+    let meta = offboard_failed_metadata(&e).await;
+    assert_eq!(meta["step"], "suspend", "{meta}");
+    assert_eq!(meta["code"], "carebus_unavailable", "{meta}");
+    assert_eq!(
+        mock.tenant_status(&t).as_deref(),
+        Some("active"),
+        "still active in care-bus"
+    );
+
+    // The retry route re-runs the suspend for an archived tenant (not the active provision).
+    mock.clear_answer("tenant");
+    let before = mock.requests().len();
+    let (s, b) = root(
+        &e.app,
+        "POST",
+        &format!("/api/tenants/{t}/carebus-provision"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["ok"], true, "{b}");
+    assert_eq!(b["steps"][0]["step"], "suspend");
+    let sent = &mock.requests()[before..];
+    assert_eq!(sent.len(), 1, "only the suspend: no user is provisioned");
+    assert_eq!(sent[0].path, format!("/api/tenants/{t}"));
+    assert_eq!(sent[0].body, json!({"name": "Acme", "status": "suspended"}));
+    assert_eq!(mock.tenant_status(&t).as_deref(), Some("suspended"));
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 1);
+}
+
+#[tokio::test]
+async fn offboard_carebus_rejection_carries_its_code() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, true).await;
+    let t = created(&e).await;
+    mock.answer(
+        "tenant",
+        403,
+        json!({"error": {"code": "forbidden", "message": "this needs the provisioner role"}}),
+    );
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["carebus"]["ok"], false);
+    assert_eq!(b["carebus"]["steps"][0]["status"], 403);
+    assert_eq!(b["carebus"]["steps"][0]["error_code"], "forbidden");
+    let meta = offboard_failed_metadata(&e).await;
+    assert_eq!(
+        (&meta["status"], &meta["code"]),
+        (&json!(403), &json!("forbidden"))
+    );
+}
+
+#[tokio::test]
+async fn offboard_with_provision_off_makes_no_carebus_call() {
+    let mock = CarebusMock::start().await;
+    let e = env(&mock, false).await;
+    let t = created(&e).await;
+    let (s, b) = offboard(&e, &t).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(archived(&e, &t).await);
+    assert_eq!(
+        b["carebus"],
+        json!({"ok": false, "skipped": true, "steps": []})
+    );
+    assert!(mock.requests().is_empty(), "no care-bus call while off");
+    assert_eq!(audited(&e, "carebus.offboard_failed").await, 0);
+}
+
+#[tokio::test]
+async fn mock_put_tenant_validates_like_carebus() {
+    let mock = CarebusMock::start().await;
+    let c = client(&mock);
+    let t = Uuid::new_v4();
+    // An unknown status is rejected by care-bus's typed body: 400 invalid_body.
+    match c.put_tenant(t, "Acme", "archived").await {
+        Err(CarebusError::Rejected { status, code, .. }) => {
+            assert_eq!((status, code.as_deref()), (400, Some("invalid_body")));
+        }
+        other => panic!("expected 400 invalid_body, got {other:?}"),
+    }
+    assert_eq!(mock.tenant_status(&t.to_string()), None);
+    assert_eq!(
+        c.put_tenant(t, "Acme", "suspended").await.unwrap().status,
+        201
+    );
+    assert_eq!(
+        c.put_tenant(t, "Acme", "suspended").await.unwrap().status,
+        200
+    );
+    assert_eq!(
+        c.put_tenant(t, "Acme", "active").await.unwrap().body["status"],
+        "active"
+    );
+    assert_eq!(
+        mock.tenant_status(&t.to_string()).as_deref(),
+        Some("active")
+    );
+}

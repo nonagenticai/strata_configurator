@@ -1,0 +1,1460 @@
+{
+  "schema": "care-bus.release/1",
+  "release_id": "2026-10-20.1",
+  "job": "customer_care_agent",
+  "hash": "sha256:79c5b940a6a1b0f3015bd5b818e22ac7c284a72efef6c69c1e276612e8aaa492",
+  "bundle": {
+    "job_settings": {
+      "preamble": "You are the intake step of a customer-care desk. From the customer's latest message, the draft request so far and the customer's recent records, extract the request type and any fields the message provides. Use order ids from the recent records when the customer names the item. Never invent a value: leave a field null when the message and records do not give it.",
+      "actor": "Customer care desk",
+      "stance": "Helpful and precise; never invents a value the customer or the records did not give."
+    },
+    "ontology": {
+      "entities": [
+        {
+          "name": "Customer",
+          "scope": "generic",
+          "industry": null,
+          "department": null,
+          "label": "Customer",
+          "synonyms": [
+            "client",
+            "buyer",
+            "cust_no"
+          ],
+          "attributes": [
+            {
+              "name": "customer_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "name",
+              "data_type": "string",
+              "pii": true,
+              "synonyms": []
+            },
+            {
+              "name": "email",
+              "data_type": "string",
+              "pii": true,
+              "synonyms": []
+            },
+            {
+              "name": "tier",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Communication",
+          "scope": "generic",
+          "industry": null,
+          "department": null,
+          "label": "Communication",
+          "synonyms": [
+            "message",
+            "email",
+            "sms"
+          ],
+          "attributes": [
+            {
+              "name": "channel",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "subject",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "at",
+              "data_type": "date",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Policy",
+          "scope": "generic",
+          "industry": null,
+          "department": null,
+          "label": "Policy",
+          "synonyms": [
+            "terms",
+            "rule"
+          ],
+          "attributes": [
+            {
+              "name": "code",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "text",
+              "data_type": "text",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Order",
+          "scope": "industry",
+          "industry": "retail",
+          "department": null,
+          "label": "Order",
+          "synonyms": [
+            "purchase",
+            "ord_no",
+            "bestelling"
+          ],
+          "attributes": [
+            {
+              "name": "order_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "placed",
+              "data_type": "date",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "amount",
+              "data_type": "money",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "status",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "shipment_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Product",
+          "scope": "industry",
+          "industry": "retail",
+          "department": null,
+          "label": "Product",
+          "synonyms": [
+            "item",
+            "article",
+            "sku"
+          ],
+          "attributes": [
+            {
+              "name": "sku",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "name",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "category",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Payment",
+          "scope": "industry",
+          "industry": "retail",
+          "department": null,
+          "label": "Payment",
+          "synonyms": [
+            "charge",
+            "transaction",
+            "psp_reference"
+          ],
+          "attributes": [
+            {
+              "name": "payment_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "method",
+              "data_type": "string",
+              "pii": true,
+              "synonyms": []
+            },
+            {
+              "name": "amount",
+              "data_type": "money",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "status",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "at",
+              "data_type": "datetime",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Shipment",
+          "scope": "industry",
+          "industry": "retail",
+          "department": null,
+          "label": "Shipment",
+          "synonyms": [
+            "parcel",
+            "package",
+            "zending"
+          ],
+          "attributes": [
+            {
+              "name": "shipment_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "carrier",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "status",
+              "data_type": "enum",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "eta",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "ReturnAuthorization",
+          "scope": "industry_dept",
+          "industry": "retail",
+          "department": "order-support",
+          "label": "Return (RMA)",
+          "synonyms": [
+            "rma",
+            "return label",
+            "retour"
+          ],
+          "attributes": [
+            {
+              "name": "rma_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "reason",
+              "data_type": "text",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "deadline",
+              "data_type": "date",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "WarrantyClaim",
+          "scope": "industry_dept",
+          "industry": "retail",
+          "department": "order-support",
+          "label": "Warranty claim",
+          "synonyms": [
+            "guarantee claim",
+            "repair"
+          ],
+          "attributes": [
+            {
+              "name": "claim_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "defect",
+              "data_type": "text",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "warranty_until",
+              "data_type": "date",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Carrier",
+          "scope": "industry_dept",
+          "industry": "retail",
+          "department": "logistics",
+          "label": "Carrier",
+          "synonyms": [
+            "PostNL",
+            "DHL",
+            "courier"
+          ],
+          "attributes": [
+            {
+              "name": "code",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "name",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        },
+        {
+          "name": "Refund",
+          "scope": "industry_dept",
+          "industry": "retail",
+          "department": "payments",
+          "label": "Refund",
+          "synonyms": [
+            "money back",
+            "chargeback",
+            "terugbetaling"
+          ],
+          "attributes": [
+            {
+              "name": "refund_id",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "amount",
+              "data_type": "money",
+              "pii": false,
+              "synonyms": []
+            },
+            {
+              "name": "eta",
+              "data_type": "string",
+              "pii": false,
+              "synonyms": []
+            }
+          ]
+        }
+      ],
+      "relations": [
+        {
+          "subject": "Customer",
+          "predicate": "places",
+          "object": "Order",
+          "cardinality": "1:n"
+        },
+        {
+          "subject": "Order",
+          "predicate": "contains",
+          "object": "Product",
+          "cardinality": "n:m"
+        },
+        {
+          "subject": "Order",
+          "predicate": "paidBy",
+          "object": "Payment",
+          "cardinality": "1:n"
+        },
+        {
+          "subject": "Order",
+          "predicate": "shippedVia",
+          "object": "Shipment",
+          "cardinality": "1:n"
+        },
+        {
+          "subject": "Shipment",
+          "predicate": "carriedBy",
+          "object": "Carrier",
+          "cardinality": "n:1"
+        },
+        {
+          "subject": "ReturnAuthorization",
+          "predicate": "for",
+          "object": "Order",
+          "cardinality": "n:1"
+        },
+        {
+          "subject": "WarrantyClaim",
+          "predicate": "covers",
+          "object": "Product",
+          "cardinality": "n:1"
+        },
+        {
+          "subject": "Refund",
+          "predicate": "reverses",
+          "object": "Payment",
+          "cardinality": "n:1"
+        },
+        {
+          "subject": "Customer",
+          "predicate": "receives",
+          "object": "Communication",
+          "cardinality": "1:n"
+        },
+        {
+          "subject": "Policy",
+          "predicate": "governs",
+          "object": "ReturnAuthorization",
+          "cardinality": "1:n"
+        }
+      ]
+    },
+    "context_spaces": [
+      {
+        "key": "retail:order-support:returns",
+        "area": "order-support",
+        "label": "Returns",
+        "request_type": "return",
+        "required": [
+          "order_id",
+          "reason"
+        ],
+        "entities": [
+          "Customer",
+          "Order",
+          "Product",
+          "ReturnAuthorization"
+        ],
+        "procedure": "return"
+      },
+      {
+        "key": "retail:order-support:warranty",
+        "area": "order-support",
+        "label": "Warranty claims",
+        "request_type": "warranty_claim",
+        "required": [
+          "order_id",
+          "defect"
+        ],
+        "entities": [
+          "Customer",
+          "Order",
+          "Product",
+          "WarrantyClaim"
+        ],
+        "procedure": "warranty_claim"
+      },
+      {
+        "key": "retail:logistics:delivery-status",
+        "area": "logistics",
+        "label": "Delivery status",
+        "request_type": "delivery_status",
+        "required": [
+          "order_id"
+        ],
+        "entities": [
+          "Order",
+          "Shipment",
+          "Carrier"
+        ],
+        "procedure": "delivery_status"
+      },
+      {
+        "key": "retail:payments:payment-errors",
+        "area": "payments",
+        "label": "Payment errors",
+        "request_type": "payment_error",
+        "required": [
+          "order_id",
+          "error_type"
+        ],
+        "entities": [
+          "Customer",
+          "Order",
+          "Payment",
+          "Refund"
+        ],
+        "procedure": "duplicate_charge_refund"
+      },
+      {
+        "key": "retail:faq:general",
+        "area": "faq",
+        "label": "General questions",
+        "request_type": "faq",
+        "required": [
+          "question"
+        ],
+        "entities": [
+          "Policy"
+        ],
+        "procedure": "faq_answer"
+      }
+    ],
+    "procedures": [
+      {
+        "name": "return",
+        "version": "1.3.0",
+        "status": "PUBLISHED",
+        "context_space": "retail:order-support:returns",
+        "domain": "customer_care",
+        "description": null,
+        "pddl_domain": null,
+        "tool_requirements": [
+          "crm_verify_customer",
+          "order_get_order",
+          "rules_check_return_window",
+          "procedures_get_procedure",
+          "order_create_rma"
+        ],
+        "success_criteria": [
+          "(rma-created ?o)"
+        ],
+        "reviewers": [
+          "a.bakker",
+          "r.visser"
+        ],
+        "plan": {
+          "phases": [
+            {
+              "steps": [
+                {
+                  "worker": "crm",
+                  "action": "verify_customer",
+                  "as": "customer",
+                  "args": {
+                    "customer_id": "$request.customer_id"
+                  }
+                },
+                {
+                  "worker": "order",
+                  "action": "get_order",
+                  "as": "order",
+                  "args": {
+                    "order_id": "$request.order_id"
+                  }
+                }
+              ],
+              "gate": null
+            },
+            {
+              "steps": [
+                {
+                  "worker": "business-rules",
+                  "action": "check_return_window",
+                  "as": "rules",
+                  "args": {
+                    "order_id": "$order.order_id",
+                    "category": "$order.category",
+                    "delivered_on": "$order.delivered_on"
+                  }
+                },
+                {
+                  "worker": "procedures",
+                  "action": "get_procedure",
+                  "as": "procedure",
+                  "args": {
+                    "name": "return"
+                  }
+                }
+              ],
+              "gate": "rules"
+            },
+            {
+              "steps": [
+                {
+                  "worker": "order",
+                  "action": "create_rma",
+                  "as": "rma",
+                  "args": {
+                    "order_id": "$request.order_id",
+                    "reason": "$request.reason"
+                  }
+                }
+              ],
+              "gate": null
+            }
+          ]
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "phase": 0,
+            "name": "Verify customer",
+            "action_type": "verify-customer",
+            "worker": "crm",
+            "mcp_tool": "crm_verify_customer",
+            "performed_by": "crm worker",
+            "preconditions": [
+              "(customer ?c)"
+            ],
+            "postconditions": [
+              "(verified ?c)"
+            ],
+            "parameters": {
+              "?customer_id": "customer_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 2,
+            "phase": 0,
+            "name": "Get order",
+            "action_type": "get-order",
+            "worker": "order",
+            "mcp_tool": "order_get_order",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(order ?o)"
+            ],
+            "postconditions": [
+              "(order-known ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 3,
+            "phase": 1,
+            "name": "Check return window",
+            "action_type": "check-return-window",
+            "worker": "business-rules",
+            "mcp_tool": "rules_check_return_window",
+            "performed_by": "business-rules worker",
+            "preconditions": [
+              "(order-known ?o)",
+              "(delivered ?o)"
+            ],
+            "postconditions": [
+              "(within-return-window ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?category": "category",
+              "?delivered_on": "delivered_on"
+            },
+            "gate": true
+          },
+          {
+            "step_number": 4,
+            "phase": 1,
+            "name": "Load procedure",
+            "action_type": "get-procedure",
+            "worker": "procedures",
+            "mcp_tool": "procedures_get_procedure",
+            "performed_by": "procedures worker",
+            "preconditions": [],
+            "postconditions": [
+              "(procedure-loaded ?n)"
+            ],
+            "parameters": {
+              "?name": "name"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 5,
+            "phase": 2,
+            "name": "Create RMA",
+            "action_type": "create-rma",
+            "worker": "order",
+            "mcp_tool": "order_create_rma",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(verified ?c)",
+              "(within-return-window ?o)"
+            ],
+            "postconditions": [
+              "(rma-created ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?reason": "reason"
+            },
+            "gate": false
+          }
+        ]
+      },
+      {
+        "name": "return",
+        "version": "1.4.0-beta",
+        "status": "CANARY",
+        "context_space": "retail:order-support:returns",
+        "domain": "customer_care",
+        "description": null,
+        "pddl_domain": null,
+        "tool_requirements": [
+          "crm_verify_customer",
+          "order_get_order",
+          "rules_check_return_window",
+          "procedures_get_procedure",
+          "order_create_rma"
+        ],
+        "success_criteria": [
+          "(rma-created ?o)"
+        ],
+        "reviewers": [
+          "a.bakker"
+        ],
+        "plan": {
+          "phases": [
+            {
+              "steps": [
+                {
+                  "worker": "crm",
+                  "action": "verify_customer",
+                  "as": "customer",
+                  "args": {
+                    "customer_id": "$request.customer_id"
+                  }
+                },
+                {
+                  "worker": "order",
+                  "action": "get_order",
+                  "as": "order",
+                  "args": {
+                    "order_id": "$request.order_id"
+                  }
+                }
+              ],
+              "gate": null
+            },
+            {
+              "steps": [
+                {
+                  "worker": "business-rules",
+                  "action": "check_return_window",
+                  "as": "rules",
+                  "args": {
+                    "order_id": "$order.order_id",
+                    "category": "$order.category",
+                    "delivered_on": "$order.delivered_on"
+                  }
+                },
+                {
+                  "worker": "procedures",
+                  "action": "get_procedure",
+                  "as": "procedure",
+                  "args": {
+                    "name": "return"
+                  }
+                }
+              ],
+              "gate": "rules"
+            },
+            {
+              "steps": [
+                {
+                  "worker": "order",
+                  "action": "create_rma",
+                  "as": "rma",
+                  "args": {
+                    "order_id": "$request.order_id",
+                    "reason": "$request.reason"
+                  }
+                }
+              ],
+              "gate": null
+            }
+          ]
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "phase": 0,
+            "name": "Verify customer",
+            "action_type": "verify-customer",
+            "worker": "crm",
+            "mcp_tool": "crm_verify_customer",
+            "performed_by": "crm worker",
+            "preconditions": [
+              "(customer ?c)"
+            ],
+            "postconditions": [
+              "(verified ?c)"
+            ],
+            "parameters": {
+              "?customer_id": "customer_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 2,
+            "phase": 0,
+            "name": "Get order",
+            "action_type": "get-order",
+            "worker": "order",
+            "mcp_tool": "order_get_order",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(order ?o)"
+            ],
+            "postconditions": [
+              "(order-known ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 3,
+            "phase": 1,
+            "name": "Check return window",
+            "action_type": "check-return-window",
+            "worker": "business-rules",
+            "mcp_tool": "rules_check_return_window",
+            "performed_by": "business-rules worker",
+            "preconditions": [
+              "(order-known ?o)",
+              "(delivered ?o)"
+            ],
+            "postconditions": [
+              "(within-return-window ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?category": "category",
+              "?delivered_on": "delivered_on"
+            },
+            "gate": true
+          },
+          {
+            "step_number": 4,
+            "phase": 1,
+            "name": "Load procedure",
+            "action_type": "get-procedure",
+            "worker": "procedures",
+            "mcp_tool": "procedures_get_procedure",
+            "performed_by": "procedures worker",
+            "preconditions": [],
+            "postconditions": [
+              "(procedure-loaded ?n)"
+            ],
+            "parameters": {
+              "?name": "name"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 5,
+            "phase": 2,
+            "name": "Create RMA",
+            "action_type": "create-rma",
+            "worker": "order",
+            "mcp_tool": "order_create_rma",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(verified ?c)",
+              "(within-return-window ?o)"
+            ],
+            "postconditions": [
+              "(rma-created ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?reason": "reason"
+            },
+            "gate": false
+          }
+        ]
+      },
+      {
+        "name": "warranty_claim",
+        "version": "1.1.0",
+        "status": "PUBLISHED",
+        "context_space": "retail:order-support:warranty",
+        "domain": "customer_care",
+        "description": null,
+        "pddl_domain": null,
+        "tool_requirements": [
+          "crm_verify_customer",
+          "order_get_order",
+          "rules_check_warranty",
+          "procedures_get_procedure",
+          "order_create_warranty_claim"
+        ],
+        "success_criteria": [
+          "(claim-registered ?o)"
+        ],
+        "reviewers": [
+          "a.bakker",
+          "r.visser"
+        ],
+        "plan": {
+          "phases": [
+            {
+              "steps": [
+                {
+                  "worker": "crm",
+                  "action": "verify_customer",
+                  "as": "customer",
+                  "args": {
+                    "customer_id": "$request.customer_id"
+                  }
+                },
+                {
+                  "worker": "order",
+                  "action": "get_order",
+                  "as": "order",
+                  "args": {
+                    "order_id": "$request.order_id"
+                  }
+                }
+              ],
+              "gate": null
+            },
+            {
+              "steps": [
+                {
+                  "worker": "business-rules",
+                  "action": "check_warranty",
+                  "as": "rules",
+                  "args": {
+                    "order_id": "$order.order_id",
+                    "category": "$order.category",
+                    "delivered_on": "$order.delivered_on"
+                  }
+                },
+                {
+                  "worker": "procedures",
+                  "action": "get_procedure",
+                  "as": "procedure",
+                  "args": {
+                    "name": "warranty_claim"
+                  }
+                }
+              ],
+              "gate": "rules"
+            },
+            {
+              "steps": [
+                {
+                  "worker": "order",
+                  "action": "create_warranty_claim",
+                  "as": "claim",
+                  "args": {
+                    "order_id": "$request.order_id",
+                    "defect": "$request.defect"
+                  }
+                }
+              ],
+              "gate": null
+            }
+          ]
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "phase": 0,
+            "name": "Verify customer",
+            "action_type": "verify-customer",
+            "worker": "crm",
+            "mcp_tool": "crm_verify_customer",
+            "performed_by": "crm worker",
+            "preconditions": [
+              "(customer ?c)"
+            ],
+            "postconditions": [
+              "(verified ?c)"
+            ],
+            "parameters": {
+              "?customer_id": "customer_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 2,
+            "phase": 0,
+            "name": "Get order",
+            "action_type": "get-order",
+            "worker": "order",
+            "mcp_tool": "order_get_order",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(order ?o)"
+            ],
+            "postconditions": [
+              "(order-known ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 3,
+            "phase": 1,
+            "name": "Check warranty",
+            "action_type": "check-warranty",
+            "worker": "business-rules",
+            "mcp_tool": "rules_check_warranty",
+            "performed_by": "business-rules worker",
+            "preconditions": [
+              "(order-known ?o)",
+              "(delivered ?o)"
+            ],
+            "postconditions": [
+              "(under-warranty ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?category": "category",
+              "?delivered_on": "delivered_on"
+            },
+            "gate": true
+          },
+          {
+            "step_number": 4,
+            "phase": 1,
+            "name": "Load procedure",
+            "action_type": "get-procedure",
+            "worker": "procedures",
+            "mcp_tool": "procedures_get_procedure",
+            "performed_by": "procedures worker",
+            "preconditions": [],
+            "postconditions": [
+              "(procedure-loaded ?n)"
+            ],
+            "parameters": {
+              "?name": "name"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 5,
+            "phase": 2,
+            "name": "Register claim",
+            "action_type": "create-warranty-claim",
+            "worker": "order",
+            "mcp_tool": "order_create_warranty_claim",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(verified ?c)",
+              "(under-warranty ?o)"
+            ],
+            "postconditions": [
+              "(claim-registered ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?defect": "defect"
+            },
+            "gate": false
+          }
+        ]
+      },
+      {
+        "name": "delivery_status",
+        "version": "2.0.0",
+        "status": "PUBLISHED",
+        "context_space": "retail:logistics:delivery-status",
+        "domain": "customer_care",
+        "description": null,
+        "pddl_domain": null,
+        "tool_requirements": [
+          "order_get_order",
+          "delivery_track_shipment"
+        ],
+        "success_criteria": [
+          "(shipment-status-known ?o)"
+        ],
+        "reviewers": [
+          "r.visser",
+          "a.bakker"
+        ],
+        "plan": {
+          "phases": [
+            {
+              "steps": [
+                {
+                  "worker": "order",
+                  "action": "get_order",
+                  "as": "order",
+                  "args": {
+                    "order_id": "$request.order_id"
+                  }
+                }
+              ],
+              "gate": null
+            },
+            {
+              "steps": [
+                {
+                  "worker": "delivery",
+                  "action": "track_shipment",
+                  "as": "shipment",
+                  "args": {
+                    "shipment_id": "$order.shipment_id"
+                  }
+                }
+              ],
+              "gate": null
+            }
+          ]
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "phase": 0,
+            "name": "Get order",
+            "action_type": "get-order",
+            "worker": "order",
+            "mcp_tool": "order_get_order",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(order ?o)"
+            ],
+            "postconditions": [
+              "(order-known ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 2,
+            "phase": 1,
+            "name": "Track shipment",
+            "action_type": "track-shipment",
+            "worker": "delivery",
+            "mcp_tool": "delivery_track_shipment",
+            "performed_by": "delivery worker",
+            "preconditions": [
+              "(order-known ?o)"
+            ],
+            "postconditions": [
+              "(shipment-status-known ?o)"
+            ],
+            "parameters": {
+              "?shipment_id": "shipment_id"
+            },
+            "gate": false
+          }
+        ]
+      },
+      {
+        "name": "duplicate_charge_refund",
+        "version": "1.0.2",
+        "status": "PUBLISHED",
+        "context_space": "retail:payments:payment-errors",
+        "domain": "customer_care",
+        "description": null,
+        "pddl_domain": null,
+        "tool_requirements": [
+          "crm_verify_customer",
+          "order_get_payments",
+          "rules_check_payment_issue",
+          "procedures_get_procedure",
+          "order_issue_refund"
+        ],
+        "success_criteria": [
+          "(refunded ?p)"
+        ],
+        "reviewers": [
+          "a.bakker",
+          "k.dekker"
+        ],
+        "plan": {
+          "phases": [
+            {
+              "steps": [
+                {
+                  "worker": "crm",
+                  "action": "verify_customer",
+                  "as": "customer",
+                  "args": {
+                    "customer_id": "$request.customer_id"
+                  }
+                },
+                {
+                  "worker": "order",
+                  "action": "get_payments",
+                  "as": "payments",
+                  "args": {
+                    "order_id": "$request.order_id"
+                  }
+                }
+              ],
+              "gate": null
+            },
+            {
+              "steps": [
+                {
+                  "worker": "business-rules",
+                  "action": "check_payment_issue",
+                  "as": "rules",
+                  "args": {
+                    "order_id": "$request.order_id",
+                    "error_type": "$request.error_type"
+                  }
+                },
+                {
+                  "worker": "procedures",
+                  "action": "get_procedure",
+                  "as": "procedure",
+                  "args": {
+                    "name": "duplicate_charge_refund"
+                  }
+                }
+              ],
+              "gate": "rules"
+            },
+            {
+              "steps": [
+                {
+                  "worker": "order",
+                  "action": "issue_refund",
+                  "as": "refund",
+                  "args": {
+                    "payment_id": "$rules.refund_payment_id",
+                    "amount": "$rules.refund_amount"
+                  }
+                }
+              ],
+              "gate": null
+            }
+          ]
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "phase": 0,
+            "name": "Verify customer",
+            "action_type": "verify-customer",
+            "worker": "crm",
+            "mcp_tool": "crm_verify_customer",
+            "performed_by": "crm worker",
+            "preconditions": [
+              "(customer ?c)"
+            ],
+            "postconditions": [
+              "(verified ?c)"
+            ],
+            "parameters": {
+              "?customer_id": "customer_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 2,
+            "phase": 0,
+            "name": "Get payments",
+            "action_type": "get-payments",
+            "worker": "order",
+            "mcp_tool": "order_get_payments",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(order-known ?o)"
+            ],
+            "postconditions": [
+              "(payments-known ?o)"
+            ],
+            "parameters": {
+              "?order_id": "order_id"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 3,
+            "phase": 1,
+            "name": "Check payment issue",
+            "action_type": "check-payment-issue",
+            "worker": "business-rules",
+            "mcp_tool": "rules_check_payment_issue",
+            "performed_by": "business-rules worker",
+            "preconditions": [
+              "(payments-known ?o)"
+            ],
+            "postconditions": [
+              "(duplicate-capture ?p)"
+            ],
+            "parameters": {
+              "?order_id": "order_id",
+              "?error_type": "error_type"
+            },
+            "gate": true
+          },
+          {
+            "step_number": 4,
+            "phase": 1,
+            "name": "Load procedure",
+            "action_type": "get-procedure",
+            "worker": "procedures",
+            "mcp_tool": "procedures_get_procedure",
+            "performed_by": "procedures worker",
+            "preconditions": [],
+            "postconditions": [
+              "(procedure-loaded ?n)"
+            ],
+            "parameters": {
+              "?name": "name"
+            },
+            "gate": false
+          },
+          {
+            "step_number": 5,
+            "phase": 2,
+            "name": "Issue refund",
+            "action_type": "issue-refund",
+            "worker": "order",
+            "mcp_tool": "order_issue_refund",
+            "performed_by": "order worker",
+            "preconditions": [
+              "(verified ?c)",
+              "(duplicate-capture ?p)"
+            ],
+            "postconditions": [
+              "(refunded ?p)"
+            ],
+            "parameters": {
+              "?payment_id": "payment_id",
+              "?amount": "amount"
+            },
+            "gate": false
+          }
+        ]
+      },
+      {
+        "name": "faq_answer",
+        "version": "2.0.0",
+        "status": "PUBLISHED",
+        "context_space": "retail:faq:general",
+        "domain": "customer_care",
+        "description": null,
+        "pddl_domain": null,
+        "tool_requirements": [
+          "faq_ask"
+        ],
+        "success_criteria": [
+          "(answered ?q)"
+        ],
+        "reviewers": [
+          "m.jansen",
+          "a.bakker"
+        ],
+        "plan": {
+          "phases": [
+            {
+              "steps": [
+                {
+                  "worker": "faq",
+                  "action": "ask",
+                  "as": "faq",
+                  "args": {
+                    "question": "$request.question"
+                  }
+                }
+              ],
+              "gate": null
+            }
+          ]
+        },
+        "steps": [
+          {
+            "step_number": 1,
+            "phase": 0,
+            "name": "Answer from knowledge stores",
+            "action_type": "ask",
+            "worker": "faq",
+            "mcp_tool": "faq_ask",
+            "performed_by": "faq worker",
+            "preconditions": [],
+            "postconditions": [
+              "(answered ?q)"
+            ],
+            "parameters": {
+              "?question": "question"
+            },
+            "gate": false
+          }
+        ]
+      }
+    ],
+    "connectors": [
+      {
+        "id": "crm-core",
+        "name": "CRM core",
+        "system": "CRM",
+        "auth_type": "oauth2_client_credentials",
+        "base_url": null,
+        "timeout_ms": 3000,
+        "rate_limit": null,
+        "field_mappings": [
+          {
+            "backend_field": "cust_no",
+            "attribute": "Customer.customer_id"
+          },
+          {
+            "backend_field": "cust_email",
+            "attribute": "Customer.email"
+          }
+        ]
+      }
+    ],
+    "knowledge_stores": [
+      {
+        "key": "faq",
+        "label": "FAQ",
+        "parent": null,
+        "kind": "group",
+        "areas": [
+          "faq"
+        ],
+        "description": "Frequently asked questions"
+      },
+      {
+        "key": "faq-policies",
+        "label": "Policies",
+        "parent": "faq",
+        "kind": "leaf",
+        "areas": [
+          "faq"
+        ],
+        "description": "Return, warranty and payment policies"
+      }
+    ]
+  }
+}

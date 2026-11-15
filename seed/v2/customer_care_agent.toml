@@ -1,0 +1,669 @@
+# Seed v2 — customer_care_agent job content (W4), job layer.
+# Generated once from care-bus's golden release bundle v1
+# (care-bus-agents feat/w3-multitenant crates/carebus-api/tests/fixtures/release-bundle-v1.json),
+# so release 1 reproduces care-bus's base. Unset nullable fields are omitted (TOML has no null).
+
+[[layer]]
+scope = "job"
+job = "customer_care_agent"
+
+  [[layer.row]]
+  kind = "job"
+  key = "customer_care_agent"
+  op = "patch"
+    [layer.row.fields]
+    preamble = "You are the intake step of a customer-care desk. From the customer's latest message, the draft request so far and the customer's recent records, extract the request type and any fields the message provides. Use order ids from the recent records when the customer names the item. Never invent a value: leave a field null when the message and records do not give it."
+    actor_label = "Customer care desk"
+
+  [[layer.row]]
+  kind = "context_space"
+  key = "retail:order-support:returns"
+  op = "add"
+    [layer.row.fields]
+    area = "order-support"
+    label = "Returns"
+    request_type = "return"
+    required = ["order_id", "reason"]
+    entities = ["Customer", "Order", "Product", "ReturnAuthorization"]
+    procedure = "return"
+
+  [[layer.row]]
+  kind = "context_space"
+  key = "retail:order-support:warranty"
+  op = "add"
+    [layer.row.fields]
+    area = "order-support"
+    label = "Warranty claims"
+    request_type = "warranty_claim"
+    required = ["order_id", "defect"]
+    entities = ["Customer", "Order", "Product", "WarrantyClaim"]
+    procedure = "warranty_claim"
+
+  [[layer.row]]
+  kind = "context_space"
+  key = "retail:logistics:delivery-status"
+  op = "add"
+    [layer.row.fields]
+    area = "logistics"
+    label = "Delivery status"
+    request_type = "delivery_status"
+    required = ["order_id"]
+    entities = ["Order", "Shipment", "Carrier"]
+    procedure = "delivery_status"
+
+  [[layer.row]]
+  kind = "context_space"
+  key = "retail:payments:payment-errors"
+  op = "add"
+    [layer.row.fields]
+    area = "payments"
+    label = "Payment errors"
+    request_type = "payment_error"
+    required = ["order_id", "error_type"]
+    entities = ["Customer", "Order", "Payment", "Refund"]
+    procedure = "duplicate_charge_refund"
+
+  [[layer.row]]
+  kind = "context_space"
+  key = "retail:faq:general"
+  op = "add"
+    [layer.row.fields]
+    area = "faq"
+    label = "General questions"
+    request_type = "faq"
+    required = ["question"]
+    entities = ["Policy"]
+    procedure = "faq_answer"
+
+  [[layer.row]]
+  kind = "procedure"
+  key = "return@1.3.0"
+  op = "add"
+    [layer.row.fields]
+    status = "PUBLISHED"
+    context_space = "retail:order-support:returns"
+    domain = "customer_care"
+    tool_requirements = ["crm_verify_customer", "order_get_order", "rules_check_return_window", "procedures_get_procedure", "order_create_rma"]
+    success_criteria = ["(rma-created ?o)"]
+    reviewers = ["a.bakker", "r.visser"]
+      [layer.row.fields.plan]
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "crm"
+          action = "verify_customer"
+          as = "customer"
+            [layer.row.fields.plan.phases.steps.args]
+            customer_id = "$request.customer_id"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "get_order"
+          as = "order"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+        [[layer.row.fields.plan.phases]]
+        gate = "rules"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "business-rules"
+          action = "check_return_window"
+          as = "rules"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$order.order_id"
+            category = "$order.category"
+            delivered_on = "$order.delivered_on"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "procedures"
+          action = "get_procedure"
+          as = "procedure"
+            [layer.row.fields.plan.phases.steps.args]
+            name = "return"
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "create_rma"
+          as = "rma"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+            reason = "$request.reason"
+      [[layer.row.fields.steps]]
+      step_number = 1
+      phase = 0
+      name = "Verify customer"
+      action_type = "verify-customer"
+      worker = "crm"
+      mcp_tool = "crm_verify_customer"
+      performed_by = "crm worker"
+      preconditions = ["(customer ?c)"]
+      postconditions = ["(verified ?c)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?customer_id" = "customer_id"
+      [[layer.row.fields.steps]]
+      step_number = 2
+      phase = 0
+      name = "Get order"
+      action_type = "get-order"
+      worker = "order"
+      mcp_tool = "order_get_order"
+      performed_by = "order worker"
+      preconditions = ["(order ?o)"]
+      postconditions = ["(order-known ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+      [[layer.row.fields.steps]]
+      step_number = 3
+      phase = 1
+      name = "Check return window"
+      action_type = "check-return-window"
+      worker = "business-rules"
+      mcp_tool = "rules_check_return_window"
+      performed_by = "business-rules worker"
+      preconditions = ["(order-known ?o)", "(delivered ?o)"]
+      postconditions = ["(within-return-window ?o)"]
+      gate = true
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?category" = "category"
+        "?delivered_on" = "delivered_on"
+      [[layer.row.fields.steps]]
+      step_number = 4
+      phase = 1
+      name = "Load procedure"
+      action_type = "get-procedure"
+      worker = "procedures"
+      mcp_tool = "procedures_get_procedure"
+      performed_by = "procedures worker"
+      preconditions = []
+      postconditions = ["(procedure-loaded ?n)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?name" = "name"
+      [[layer.row.fields.steps]]
+      step_number = 5
+      phase = 2
+      name = "Create RMA"
+      action_type = "create-rma"
+      worker = "order"
+      mcp_tool = "order_create_rma"
+      performed_by = "order worker"
+      preconditions = ["(verified ?c)", "(within-return-window ?o)"]
+      postconditions = ["(rma-created ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?reason" = "reason"
+
+  [[layer.row]]
+  kind = "procedure"
+  key = "return@1.4.0-beta"
+  op = "add"
+    [layer.row.fields]
+    status = "CANARY"
+    context_space = "retail:order-support:returns"
+    domain = "customer_care"
+    tool_requirements = ["crm_verify_customer", "order_get_order", "rules_check_return_window", "procedures_get_procedure", "order_create_rma"]
+    success_criteria = ["(rma-created ?o)"]
+    reviewers = ["a.bakker"]
+      [layer.row.fields.plan]
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "crm"
+          action = "verify_customer"
+          as = "customer"
+            [layer.row.fields.plan.phases.steps.args]
+            customer_id = "$request.customer_id"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "get_order"
+          as = "order"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+        [[layer.row.fields.plan.phases]]
+        gate = "rules"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "business-rules"
+          action = "check_return_window"
+          as = "rules"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$order.order_id"
+            category = "$order.category"
+            delivered_on = "$order.delivered_on"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "procedures"
+          action = "get_procedure"
+          as = "procedure"
+            [layer.row.fields.plan.phases.steps.args]
+            name = "return"
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "create_rma"
+          as = "rma"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+            reason = "$request.reason"
+      [[layer.row.fields.steps]]
+      step_number = 1
+      phase = 0
+      name = "Verify customer"
+      action_type = "verify-customer"
+      worker = "crm"
+      mcp_tool = "crm_verify_customer"
+      performed_by = "crm worker"
+      preconditions = ["(customer ?c)"]
+      postconditions = ["(verified ?c)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?customer_id" = "customer_id"
+      [[layer.row.fields.steps]]
+      step_number = 2
+      phase = 0
+      name = "Get order"
+      action_type = "get-order"
+      worker = "order"
+      mcp_tool = "order_get_order"
+      performed_by = "order worker"
+      preconditions = ["(order ?o)"]
+      postconditions = ["(order-known ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+      [[layer.row.fields.steps]]
+      step_number = 3
+      phase = 1
+      name = "Check return window"
+      action_type = "check-return-window"
+      worker = "business-rules"
+      mcp_tool = "rules_check_return_window"
+      performed_by = "business-rules worker"
+      preconditions = ["(order-known ?o)", "(delivered ?o)"]
+      postconditions = ["(within-return-window ?o)"]
+      gate = true
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?category" = "category"
+        "?delivered_on" = "delivered_on"
+      [[layer.row.fields.steps]]
+      step_number = 4
+      phase = 1
+      name = "Load procedure"
+      action_type = "get-procedure"
+      worker = "procedures"
+      mcp_tool = "procedures_get_procedure"
+      performed_by = "procedures worker"
+      preconditions = []
+      postconditions = ["(procedure-loaded ?n)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?name" = "name"
+      [[layer.row.fields.steps]]
+      step_number = 5
+      phase = 2
+      name = "Create RMA"
+      action_type = "create-rma"
+      worker = "order"
+      mcp_tool = "order_create_rma"
+      performed_by = "order worker"
+      preconditions = ["(verified ?c)", "(within-return-window ?o)"]
+      postconditions = ["(rma-created ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?reason" = "reason"
+
+  [[layer.row]]
+  kind = "procedure"
+  key = "warranty_claim@1.1.0"
+  op = "add"
+    [layer.row.fields]
+    status = "PUBLISHED"
+    context_space = "retail:order-support:warranty"
+    domain = "customer_care"
+    tool_requirements = ["crm_verify_customer", "order_get_order", "rules_check_warranty", "procedures_get_procedure", "order_create_warranty_claim"]
+    success_criteria = ["(claim-registered ?o)"]
+    reviewers = ["a.bakker", "r.visser"]
+      [layer.row.fields.plan]
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "crm"
+          action = "verify_customer"
+          as = "customer"
+            [layer.row.fields.plan.phases.steps.args]
+            customer_id = "$request.customer_id"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "get_order"
+          as = "order"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+        [[layer.row.fields.plan.phases]]
+        gate = "rules"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "business-rules"
+          action = "check_warranty"
+          as = "rules"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$order.order_id"
+            category = "$order.category"
+            delivered_on = "$order.delivered_on"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "procedures"
+          action = "get_procedure"
+          as = "procedure"
+            [layer.row.fields.plan.phases.steps.args]
+            name = "warranty_claim"
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "create_warranty_claim"
+          as = "claim"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+            defect = "$request.defect"
+      [[layer.row.fields.steps]]
+      step_number = 1
+      phase = 0
+      name = "Verify customer"
+      action_type = "verify-customer"
+      worker = "crm"
+      mcp_tool = "crm_verify_customer"
+      performed_by = "crm worker"
+      preconditions = ["(customer ?c)"]
+      postconditions = ["(verified ?c)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?customer_id" = "customer_id"
+      [[layer.row.fields.steps]]
+      step_number = 2
+      phase = 0
+      name = "Get order"
+      action_type = "get-order"
+      worker = "order"
+      mcp_tool = "order_get_order"
+      performed_by = "order worker"
+      preconditions = ["(order ?o)"]
+      postconditions = ["(order-known ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+      [[layer.row.fields.steps]]
+      step_number = 3
+      phase = 1
+      name = "Check warranty"
+      action_type = "check-warranty"
+      worker = "business-rules"
+      mcp_tool = "rules_check_warranty"
+      performed_by = "business-rules worker"
+      preconditions = ["(order-known ?o)", "(delivered ?o)"]
+      postconditions = ["(under-warranty ?o)"]
+      gate = true
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?category" = "category"
+        "?delivered_on" = "delivered_on"
+      [[layer.row.fields.steps]]
+      step_number = 4
+      phase = 1
+      name = "Load procedure"
+      action_type = "get-procedure"
+      worker = "procedures"
+      mcp_tool = "procedures_get_procedure"
+      performed_by = "procedures worker"
+      preconditions = []
+      postconditions = ["(procedure-loaded ?n)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?name" = "name"
+      [[layer.row.fields.steps]]
+      step_number = 5
+      phase = 2
+      name = "Register claim"
+      action_type = "create-warranty-claim"
+      worker = "order"
+      mcp_tool = "order_create_warranty_claim"
+      performed_by = "order worker"
+      preconditions = ["(verified ?c)", "(under-warranty ?o)"]
+      postconditions = ["(claim-registered ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?defect" = "defect"
+
+  [[layer.row]]
+  kind = "procedure"
+  key = "delivery_status@2.0.0"
+  op = "add"
+    [layer.row.fields]
+    status = "PUBLISHED"
+    context_space = "retail:logistics:delivery-status"
+    domain = "customer_care"
+    tool_requirements = ["order_get_order", "delivery_track_shipment"]
+    success_criteria = ["(shipment-status-known ?o)"]
+    reviewers = ["r.visser", "a.bakker"]
+      [layer.row.fields.plan]
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "get_order"
+          as = "order"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "delivery"
+          action = "track_shipment"
+          as = "shipment"
+            [layer.row.fields.plan.phases.steps.args]
+            shipment_id = "$order.shipment_id"
+      [[layer.row.fields.steps]]
+      step_number = 1
+      phase = 0
+      name = "Get order"
+      action_type = "get-order"
+      worker = "order"
+      mcp_tool = "order_get_order"
+      performed_by = "order worker"
+      preconditions = ["(order ?o)"]
+      postconditions = ["(order-known ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+      [[layer.row.fields.steps]]
+      step_number = 2
+      phase = 1
+      name = "Track shipment"
+      action_type = "track-shipment"
+      worker = "delivery"
+      mcp_tool = "delivery_track_shipment"
+      performed_by = "delivery worker"
+      preconditions = ["(order-known ?o)"]
+      postconditions = ["(shipment-status-known ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?shipment_id" = "shipment_id"
+
+  [[layer.row]]
+  kind = "procedure"
+  key = "duplicate_charge_refund@1.0.2"
+  op = "add"
+    [layer.row.fields]
+    status = "PUBLISHED"
+    context_space = "retail:payments:payment-errors"
+    domain = "customer_care"
+    tool_requirements = ["crm_verify_customer", "order_get_payments", "rules_check_payment_issue", "procedures_get_procedure", "order_issue_refund"]
+    success_criteria = ["(refunded ?p)"]
+    reviewers = ["a.bakker", "k.dekker"]
+      [layer.row.fields.plan]
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "crm"
+          action = "verify_customer"
+          as = "customer"
+            [layer.row.fields.plan.phases.steps.args]
+            customer_id = "$request.customer_id"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "get_payments"
+          as = "payments"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+        [[layer.row.fields.plan.phases]]
+        gate = "rules"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "business-rules"
+          action = "check_payment_issue"
+          as = "rules"
+            [layer.row.fields.plan.phases.steps.args]
+            order_id = "$request.order_id"
+            error_type = "$request.error_type"
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "procedures"
+          action = "get_procedure"
+          as = "procedure"
+            [layer.row.fields.plan.phases.steps.args]
+            name = "duplicate_charge_refund"
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "order"
+          action = "issue_refund"
+          as = "refund"
+            [layer.row.fields.plan.phases.steps.args]
+            payment_id = "$rules.refund_payment_id"
+            amount = "$rules.refund_amount"
+      [[layer.row.fields.steps]]
+      step_number = 1
+      phase = 0
+      name = "Verify customer"
+      action_type = "verify-customer"
+      worker = "crm"
+      mcp_tool = "crm_verify_customer"
+      performed_by = "crm worker"
+      preconditions = ["(customer ?c)"]
+      postconditions = ["(verified ?c)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?customer_id" = "customer_id"
+      [[layer.row.fields.steps]]
+      step_number = 2
+      phase = 0
+      name = "Get payments"
+      action_type = "get-payments"
+      worker = "order"
+      mcp_tool = "order_get_payments"
+      performed_by = "order worker"
+      preconditions = ["(order-known ?o)"]
+      postconditions = ["(payments-known ?o)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+      [[layer.row.fields.steps]]
+      step_number = 3
+      phase = 1
+      name = "Check payment issue"
+      action_type = "check-payment-issue"
+      worker = "business-rules"
+      mcp_tool = "rules_check_payment_issue"
+      performed_by = "business-rules worker"
+      preconditions = ["(payments-known ?o)"]
+      postconditions = ["(duplicate-capture ?p)"]
+      gate = true
+        [layer.row.fields.steps.parameters]
+        "?order_id" = "order_id"
+        "?error_type" = "error_type"
+      [[layer.row.fields.steps]]
+      step_number = 4
+      phase = 1
+      name = "Load procedure"
+      action_type = "get-procedure"
+      worker = "procedures"
+      mcp_tool = "procedures_get_procedure"
+      performed_by = "procedures worker"
+      preconditions = []
+      postconditions = ["(procedure-loaded ?n)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?name" = "name"
+      [[layer.row.fields.steps]]
+      step_number = 5
+      phase = 2
+      name = "Issue refund"
+      action_type = "issue-refund"
+      worker = "order"
+      mcp_tool = "order_issue_refund"
+      performed_by = "order worker"
+      preconditions = ["(verified ?c)", "(duplicate-capture ?p)"]
+      postconditions = ["(refunded ?p)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?payment_id" = "payment_id"
+        "?amount" = "amount"
+
+  [[layer.row]]
+  kind = "procedure"
+  key = "faq_answer@2.0.0"
+  op = "add"
+    [layer.row.fields]
+    status = "PUBLISHED"
+    context_space = "retail:faq:general"
+    domain = "customer_care"
+    tool_requirements = ["faq_ask"]
+    success_criteria = ["(answered ?q)"]
+    reviewers = ["m.jansen", "a.bakker"]
+      [layer.row.fields.plan]
+        [[layer.row.fields.plan.phases]]
+          [[layer.row.fields.plan.phases.steps]]
+          worker = "faq"
+          action = "ask"
+          as = "faq"
+            [layer.row.fields.plan.phases.steps.args]
+            question = "$request.question"
+      [[layer.row.fields.steps]]
+      step_number = 1
+      phase = 0
+      name = "Answer from knowledge stores"
+      action_type = "ask"
+      worker = "faq"
+      mcp_tool = "faq_ask"
+      performed_by = "faq worker"
+      preconditions = []
+      postconditions = ["(answered ?q)"]
+      gate = false
+        [layer.row.fields.steps.parameters]
+        "?question" = "question"
+
+  [[layer.row]]
+  kind = "connector_slot"
+  key = "crm-core"
+  op = "add"
+    [layer.row.fields]
+    name = "CRM core"
+    system = "CRM"
+    auth_type = "oauth2_client_credentials"
+    timeout_ms = 3000
+      [[layer.row.fields.field_mappings]]
+      backend_field = "cust_no"
+      attribute = "Customer.customer_id"
+      [[layer.row.fields.field_mappings]]
+      backend_field = "cust_email"
+      attribute = "Customer.email"
+
+  [[layer.row]]
+  kind = "knowledge_store"
+  key = "faq"
+  op = "add"
+    [layer.row.fields]
+    label = "FAQ"
+    kind = "group"
+    areas = ["faq"]
+    description = "Frequently asked questions"
+
+  [[layer.row]]
+  kind = "knowledge_store"
+  key = "faq-policies"
+  op = "add"
+    [layer.row.fields]
+    label = "Policies"
+    parent = "faq"
+    kind = "leaf"
+    areas = ["faq"]
+    description = "Return, warranty and payment policies"

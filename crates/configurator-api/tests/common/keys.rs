@@ -1,0 +1,132 @@
+//! Test signing keys and token minting, after care-bus's `rs256` test helper @ 3b88445.
+//! The RSA keypairs are generated once per test binary, so no private key is committed.
+#![allow(dead_code)]
+use std::sync::LazyLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
+
+use super::TEST_ISSUER;
+
+/// The audience the API expects (`KEYCLOAK_AUDIENCE` default).
+pub const TEST_AUDIENCE: &str = "strata-configurator";
+/// The client role (on the `TEST_AUDIENCE` client) that makes a caller super-admin
+/// (`SUPER_ADMIN_ROLE` default).
+pub const SUPER_ADMIN: &str = "super_admin";
+
+struct KeyPair {
+    enc: EncodingKey,
+    /// base64url (no padding) modulus, as a JWKS `n`.
+    n: String,
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let v = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..=c.len() {
+            out.push(T[((v >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+fn gen_key() -> KeyPair {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::traits::PublicKeyParts;
+    let k = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let pem = k.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+    KeyPair {
+        enc: EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+        n: b64url(&k.n().to_bytes_be()),
+    }
+}
+
+/// The key the API trusts.
+static KEY: LazyLock<KeyPair> = LazyLock::new(gen_key);
+/// A key the API has never seen.
+static FOREIGN: LazyLock<KeyPair> = LazyLock::new(gen_key);
+
+/// The public half of the trusted key, for `Verifier::static_key`.
+pub fn decoding_key() -> DecodingKey {
+    DecodingKey::from_rsa_components(&KEY.n, "AQAB").unwrap()
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// The claims of a valid token for `sub`, with `roles` as client roles of this app's client
+/// (`resource_access.<TEST_AUDIENCE>.roles`); tests edit or remove fields before signing.
+pub fn claims(sub: &str, roles: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "sub": sub, "preferred_username": username(sub), "exp": now() + 300,
+        "iss": TEST_ISSUER, "aud": TEST_AUDIENCE,
+        "resource_access": {TEST_AUDIENCE: {"roles": roles}}
+    })
+}
+
+/// `claims` with `exp` this many seconds from now (negative = already expired).
+pub fn expiring_in(sub: &str, secs: i64) -> serde_json::Value {
+    let mut c = claims(sub, &[]);
+    c["exp"] = (now() + secs).into();
+    c
+}
+
+fn sign_with(key: &KeyPair, claims: &serde_json::Value) -> String {
+    let mut h = Header::new(Algorithm::RS256);
+    h.kid = Some("test".into());
+    encode(&h, claims, &key.enc).unwrap()
+}
+
+/// RS256 over arbitrary claims with the trusted key.
+pub fn sign(claims: &serde_json::Value) -> String {
+    sign_with(&KEY, claims)
+}
+
+/// Algorithm confusion: HS256, keyed with the trusted RSA public modulus.
+pub fn hs256(claims: &serde_json::Value) -> String {
+    let mut h = Header::new(Algorithm::HS256);
+    h.kid = Some("test".into());
+    encode(&h, claims, &EncodingKey::from_secret(KEY.n.as_bytes())).unwrap()
+}
+
+/// An unsigned `alg: none` token (jsonwebtoken cannot mint one, so it is built by hand).
+pub fn alg_none(claims: &serde_json::Value) -> String {
+    let header = br#"{"alg":"none","typ":"JWT"}"#;
+    format!(
+        "{}.{}.",
+        b64url(header),
+        b64url(claims.to_string().as_bytes())
+    )
+}
+
+fn mint(key: &KeyPair, sub: &str, roles: &[&str]) -> String {
+    sign_with(key, &claims(sub, roles))
+}
+
+/// The `preferred_username` minted for `sub`, i.e. the audit actor.
+pub fn username(sub: &str) -> String {
+    format!("{sub}.user")
+}
+
+/// A valid RS256 portal-realm token for `sub` with these client roles.
+pub fn token(sub: &str, roles: &[&str]) -> String {
+    mint(&KEY, sub, roles)
+}
+
+/// A super-admin token for `sub`.
+pub fn super_admin(sub: &str) -> String {
+    token(sub, &[SUPER_ADMIN])
+}
+
+/// A well-formed token signed by a key the API does not trust.
+pub fn foreign_token(sub: &str, roles: &[&str]) -> String {
+    mint(&FOREIGN, sub, roles)
+}
