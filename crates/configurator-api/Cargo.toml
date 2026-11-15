@@ -2,6 +2,7 @@
 name = "configurator-api"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "HTTP backend for strata-configurator"
 
 [dependencies]

@@ -6,4 +6,11 @@ ignore = [
   # throwaway JWT signing keys in tests; it never ships in an image and never decrypts
   # attacker-supplied data. Revisit if it gains a normal edge.
   "RUSTSEC-2023-0071",
+  # RUSTSEC-2026-0459: libsqlite3-sys via C SQLite CVE-2026-119375. The fixed 0.39.0 is out
+  # of range: sqlx-sqlite 0.9.0 (from the pinned sqlx) admits `>=0.30.1, <0.38.0`, so the
+  # ceiling can only move in a later sqlx release. This workspace enables sqlx's postgres,
+  # runtime-tokio, tls-rustls, macros, migrate, uuid and json features only — never `sqlite`
+  # — so sqlx-sqlite and libsqlite3-sys sit in Cargo.lock but are never compiled or linked.
+  # Revisit if a SQLite feature is ever enabled.
+  "RUSTSEC-2026-0459",
 ]

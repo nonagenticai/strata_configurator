@@ -38,7 +38,7 @@ pub struct Config {
 /// `care-bus/release-writer`, and the care-bus API it calls.
 #[derive(Clone)]
 pub struct CarebusConfig {
-    /// e.g. `http://carebus-api.care-bus.svc.cluster.local:8095`, without a trailing slash.
+    /// The care-bus API base URL, without a trailing slash.
     pub api_url: String,
     pub token_url: String,
     pub client_id: String,
@@ -156,7 +156,7 @@ pub struct LicensesAdminConfig {
     pub token_url: String,
     pub client_id: String,
     pub client_secret: String,
-    /// The licences admin API base, e.g. `http://licenses.licenses.svc.cluster.local:8544`.
+    /// The licences admin API base URL.
     pub url: String,
     /// The plan new tenants are licensed on.
     pub plan_code: String,
@@ -261,10 +261,9 @@ impl Config {
         };
         let license_gate = LicenseGateConfig {
             enabled,
-            introspect_url: opt(
-                "LICENSE_INTROSPECT_URL",
-                "http://licenses.licenses.svc.cluster.local:8544/license/introspect",
-            ),
+            // No default: a deployment that turns the gate on must point it at its own
+            // licences endpoint. Empty means unconfigured, and the gate fails closed.
+            introspect_url: opt("LICENSE_INTROSPECT_URL", ""),
             app_key: opt("LICENSE_APP_KEY", "strata-configurator"),
             cache_ttl_sec,
         };
@@ -542,10 +541,7 @@ mod tests {
         assert!(c.keycloak_admin.is_none());
         assert!(c.licenses_admin.is_none());
         assert!(!c.license_gate.enabled);
-        assert_eq!(
-            c.license_gate.introspect_url,
-            "http://licenses.licenses.svc.cluster.local:8544/license/introspect"
-        );
+        assert_eq!(c.license_gate.introspect_url, "");
         assert_eq!(c.license_gate.app_key, "strata-configurator");
         assert_eq!(c.license_gate.cache_ttl_sec, 300);
     }

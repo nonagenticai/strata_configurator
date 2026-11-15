@@ -2,6 +2,7 @@
 name = "configurator-core"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Domain model and compiler for strata-configurator"
 
 [dependencies]

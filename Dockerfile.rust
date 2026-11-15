@@ -1,5 +1,5 @@
 # One Dockerfile: --build-arg PACKAGE=configurator-api
-ARG BASE_REGISTRY=registry.internal:5000
+ARG BASE_REGISTRY=docker.io
 FROM ${BASE_REGISTRY}/library/rust:1.98-bookworm AS build
 ARG PACKAGE
 WORKDIR /src

@@ -46,10 +46,9 @@ fn with_db_name(url: &str, name: &str) -> String {
     }
 }
 
-/// One server per test binary: `TEST_DATABASE_URL` when set, otherwise a single throwaway Postgres 18 from the LAN
-/// mirror (`TEST_PG_REGISTRY`, default `registry.internal:5000/library`), never docker.io. Every test gets its own
-/// fresh database inside it. The container lives in a static, so it is removed by an `atexit` hook when the test
-/// process exits.
+/// One server per test binary: `TEST_DATABASE_URL` when set, otherwise a single throwaway Postgres 18 pulled from
+/// `TEST_PG_REGISTRY` (default `docker.io/library`). Every test gets its own fresh database inside it. The container
+/// lives in a static, so it is removed by an `atexit` hook when the test process exits.
 struct Server {
     base: String,
     _container: Option<ContainerAsync<Postgres>>,
@@ -72,7 +71,7 @@ extern "C" fn remove_container() {
 async fn start_container() -> (String, ContainerAsync<Postgres>) {
     let reg = match std::env::var("TEST_PG_REGISTRY") {
         Ok(r) if !r.is_empty() => r,
-        _ => "registry.internal:5000/library".to_string(),
+        _ => "docker.io/library".to_string(),
     };
     let image = format!("{}/postgres", reg.trim_end_matches('/'));
     let mut last = String::new();

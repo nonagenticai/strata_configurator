@@ -1,4 +1,4 @@
-ARG BASE_REGISTRY=registry.internal:5000
+ARG BASE_REGISTRY=docker.io
 FROM ${BASE_REGISTRY}/library/node:26-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
