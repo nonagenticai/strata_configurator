@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
-	import { initAuth, logout } from '$lib/auth';
-	import { api, all } from '$lib/api';
-	import { roleLabel, session, type Workspace } from '$lib/session.svelte';
+	import { initAuth, logout } from '#lib/auth';
+	import { api, all } from '#lib/api';
+	import { roleLabel, session, type Workspace } from '#lib/session.svelte';
 	import './app.css';
 	let { data, children } = $props();
 	let error = $state('');

@@ -9,8 +9,8 @@
 		type Release,
 		type Target,
 		type Violation,
-	} from '$lib/api';
-	import { session } from '$lib/session.svelte';
+	} from '#lib/api';
+	import { session } from '#lib/session.svelte';
 	let targets = $state<Target[]>([]),
 		selected = $state<Target | null>(null),
 		releases = $state<Release[]>([]),

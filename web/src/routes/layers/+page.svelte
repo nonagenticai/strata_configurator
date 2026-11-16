@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { all, layerLabel, type Layer, type Row } from '$lib/api';
-	import { session } from '$lib/session.svelte';
+	import { all, layerLabel, type Layer, type Row } from '#lib/api';
+	import { session } from '#lib/session.svelte';
 	let layers = $state<Layer[]>([]),
 		selected = $state<Layer | null>(null),
 		rows = $state<Row[]>([]),

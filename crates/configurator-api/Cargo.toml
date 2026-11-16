@@ -25,6 +25,6 @@ uuid = { version = "=1.28.0", features = ["v4", "serde"] }
 [dev-dependencies]
 http-body-util = "=0.1.5"
 libc = "=0.2.190"
-rsa = { version = "=0.9.8", features = ["std"] }
+rsa = { version = "=0.9.10", features = ["std"] }
 testcontainers-modules = { version = "=0.15.0", features = ["postgres"] }
 tower = { version = "=0.5.3", features = ["util"] }

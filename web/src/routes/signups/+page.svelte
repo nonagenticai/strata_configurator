@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, all, ApiError } from '$lib/api';
-	import { session } from '$lib/session.svelte';
+	import { api, all, ApiError } from '#lib/api';
+	import { session } from '#lib/session.svelte';
 	/** One early-access signup (`GET /api/signup-approvals`). */
 	type Signup = {
 		id: string;
