@@ -8,9 +8,9 @@
 		type EffectiveConfig,
 		type CompileError,
 		type Origin,
-	} from '$lib/api';
-	import { session } from '$lib/session.svelte';
-	import Provenance from '$lib/Provenance.svelte';
+	} from '#lib/api';
+	import { session } from '#lib/session.svelte';
+	import Provenance from '#lib/Provenance.svelte';
 	type Profile = { id: string; name: string; tenant: string | null; values: Record<string, string[]> };
 	type Dimension = { key: string; label: string; values: { key: string; label: string }[] };
 	let industries = $state<string[]>([]),

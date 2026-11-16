@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, all, type CarebusProvision } from '$lib/api';
-	import { session } from '$lib/session.svelte';
+	import { api, all, type CarebusProvision } from '#lib/api';
+	import { session } from '#lib/session.svelte';
 	/** One tenant (`GET /api/tenants`); archived ones are left out unless asked for. */
 	type Tenant = { id: string; name: string; created_at: string; archived_at: string | null };
 	let tenants = $state<Tenant[]>([]),
