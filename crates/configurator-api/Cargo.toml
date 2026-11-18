@@ -10,7 +10,7 @@ anyhow = "=1.0.104"
 axum = "=0.8.9"
 base64 = "=0.22.1"
 configurator-core = { path = "../configurator-core" }
-jsonwebtoken = "=9.3.1"
+jsonwebtoken = "=10.3.0"
 reqwest = { version = "=0.13.5", features = ["json"] }
 ring = "=0.17.14"
 serde = { version = "=1.0.229", features = ["derive"] }
