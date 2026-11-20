@@ -1,0 +1,31 @@
+# Compile gate for lane pushes — the answer "does it compile?" without a local compiler.
+#
+# This file is a CONSUMER of the estate's exported `rust-preflight` workflow: it answers the
+# one question a lane push must answer before a PR (is the tree formatted, does
+# `cargo clippy --all-targets -D warnings` pass) on a free GitHub-hosted runner, and it writes
+# no required status. The mechanism, and why a public repo can use neither the ARC pools nor
+# the private archetype, lives in the reusable workflow and in ci-public.yml's header.
+#
+# `cache_shared_key` MUST be the same value the `checks` job in ci-public.yml passes to
+# Swatinem/rust-cache (`shared-key: checks`), so this job restores the dependency cache the
+# last main run saved instead of paying a cold compile. A preflight never saves — `save-if`
+# in the reusable workflow is main-only — so it cannot evict the cache it borrows.
+name: preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['issue/**', 'lane/**', 'slice/**']
+
+concurrency:
+  group: preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    uses: nonagenticai/ci-workflows/.github/workflows/rust-preflight.yml@d2ae87a417b00013838ba18841cdd1642b83fb89
+    with:
+      cache_shared_key: checks

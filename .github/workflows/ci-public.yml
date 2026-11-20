@@ -98,15 +98,19 @@ jobs:
           rustup show
           rustc --version
 
-      - uses: actions/cache@v6
+      # Swatinem/rust-cache, not actions/cache: a registry-only key paid a cold compile of
+      # every dependency on every run. This one caches the DEPENDENCY graph (registry, git and
+      # the dependency crates' target/ artifacts, never this workspace's own) and prunes itself
+      # to the 10 GB budget. `shared-key: checks` is the SAME value preflight.yml hands the
+      # reusable rust-preflight workflow, so lane pushes restore what main saves here.
+      # `env-vars` folds the dev-profile debug level set above into the cache key, so a profile
+      # change cannot silently reuse a target built the other way.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Registry only: target/ is multi-gigabyte and would thrash the 10 GB cache budget.
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          prefix-key: v1-rust
+          shared-key: checks
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          env-vars: CARGO_PROFILE_DEV_DEBUG
 
       # ⛔ Both storage choices below are load-bearing and they are different resources.
       #   --shm-size: Docker's default /dev/shm is 64 MB and Postgres parallel workers
